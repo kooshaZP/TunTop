@@ -11,7 +11,7 @@ $VpnInterface      = ''        # set to your exact VPN connection name to overri
 $DnsServer         = '8.8.8.8'
 
 # VLESS server address(es) - IP or hostname, as many as you like.
-$Servers           = @('198.51.100.1')  # TEST-NET-1 placeholder — replace with your VLESS server IP
+$Servers           = @('188.114.97.6')
 
 # geoip.dat bypass (route-level "bypass a country").
 # The script looks for geoip.dat inside a 'geofil' sub-folder next to this script.
