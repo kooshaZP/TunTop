@@ -16,8 +16,9 @@ TunMood drives a Wintun TUN adapter from your v2rayN (VLESS) proxy so every app 
   <img src="docs/dashboard-3.jpg" width="720" alt="TunMood dashboard - live throughput graphs & health suite"><br>
   <em>TunMood dashboard: live btop-style throughput graphs, health-check suite, and bypass controls.</em><br>
   <img src="docs/dashboard-1.jpg" width="360" alt="TunMood dashboard view 1">
-  <img src="docs/dashboard-4.jpg" width="360" alt="TunMood dashboard view 2">
   <img src="docs/dashboard-2.jpg" width="320" alt="TunMood dashboard view 3">
+  <img src="docs/dashboard-4.jpg" width="360" alt="TunMood dashboard view 2">
+  
 </p>
 
 
