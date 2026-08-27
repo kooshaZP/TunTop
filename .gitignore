@@ -1,0 +1,28 @@
+# --- downloaded at first run; never commit binaries -----------------------
+*.exe
+*.dll
+*.zip
+
+# --- generated at runtime -------------------------------------------------
+profiles.json
+diagnostics_*.txt
+crash_*.txt
+*.log
+
+# --- caches ---------------------------------------------------------------
+__pycache__/
+*.pyc
+.geo_cache/
+
+# --- local / personal config ---------------------------------------------
+# Run_Helper.ps1 may contain your server IPs and geoip path - keep a copy of
+# the stock version and never push your edits, or move your values into an
+# untracked override file instead.
+# Run_Helper.local.ps1
+
+# --- editor / OS ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
