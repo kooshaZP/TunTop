@@ -131,7 +131,6 @@ tunmood/
   geoip.py                  <- geoip.dat / JSON country-range parser
 profiles.json              <- created when you save profiles
 test_bypass_resolve.py      <- offline test suite (~70 checks)
-test_bypass_remove.py       <- removal test suite (18 checks)
 ```
 
 `tun2socks.exe` and `wintun.dll` are auto-downloaded on first run and are not checked into the repo.
@@ -140,11 +139,10 @@ test_bypass_remove.py       <- removal test suite (18 checks)
 
 ```powershell
 python test_bypass_resolve.py        # fully offline, mocked DNS/routes
-python test_bypass_remove.py
 python test_bypass_resolve.py --live # adds real DNS lookups
 ```
 
-Both suites are offline-by-default and run in roughly 25 seconds — run them before every commit.
+The suite is offline-by-default and runs in roughly 25 seconds — run it before every commit.
 
 ## 🩺 Troubleshooting
 

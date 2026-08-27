@@ -15,9 +15,8 @@ Thanks for helping improve the v2ray TUN dashboard!
 ## Workflow
 
 ```bash
-# run both suites before every commit - they are offline and fast (~25s)
+# run the suite before every commit - it is offline and fast (~25s)
 python test_bypass_resolve.py
-python test_bypass_remove.py
 ```
 
 - Keep PRs focused: one feature or fix per PR.

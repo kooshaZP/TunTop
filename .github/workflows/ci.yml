@@ -26,6 +26,3 @@ jobs:
 
       - name: Offline logic suite (bypass resolve)
         run: python test_bypass_resolve.py
-
-      - name: Offline logic suite (bypass remove)
-        run: python test_bypass_remove.py

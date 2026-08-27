@@ -4328,6 +4328,10 @@ class BTopTui:
             return "".join(
                 _SPARK_BLOCKS[min(n, int(v / m * n))] for v in seq)
 
+        # Shared vertical scale so the two directions are directly comparable.
+        peak_ref = max((max(rx_snap) if rx_snap else 0.0),
+                       (max(tx_snap) if tx_snap else 0.0), 0.01)
+
         # Mood state per direction from the CURRENT sample vs window peak.
         def _mood_of(cur):
             if cur <= 2048:                       # < 2 KiB/s == idle
@@ -4354,10 +4358,6 @@ class BTopTui:
                       (235, 255, 200) if hot else (150, 255, 180))
         up_stops = ((12, 60, 88), (48, 168, 220),
                     (230, 244, 255) if hot else (140, 235, 255))
-
-        # Shared vertical scale so the two directions are directly comparable.
-        peak_ref = max((max(rx_snap) if rx_snap else 0.0),
-                       (max(tx_snap) if tx_snap else 0.0), 0.01)
 
         def _area(vals, hi, lo, peak, height, mode="block", idle_mark=None,
                   stops=None, pulse=False):
