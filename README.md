@@ -1,6 +1,6 @@
 # TunMood
 
-[![CI](https://github.com/kooshaZP/tun-mood/actions/workflows/ci.yml/badge.svg)](https://github.com/kooshaZP/tun-mood/actions)
+[![CI](https://github.com/kooshaZP/TunTop/actions/workflows/ci.yml/badge.svg)](https://github.com/kooshaZP/TunTop/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/kooshaZP/tun-mood/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](#requirements)
 [![Python](https://img.shields.io/badge/python-3.10%2B-informational)](#requirements)
