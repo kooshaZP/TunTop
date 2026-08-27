@@ -1,7 +1,7 @@
 # TunMood
 
 [![CI](https://github.com/kooshaZP/TunTop/actions/workflows/ci.yml/badge.svg)](https://github.com/kooshaZP/TunTop/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/kooshaZP/tun-mood/blob/main/LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/kooshaZP/TunTop/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](#requirements)
 [![Python](https://img.shields.io/badge/python-3.10%2B-informational)](#requirements)
 [![Dependencies](https://img.shields.io/badge/pip%20deps-zero-brightgreen)](#-files)
@@ -13,9 +13,16 @@ TunMood drives a Wintun TUN adapter from your v2rayN (VLESS) proxy so every app 
 > ⚠️ The dashboard builds and owns the tunnel itself. Never run `tunmood/helper.py` directly — always launch through `Run_Helper.ps1` or `tunmood/dashboard.py`.
 
 <p align="center">
-  <!-- Swap this in once you've got a capture: -->
-  <!-- <img src="docs/dashboard.gif" width="720" alt="TunMood dashboard demo"> -->
-  <em>Screenshot / GIF of the dashboard goes here.</em>
+  <img src="docs/dashboard-3.jpg" width="720" alt="TunMood dashboard - live throughput graphs & health suite"><br>
+  <em>TunMood dashboard: live btop-style throughput graphs, health-check suite, and bypass controls.</em><br>
+  <img src="docs/dashboard-1.jpg" width="360" alt="TunMood dashboard view 1">
+  <img src="docs/dashboard-4.jpg" width="360" alt="TunMood dashboard view 2">
+</p>
+
+<p align="center">
+  <img src="docs/dashboard-2.jpg" width="320" alt="TunMood dashboard view 3">
+  <img src="docs/dashboard-5.jpg" width="320" alt="TunMood dashboard view 4">
+  <img src="docs/dashboard-6.jpg" width="320" alt="TunMood dashboard view 5">
 </p>
 
 ## Contents
@@ -81,8 +88,8 @@ flowchart LR
 
 1. **Get the repo**
    ```powershell
-   git clone https://github.com/kooshaZP/tun-mood.git
-   cd tun-mood
+   git clone https://github.com/kooshaZP/TunTop.git
+   cd TunTop
    ```
 2. **Set up v2rayN** — install [v2rayN](https://github.com/2dust/v2rayN), add your VLESS server, and enable the local SOCKS inbound (default `127.0.0.1:10808`).
 3. **Run the launcher**
@@ -154,7 +161,7 @@ Both suites are offline-by-default and run in roughly 25 seconds — run them be
 
 ## 🤝 Contributing
 
-See [CONTRIBUTING.md](https://github.com/kooshaZP/tun-mood/blob/main/CONTRIBUTING.md) for the full guide. The short version:
+See [CONTRIBUTING.md](https://github.com/kooshaZP/TunTop/blob/main/CONTRIBUTING.md) for the full guide. The short version:
 
 - **Standard library only** — no new pip dependencies without discussing them in an issue first.
 - **The UI must never block** — DNS, PowerShell, and route operations belong on background threads.
@@ -172,4 +179,4 @@ TunMood builds on top of:
 
 ## 📄 License
 
-[MIT](https://github.com/kooshaZP/tun-mood/blob/main/LICENSE)
+[MIT](https://github.com/kooshaZP/TunTop/blob/main/LICENSE)
