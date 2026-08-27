@@ -87,7 +87,6 @@ def run_case(label, entry, seeded_state, seeded_cache, expect_ips):
     if seeded_cache is not None:
         tui._bypass_res_cache[entry] = seeded_cache
     tui.ns.bypass_ip = [entry]
-    tui._bypass_autorestart = False
 
     print(f"\n  case: {label}")
     print(f"    entry={entry!r} seeded_state={'yes' if seeded_state else 'no'} "

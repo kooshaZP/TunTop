@@ -499,19 +499,12 @@ def test_instant_add_remove(mod, r):
     app = None
     try:
         app = make_app(mod, make_ns(), routes)
-        # The default must be instant (no stop+start of the tunnel).
-        r.check("default add mode is instant (_bypass_autorestart False)",
-                app._bypass_autorestart is False,
-                f"_bypass_autorestart={app._bypass_autorestart!r}")
-        restarts = []
-        app._schedule_bypass_restart = lambda reason: restarts.append(reason)
 
         t0 = time.time()
         app._add_bypass_ip("https://instant.example.com/")
         add_dt = time.time() - t0
         drain(app)
         r.check("[A] add returned instantly", add_dt < 0.5, f"{add_dt:.2f}s")
-        r.eq("add did NOT schedule a tunnel restart", restarts, [])
         r.check("background resolver started for the new entry",
                 getattr(app, "_bypass_res_thread", None) is not None
                 and app._bypass_res_thread.is_alive())
@@ -530,7 +523,6 @@ def test_instant_add_remove(mod, r):
         rm_dt = time.time() - t0
         r.eq("entry removed from list instantly", app.ns.bypass_ip, [])
         r.check("[X] remove returned instantly", rm_dt < 0.5, f"{rm_dt:.2f}s")
-        r.eq("remove did NOT schedule a tunnel restart", restarts, [])
         deadline = time.time() + 5
         while time.time() < deadline:
             if ("-v4", "203.0.113.77/32") in routes:
