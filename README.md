@@ -130,19 +130,13 @@ tunmood/
   netdns.py                <- resolver: cache, UDP/53 + DoH fallbacks
   geoip.py                  <- geoip.dat / JSON country-range parser
 profiles.json              <- created when you save profiles
-test_bypass_resolve.py      <- offline test suite (~70 checks)
 ```
 
 `tun2socks.exe` and `wintun.dll` are auto-downloaded on first run and are not checked into the repo.
 
 ## 🧪 Tests
 
-```powershell
-python test_bypass_resolve.py        # fully offline, mocked DNS/routes
-python test_bypass_resolve.py --live # adds real DNS lookups
-```
-
-The suite is offline-by-default and runs in roughly 25 seconds — run it before every commit.
+There is currently no automated test suite checked into the repo.
 
 ## 🩺 Troubleshooting
 

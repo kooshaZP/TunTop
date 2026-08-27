@@ -15,8 +15,8 @@ Thanks for helping improve the v2ray TUN dashboard!
 ## Workflow
 
 ```bash
-# run the suite before every commit - it is offline and fast (~25s)
-python test_bypass_resolve.py
+# run the dashboard / helper through your manual checks before every commit
+python tunmood/dashboard.py --help
 ```
 
 - Keep PRs focused: one feature or fix per PR.

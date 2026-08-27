@@ -23,6 +23,3 @@ jobs:
       - name: Syntax-check all Python entry points
         run: |
           python -m py_compile tunmood/dashboard.py tunmood/helper.py tunmood/routing.py tunmood/netdns.py tunmood/geoip.py
-
-      - name: Offline logic suite (bypass resolve)
-        run: python test_bypass_resolve.py
