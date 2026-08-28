@@ -47,6 +47,14 @@ from tunmood.netdns import (           # noqa: E402
     _dns_cache_clear, _dns_build_query, _dns_parse_answers,
     _dns_query_udp, _dns_query_doh,
 )
+from tunmood.state import (            # noqa: E402
+    TunnelState, TunnelStateMachine,
+)
+from tunmood.recovery import (         # noqa: E402
+    FailureKind, RecoveryAction, RecoveryEngine,
+)
+from tunmood.routes_txn import RouteTransaction   # noqa: E402
+from tunmood import startup_recovery              # noqa: E402
 
 
 # Crash log written next to this script. main() catches anything that gets
@@ -1832,6 +1840,47 @@ class BTopTui:
         self.ns = args
         self.proc = None
         self.logs = queue.Queue()
+
+        # Tunnel state machine (tunmood/state.py): the single source of
+        # truth for what the tunnel is doing - far beyond the old
+        # "helper process alive => RUNNING" boolean. Phases of the start
+        # sequence, degradation, self-heal and teardown are all explicit
+        # states now; every transition is mirrored into the event log (see
+        # _on_tunnel_state_change) so a stuck or failing start is visible
+        # in the UI instead of a dashboard that just keeps saying RUNNING.
+        self.tunnel = TunnelStateMachine()
+        self.tunnel.observe(self._on_tunnel_state_change)
+
+        # Recovery engine (tunmood/recovery.py): bounded, backoff-based
+        # repair policy on top of the state machine. A dead helper gets
+        # auto-restarted (max 3 attempts, 1s/2s/4s backoff, crash-loop
+        # protection); persistent DEGRADED escalates to a restart only
+        # after the helper's own self-heal had 90s to work. Disabled with
+        # --no-auto-recover (the engine then stays paused).
+        self.recovery = RecoveryEngine(
+            self.tunnel, log=lambda msg: self.logs.put(msg),
+            max_attempts=3, give_up_after=3)
+        self.recovery.register(FailureKind.PROCESS, [RecoveryAction(
+            "restart the tunnel helper", repair=self._recover_restart_tunnel,
+            verify=lambda: bool(self.proc and self.proc.poll() is None))])
+        # DNS/proxy failures: the helper's own monitor/self-heal loop gets
+        # 90s (its retries + self-heal) before the engine escalates to a
+        # full restart - never fight the helper's own repair.
+        self.recovery.register(FailureKind.DNS, [RecoveryAction(
+            "restart the tunnel helper", repair=self._recover_restart_tunnel,
+            verify=lambda: bool(self.proc and self.proc.poll() is None))],
+            first_delay=90)
+        self.recovery.register(FailureKind.PROXY, [RecoveryAction(
+            "restart the tunnel helper", repair=self._recover_restart_tunnel,
+            verify=lambda: bool(self.proc and self.proc.poll() is None))],
+            first_delay=90)
+        # Opt-out: --no-auto-recover keeps the engine paused forever (the
+        # state machine still tracks phases; nothing is auto-repaired).
+        if getattr(self.ns, "no_auto_recover", False):
+            self.recovery.pause("disabled by --no-auto-recover")
+        else:
+            self.recovery.start()
+
         self.results = []
         self.checking = False
         self.running = True
@@ -1876,8 +1925,10 @@ class BTopTui:
         self._ping_ts = 0
         self._vpn_cache_ts = 0
         self._vpn_status = None
-        # Tunnel state watcher (loop()): None until the first check primes it,
-        # then "RUNNING"/"STOPPED" - transitions emit event-log notifications.
+        # Tunnel state watcher (loop()): None until the first check primes
+        # it, then the machine's state string - it announces tunnel DOWN
+        # (terminal state) transitions; every other transition is already
+        # announced by _on_tunnel_state_change.
         self._last_seen_state = None
         self._mouse_retry_done = False
 
@@ -2094,11 +2145,79 @@ class BTopTui:
         s = self.ping_samples
         return round(sum(s) / len(s)) if s else None
 
+    def _on_tunnel_state_change(self, tr):
+        """TunnelStateMachine observer: mirror every state transition into
+        the event log so the user sees exactly which phase the tunnel is
+        in - and, when things go wrong, exactly which phase failed. Runs on
+        whichever thread made the transition (UI, helper reader or
+        telemetry); self.logs is a thread-safe queue drained by loop()."""
+        try:
+            self.logs.put(f"[*] TUNNEL: {tr.source.value} -> "
+                          f"{tr.target.value}" + (f" - {tr.reason}"
+                                                  if tr.reason else ""))
+            # Feed the recovery engine: a verified RUNNING closes any open
+            # incident; an unexpected helper death opens one (user-initiated
+            # stop paths pause the engine first, so their STOPPED
+            # transitions are absorbed, not treated as crashes).
+            if tr.target is TunnelState.RUNNING:
+                self.recovery.report_success()
+            elif tr.target is TunnelState.STOPPED and \
+                    (tr.reason or "").startswith("helper process"):
+                self.recovery.report_failure(FailureKind.PROCESS,
+                                             tr.reason or "helper died")
+        except Exception:
+            pass
+
+    def _recover_restart_tunnel(self):
+        """Recovery-engine repair: full stop + start of the tunnel helper -
+        the only dashboard-owned repair for a dead or unfixable helper.
+        Serialised against bypass restarts; refuses to run while a user
+        shutdown is in progress. Returns True when a helper process is
+        alive again (the machine reaches RUNNING when the helper itself
+        announces stability)."""
+        if not getattr(self.ns, "server", None):
+            return False
+        if self._shutting_down or self._cleanup_done:
+            return False
+        with self._restart_lock:
+            if self._bypass_restart_active:
+                return True      # a restart is already in flight
+            self._bypass_restart_active = True
+        try:
+            self._blog("[*] Recovery: restarting the tunnel...")
+            try:
+                self.stop()
+            except Exception as e:
+                self._blog(f"[!] stop during recovery restart failed: {e}")
+            try:
+                self.launch()
+            except Exception as e:
+                self._blog(f"[!] launch during recovery restart failed: {e}")
+            return bool(self.proc and self.proc.poll() is None)
+        finally:
+            with self._restart_lock:
+                self._bypass_restart_active = False
+
     @property
     def state(self):
-        if self.proc and self.proc.poll() is None:
-            return "RUNNING"
-        return "STOPPED"
+        """The tunnel state as a plain string ("RUNNING", "STOPPED",
+        "VERIFYING", ...), backed by the state machine.
+
+        Reconciled against the helper process on every read: if the machine
+        thinks the tunnel is up (or starting) but the helper process is
+        gone, the machine is driven down right here. The helper-output
+        reader thread normally handles that first; this is the belt to its
+        braces, covering a dead reader thread too. A dead helper can
+        therefore never leave the dashboard claiming RUNNING."""
+        st = self.tunnel.current
+        if (st.is_operational or st is TunnelState.STARTING) and \
+                not (self.proc and self.proc.poll() is None):
+            self.tunnel.try_transition(TunnelState.STOPPING,
+                                       "helper process is gone")
+            self.tunnel.try_transition(TunnelState.STOPPED,
+                                       "helper process is gone")
+            st = self.tunnel.current
+        return st.value
 
     # ── Graph resolution mode ────────────────────────────────────────────
 
@@ -2602,9 +2721,16 @@ class BTopTui:
     def _install_bypass_routes(self, entry, ep4, ep6, log=True):
         """Install /32 + /128 bypass routes for one entry. Returns the list of
         IPs that are now routed direct. Safe to call from any thread: it only
-        shells out and logs through the queue."""
-        applied = []
+        shells out and logs through the queue.
+
+        TRANSACTIONAL (tunmood/routes_txn.py): every route of the entry is
+        applied as ONE all-or-nothing unit - each add is verified against the
+        real routing table, and any failure rolls back the routes already
+        applied. A half-installed bypass (IPv4 direct while IPv6 still dies
+        inside the TUN) can no longer happen."""
         iface_gw = self._get_vless_iface_gateway()
+        # ── Plan ────────────────────────────────────────────────────────
+        planned = []                   # (ip, RouteOp) in apply order
         for ip in ep4:
             # Route via the interface/gateway Windows would really use to reach
             # this IP (correct for split-tunnel VPNs), not the bare default.
@@ -2614,11 +2740,8 @@ class BTopTui:
                     self._blog(f"[!] No egress found for {ip} ({entry}); bypass route "
                                "not installed yet - will retry.")
                 continue
-            if _add_route_v4(f"{ip}/32", eg[0], eg[1], metric=1):
-                applied.append(ip)
-                self._live_bypass_added.append(("v4", f"{ip}/32", eg[0], eg[1]))
-            elif log:
-                self._blog(f"[!] Route add failed for {ip} ({entry}).")
+            planned.append(
+                (ip, ("v4", f"{ip}/32", eg[0], eg[1])))
         if ep6:
             v6gw = self._get_vless_iface_gateway_v6()
             if not v6gw:
@@ -2628,11 +2751,32 @@ class BTopTui:
             else:
                 v6iface, v6gateway = v6gw
                 for ip in ep6:
-                    if _add_route_v6(f"{ip}/128", v6iface, v6gateway, metric=1):
-                        applied.append(ip)
-                        self._live_bypass_added.append(("v6", f"{ip}/128", v6iface, v6gateway))
-                    elif log:
-                        self._blog(f"[!] IPv6 route add failed for {ip} ({entry}).")
+                    planned.append(
+                        (ip, ("v6", f"{ip}/128", v6iface, v6gateway)))
+        if not planned:
+            return []
+        # ── Apply (all-or-nothing) ──────────────────────────────────────
+        txn = RouteTransaction(log=self._blog if log else None)
+        for _ip, (fam, dest, iface, gw) in planned:
+            if fam == "v4":
+                txn.add_v4(dest, iface, gw, metric=1)
+            else:
+                txn.add_v6(dest, iface, gw, metric=1)
+        result = txn.commit()
+        if not result.ok:
+            # The table was rolled back: traffic path is UNCHANGED, so this
+            # is a clean "not applied" - the resolver retries later.
+            if log:
+                self._blog(f"[!] Bypass routes for {entry} FAILED - "
+                           "transaction rolled back, traffic path unchanged.")
+                for op, err in result.failed:
+                    self._blog(f"[!]   {op.dest} via {op.iface}: {err}")
+            return []
+        applied = []
+        for ip, (fam, dest, iface, gw) in planned:
+            applied.append(ip)
+            # Bookkeeping for stop()/exit sweeps (same tuples as before).
+            self._live_bypass_added.append((fam, dest, iface, gw))
         return applied
 
     def _bypass_resolve_entry(self, entry, log=True):
@@ -3972,7 +4116,17 @@ class BTopTui:
         vpn_bp_on = not getattr(self.ns, "no_vpn_bypass", False)
 
         badge = f"[ {state} ]"
-        badge_color = GREEN if state == "RUNNING" else RED
+        # Colour by state category, not just the RUNNING string: green =
+        # traffic flowing (RUNNING/DEGRADED keeps green but see below),
+        # yellow = a start/stop/self-heal phase in flight, red = stopped or
+        # failed. A normal start now reads VERIFYING in yellow instead of
+        # flashing an alarming red "not RUNNING".
+        if state in (TunnelState.RUNNING.value, TunnelState.DEGRADED.value):
+            badge_color = GREEN
+        elif state in (TunnelState.STOPPED.value, TunnelState.FAILED.value):
+            badge_color = RED
+        else:
+            badge_color = YELLOW
         pairs = [
             ("MODE", WHITE + mode + RESET),
             ("PROXY", CYAN + f"127.0.0.1:{self.ns.port}" + RESET),
@@ -4835,22 +4989,19 @@ class BTopTui:
                     if self._mouse_ok and self._stdin_handle is not before:
                         self.log_lines.append("[+] Mouse: on (late init worked).")
 
-                # Tunnel state watcher: notify the user the moment the TUN
-                # comes up or goes down (start attempted -> UP, stop/crash ->
-                # DOWN). The very first check only primes the tracker so a
-                # fresh dashboard doesn't log a bogus "DOWN" line.
+                # Tunnel state watcher: announce the tunnel going DOWN the
+                # moment the machine reaches a terminal state (with the
+                # reason). Every other transition is already mirrored into
+                # the event log by _on_tunnel_state_change; the very first
+                # check only primes the tracker so a fresh dashboard doesn't
+                # log a bogus "DOWN" line.
                 st = self.state
                 if st != self._last_seen_state:
-                    if self._last_seen_state is not None:
-                        if st == "RUNNING":
-                            # Helper process alive != tunnel ready; the real
-                            # "ready" announcement comes from the helper's
-                            # post-stability marker (see _read()).
-                            self.logs.put("[*] Helper process running - "
-                                          "installing routes...")
-                        else:
-                            self.logs.put("[!] TUN went DOWN - traffic leaves "
-                                          "via the physical NIC until restarted.")
+                    if self._last_seen_state is not None and \
+                            st in (TunnelState.STOPPED.value,
+                                   TunnelState.FAILED.value):
+                        self.logs.put("[!] TUN went DOWN - traffic leaves "
+                                      "via the physical NIC until restarted.")
                     self._last_seen_state = st
 
                 # Drain log queue
@@ -4898,12 +5049,20 @@ class BTopTui:
             self._telemetry_running = False
             sys.stdout.write("\033[?25h")  # restore the caret
             sys.stdout.flush()
+            # Stop the recovery worker before teardown: no attempt may fire
+            # while the route table is being cleared, and its thread must
+            # never keep the process alive past exit.
+            self.recovery.pause("app exiting")
+            self.recovery.shutdown()
             self.stop()
             self._restore_console_mode()
 
     def launch(self):
         if not getattr(self.ns, "server", None):
             return
+        # A fresh user start always re-arms recovery (clears give-up state)
+        # and closes any stale incident from the previous run.
+        self.recovery.resume()
         self.logs.put("[*] Start requested - launching tunnel helper...")
         import sys as _sys
         cmd = [_sys.executable, os.path.join(os.path.dirname(__file__), "helper.py"),
@@ -4950,6 +5109,11 @@ class BTopTui:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 encoding="utf-8", errors="replace", env=child_env,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            # The helper is alive: the machine leaves STOPPED and walks the
+            # start sequence from here (VERIFYING on "[+] TUNNEL ACTIVE",
+            # RUNNING on the START SEQUENCE COMPLETE marker - see _read).
+            self.tunnel.try_transition(TunnelState.STARTING,
+                                       f"helper launched (PID {self.proc.pid})")
             self.logs.put(f"[+] Helper launched (PID {self.proc.pid}) - "
                           f"bringing up the Wintun adapter, routes follow...")
             self.logs.put(f"[dns] configured resolver: {self.ns.dns4}")
@@ -4987,8 +5151,12 @@ class BTopTui:
                     # restart; deduplicate them to ONE event-log line per session.
                     if self._geo_diag_suppress(s):
                         continue
-                    # Start-sequence milestones: surface each phase to the user.
+                    # Start-sequence milestones: surface each phase to the
+                    # user AND advance the tunnel state machine to match.
                     if s.strip() == "[+] TUNNEL ACTIVE":
+                        self.tunnel.try_transition(
+                            TunnelState.VERIFYING,
+                            "routes installed - probing real traffic")
                         self.logs.put("[*] Routes installed - verifying traffic "
                                       "through the TUN...")
                         self.logs.put(s)
@@ -4996,6 +5164,9 @@ class BTopTui:
                     if "Press Ctrl+C to stop" in s:
                         # Emitted by the helper only AFTER wait_for_tunnel_stable()
                         # succeeded - this is the true "ready" moment.
+                        self.tunnel.try_transition(
+                            TunnelState.RUNNING,
+                            "start sequence complete - tunnel stable")
                         self.logs.put("[+] START SEQUENCE COMPLETE - the TUN is "
                                       "READY TO USE.")
                         continue
@@ -5005,15 +5176,59 @@ class BTopTui:
                         self.logs.put("[*] Loading geo bypass ranges (this can "
                                       "take a moment)...")
                         continue
+                    # Monitor failures/self-heal: reflect them on the state
+                    # machine immediately, so DEGRADED/RECOVERING show up in
+                    # the UI instead of the dashboard claiming RUNNING while
+                    # the tunnel silently struggles.
+                    if s.startswith("[MONITOR] tunnel check failed"):
+                        self.tunnel.try_transition(
+                            TunnelState.DEGRADED,
+                            s.split(":", 1)[-1].strip() or "monitor probe failed")
+                        # Also tell the recovery engine. It waits 90s (the
+                        # helper's own self-heal window) before escalating;
+                        # a self-heal success (-> RUNNING) closes the
+                        # incident instead.
+                        self.recovery.report_failure(
+                            FailureKind.DNS,
+                            s.split(":", 1)[-1].strip() or "monitor probe failed")
+                    if s.startswith("[*] Self-healing:"):
+                        self.tunnel.try_transition(
+                            TunnelState.RECOVERING,
+                            "self-heal: re-applying wintun config and routes")
+                        self.logs.put(s)
+                        continue
+                    if s.startswith("[+] Self-heal applied."):
+                        self.tunnel.try_transition(
+                            TunnelState.RUNNING, "self-heal applied")
+                        self.logs.put(s)
+                        continue
                     # The helper's monitor prints "[MONITOR] tunnel OK: ..."
                     # every 30s forever - pure noise in the log (it says nothing
-                    # new). Drop the success heartbeats; FAILURES still pass
-                    # through below, since those actually need attention.
+                    # new). Drop the success heartbeats; a DEGRADED tunnel that
+                    # probes OK again is silently restored to RUNNING above the
+                    # drop. FAILURES still pass through below, since those
+                    # actually need attention.
                     if s.startswith("[MONITOR] tunnel OK"):
+                        self.tunnel.try_transition(
+                            TunnelState.RUNNING, "monitor probe OK")
                         continue
                     self.logs.put(s)
+                # Helper stdout closed: the process has exited (clean stop,
+                # crash or external kill). Drive the machine down so neither
+                # the UI nor live-bypass logic can keep treating a dead
+                # tunnel as RUNNING. try_transition (not transition): the
+                # user's [Q] teardown may already have claimed STOPPING.
+                self.tunnel.try_transition(TunnelState.STOPPING,
+                                           "helper process exited")
+                self.tunnel.try_transition(TunnelState.STOPPED,
+                                           "helper process exited")
             threading.Thread(target=_read, daemon=True).start()
         except Exception as e:
+            # Still in STOPPED (the STARTING transition only happens after a
+            # successful Popen): record the failure on the machine so the UI
+            # and diagnostics see it, not just the log line.
+            self.tunnel.try_transition(TunnelState.FAILED,
+                                       f"helper launch failed: {e}")
             self.log_lines.append(f"[!] Failed to launch: {e}")
 
     def _final_host_route_sweep(self):
@@ -5374,6 +5589,12 @@ class BTopTui:
         if self._shutting_down:
             return
         self._shutting_down = True
+        # The [Q] path does NOT go through stop() - pause recovery (this is
+        # a user-initiated quit, never a crash to repair) and drive the
+        # machine into STOPPING so the UI/telemetry see the teardown phase.
+        self.recovery.pause("shutdown requested [Q]")
+        self.tunnel.try_transition(TunnelState.STOPPING,
+                                   "shutdown requested [Q]")
 
         # Ordered, weighted cleanup tasks. Each becomes a CHECKLIST row in the
         # redesigned shutdown panel: ✔ done / ▸ running / ◦ pending, plus a
@@ -5460,6 +5681,9 @@ class BTopTui:
 
         self._cleanup_done = True
         self.running = False
+        # Every route is verified gone: the machine may now rest.
+        self.tunnel.try_transition(TunnelState.STOPPED,
+                                   "shutdown complete - routes verified clear")
 
     def _draw_shutdown(self):
         """Render the full-screen teardown screen: a CHECKLIST of cleanup steps
@@ -5538,6 +5762,12 @@ class BTopTui:
         # progress bar) and sets `_cleanup_done`; don't repeat that work here.
         if self._cleanup_done:
             return
+        # User-initiated stop: pause recovery FIRST so the machine's walk
+        # down (STOPPING/STOPPED) is never mistaken for a crash to repair.
+        self.recovery.pause("stop requested")
+        # Announce teardown on the machine (no-op if the helper-exit path in
+        # _read already claimed STOPPING/STOPPED - try_transition ignores it).
+        self.tunnel.try_transition(TunnelState.STOPPING, "stop requested")
         if self.proc and self.proc.poll() is None:
             try:
                 self.logs.put("[*] Stopping helper...")
@@ -5558,6 +5788,7 @@ class BTopTui:
         # Belt-and-braces: also clear anything the helper may have left behind
         # if it had to be force-killed (its own cleanup never ran then).
         self._exit_route_sweep()
+        self.tunnel.try_transition(TunnelState.STOPPED, "teardown complete")
 
     def _schedule_bypass_restart(self, reason):
         """Apply a changed --bypass-ip list by fully restarting the tunnel
@@ -5614,6 +5845,10 @@ def main():
     ap.add_argument("--port", type=int, default=10808, help="SOCKS5 inbound port")
     ap.add_argument("--tun2socks", default=os.path.join(os.path.dirname(__file__), "tun2socks-windows-amd64-v3.exe"))
     ap.add_argument("--no-vpn-bypass", action="store_true")
+    ap.add_argument("--no-auto-recover", action="store_true",
+                    help="Disable automatic crash/degradation recovery "
+                         "(auto-restart of a dead helper is off; the state "
+                         "machine still reports phases)")
     ap.add_argument("--vless-over-vpn", action="store_true")
     ap.add_argument("--vpn-interface", default=None)
     ap.add_argument("--endpoint-port", type=int, default=443)
@@ -5657,6 +5892,25 @@ def main():
     _enable_ansi()
     # Resize the console so the full dashboard fits on one screen.
     _resize_console()
+
+    # ── Startup crash recovery (tunmood/startup_recovery.py) ────────────
+    # A hard-killed previous run leaves orphaned tun2socks, the Wintun
+    # adapter + its routes, and per-host bypass routes behind. Detect and
+    # clean ALL of it BEFORE the new tunnel starts, so this launch never
+    # builds on top of stale state.
+    _startup_hosts = list(dict.fromkeys(
+        [s for s in (args.server or []) if s]
+        + [h for h in (args.bypass_ip or []) if h]))
+    try:
+        _recovery_actions = startup_recovery.startup_recover(
+            hosts=_startup_hosts, log=lambda m: print(m))
+        if _recovery_actions:
+            print("[+] Startup recovery complete - clean slate for this run.")
+    except Exception as e:
+        # Recovery must never block the launch; the helper's own
+        # preflight_cleanup is still there as the second line of defence.
+        print(f"[!] Startup recovery could not run: {e}")
+
     def _atexit_all():
         try:
             if app is not None:
@@ -5666,6 +5920,9 @@ def main():
         except Exception as e:
             print(f"[!] Route cleanup on exit failed: {e}")
         _teardown_wintun()
+        # Verified clean exit: the crash marker goes away, so the NEXT
+        # launch knows it starts from a clean slate.
+        startup_recovery.clear_marker()
     atexit.register(_atexit_all)
 
     if args.ascii:

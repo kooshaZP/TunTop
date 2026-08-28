@@ -7,4 +7,5 @@ geo-splitting, profiles and leak tests - with zero pip dependencies.
 """
 
 __version__ = "1.0.0"
-__all__ = ["dashboard", "helper", "routing", "netdns", "geoip"]
+__all__ = ["dashboard", "helper", "routing", "netdns", "geoip", "state",
+           "recovery", "routes_txn", "startup_recovery"]

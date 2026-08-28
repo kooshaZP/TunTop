@@ -8,6 +8,7 @@ profiles.json
 diagnostics_*.txt
 crash_*.txt
 *.log
+.last_run.json
 
 # --- caches ---------------------------------------------------------------
 __pycache__/

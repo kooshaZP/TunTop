@@ -22,4 +22,7 @@ jobs:
 
       - name: Syntax-check all Python entry points
         run: |
-          python -m py_compile tunmood/dashboard.py tunmood/helper.py tunmood/routing.py tunmood/netdns.py tunmood/geoip.py
+          python -m py_compile tunmood/dashboard.py tunmood/helper.py tunmood/routing.py tunmood/netdns.py tunmood/geoip.py tunmood/state.py tunmood/recovery.py tunmood/routes_txn.py tunmood/startup_recovery.py
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
