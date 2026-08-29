@@ -58,6 +58,10 @@ from tuntop import startup_recovery              # noqa: E402
 from tuntop import integrity                     # noqa: E402
 from tuntop import ui_text                       # noqa: E402
 from tuntop import profiles                      # noqa: E402
+from tuntop.structured_log import (              # noqa: E402
+    LogRing, INFO as _LOG_INFO, WARNING as _LOG_WARNING,
+    ERROR as _LOG_ERROR,
+)
 
 
 # Crash log written next to this script. main() catches anything that gets
@@ -1738,6 +1742,12 @@ class BTopTui:
         self.checking = False
         self.running = True
 
+        # Structured event log (tuntop/structured_log.py): every significant
+        # event goes through here with timestamp, severity, component and
+        # state — used by the event panel, diagnostics export, and
+        # (eventually) JSON bug reports.
+        self.event_log = LogRing(capacity=500)
+
         # [Q] shutdown-with-progress state. While `_shutting_down` is True the
         # dashboard runs a blocking, single-threaded route-clearing sequence and
         # draws a dedicated progress bar; it does NOT exit until every route is
@@ -2525,6 +2535,10 @@ class BTopTui:
             self.logs.put(msg)
         except Exception:
             self.log_lines.append(msg)
+        # Mirror into the structured ring for diagnostics and the event panel.
+        sev = _LOG_ERROR if msg.startswith("[!]") else (
+            _LOG_WARNING if msg.startswith("[*]") else _LOG_INFO)
+        self.event_log.log(sev, "DASHBOARD", msg)
 
     def _geo_diag_suppress(self, line):
         """Return True if this geoip diagnostic has already been logged this
@@ -3280,6 +3294,9 @@ class BTopTui:
             secs.append(("LAST HEALTH SCAN", rows))
             logs = "\n".join(self.log_lines[-150:]) or "  (empty)"
             secs.append(("EVENT LOG (last 150)", logs))
+            # Structured event log — machine-readable version of the above.
+            secs.append(("STRUCTURED EVENT LOG (all)", self.event_log.dump_text()
+                          or "  (empty)"))
             ok, out = _ps(
                 "Get-NetRoute -ErrorAction SilentlyContinue | "
                 "Where-Object { $_.InterfaceAlias -eq 'wintun' -or "
