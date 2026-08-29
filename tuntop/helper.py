@@ -1649,43 +1649,66 @@ def _probe_tunnel_once(url="https://api.ipify.org/", timeout=5):
         return False, f"{host} resolved ({', '.join(addrs)}) but fetch failed: {e}"
 
 
-def wait_for_tunnel_stable(url="https://api.ipify.org/", attempts=40, interval=2):
-    """Block, retrying, until name resolution AND end-to-end HTTPS through the
-    TUN both work.  Right after the tun2socks IPv6 restart the adapter / DNS /
-    egress can still be "warming up", so a single early probe would wrongly
-    report the tunnel as broken.  This RETRIES instead of failing."""
+# Fast, reliable verification endpoints — tried in order.
+# connectivitycheck.gstatic.com (Android check) and cp.cloudflare.com both
+# respond in <100ms from almost anywhere; api.ipify.org is a slow fallback.
+_VERIFY_URLS = [
+    "http://connectivitycheck.gstatic.com/generate_204",
+    "http://cp.cloudflare.com/",
+    "https://api.ipify.org/",
+]
+
+
+def wait_for_tunnel_stable(timeout=5):
+    """Block until DNS + HTTP verification through the TUN succeeds.
+
+    Tries each of _VERIFY_URLS in order.  For each URL, up to 5 probes
+    with 2-second gaps (10 s max per URL).  If all URLs fail, auto-escalates
+    to DoH DNS and retries.  Total worst-case: ~60 s (down from ~160 s).
+
+    Returns True if the tunnel is verified, False if all attempts fail."""
     global _ACTIVE_DNS_MODE
+
+    for phase, url in enumerate(["plain DNS"] + _VERIFY_URLS):
+        is_dns_phase = (phase == 0)
+        if is_dns_phase:
+            continue  # DNS mode doesn't need its own loop; each URL tests DNS+HTTP
+
     last_err = ""
-    for i in range(1, attempts + 1):
-        ok, msg = _probe_tunnel_once(url, timeout=5)
-        if ok:
-            print(f"[+] Tunnel stable: {msg}")
-            return True
-        last_err = msg.split(": ", 1)[-1] if ": " in msg else msg
-        print(f"    [{i}/{attempts}] {msg}")
-        time.sleep(interval)
-    print(f"[!] Tunnel did not stabilize within {attempts * interval}s "
-          f"(last error: {last_err}). Routes are installed, but name "
-          f"resolution / egress through the TUN is not working yet.")
-    # Auto-escalate to DoH if plain DNS appears broken and we haven't tried it.
-    # TCP/443 relays reliably through the proxy where UDP/53 does not, so moving
-    # DNS onto DoH frequently unblocks name resolution without a restart.
+    for url in _VERIFY_URLS:
+        for i in range(1, 6):  # 5 attempts per URL
+            ok, msg = _probe_tunnel_once(url, timeout=timeout)
+            if ok:
+                print(f"[+] Tunnel stable: {msg}", flush=True)
+                return True
+            last_err = msg.split(": ", 1)[-1] if ": " in msg else msg
+            print(f"    [{i}/5] {url}: {msg}", flush=True)
+            time.sleep(2)
+        # This URL failed all 5 attempts; try the next one.
+        print(f"    [*] {url} unreachable, trying next endpoint...", flush=True)
+
+    print(f"[!] All verification endpoints failed (last: {last_err}). "
+          f"Routes are installed but egress through the TUN is not working yet.",
+          flush=True)
+
+    # Auto-escalate to DoH if plain DNS appears broken.
     if _ACTIVE_DNS_MODE == "auto":
-        print("[*] Plain DNS through the TUN failed; auto-switching wintun DNS to "
-              "DoH (HTTPS) so name resolution rides over TCP/443.")
+        print("[*] Auto-switching wintun DNS to DoH (HTTPS) so name resolution "
+              "rides over TCP/443...", flush=True)
         _ACTIVE_DNS_MODE = "doh"
         try:
             configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
         except Exception as e:
-            print(f"[!] DoH switch failed: {e}")
-        for i in range(1, attempts + 1):
-            ok, msg = _probe_tunnel_once(url, timeout=5)
-            if ok:
-                print(f"[+] Tunnel stable (via DoH): {msg}")
-                return True
-            last_err = msg.split(": ", 1)[-1] if ": " in msg else msg
-            print(f"    [{i}/{attempts}] (DoH) {msg}")
-            time.sleep(interval)
+            print(f"[!] DoH switch failed: {e}", flush=True)
+        for url in _VERIFY_URLS:
+            for i in range(1, 6):
+                ok, msg = _probe_tunnel_once(url, timeout=timeout)
+                if ok:
+                    print(f"[+] Tunnel stable (via DoH): {msg}", flush=True)
+                    return True
+                last_err = msg.split(": ", 1)[-1] if ": " in msg else msg
+                print(f"    [{i}/5] (DoH) {url}: {msg}", flush=True)
+                time.sleep(2)
     return False
 
 
@@ -2249,8 +2272,7 @@ def main():
     # right after the tun2socks restart) and fixes the old
     # "Could not resolve https://api.ipify.org/" failure, which was just the
     # full URL (scheme + path) being fed to getaddrinfo instead of a hostname.
-    print("[*] Verifying the tunnel is stable (resolving/connecting to "
-          "https://api.ipify.org/ through the TUN)...")
+    print("[*] Verifying the tunnel is stable...", flush=True)
     wait_for_tunnel_stable()
 
     print("[*] Press Ctrl+C to stop.", flush=True)
