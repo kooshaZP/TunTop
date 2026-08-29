@@ -62,6 +62,10 @@ from tuntop.structured_log import (              # noqa: E402
     LogRing, INFO as _LOG_INFO, WARNING as _LOG_WARNING,
     ERROR as _LOG_ERROR,
 )
+from tuntop.health_report import (              # noqa: E402
+    format_panel as _health_format_panel,
+    format_compact as _health_compact,
+)
 
 
 # Crash log written next to this script. main() catches anything that gets
@@ -3297,6 +3301,10 @@ class BTopTui:
             # Structured event log — machine-readable version of the above.
             secs.append(("STRUCTURED EVENT LOG (all)", self.event_log.dump_text()
                           or "  (empty)"))
+            # Visual health summary
+            secs.append(("HEALTH REPORT", "\n".join(
+                _health_format_panel(self.results, use_unicode=True))
+                or "  (no scan yet)"))
             ok, out = _ps(
                 "Get-NetRoute -ErrorAction SilentlyContinue | "
                 "Where-Object { $_.InterfaceAlias -eq 'wintun' -or "
