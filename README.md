@@ -48,9 +48,17 @@ Install [v2rayN](https://github.com/2dust/v2rayN), add your VLESS server, and en
 
 ### 3. Run
 
-```powershell
-powershell -ExecutionPolicy Bypass -File Run_Helper.ps1
-```
+> ⚠️ **Windows blocks `.ps1` scripts by default.** PowerShell's default
+> execution policy is `Restricted`, so double-clicking `Run_Helper.ps1`
+> does nothing (or opens it in Notepad). Use **one** of these:
+>
+> - **From a terminal** (recommended — also bypasses the policy):
+>   ```powershell
+>   powershell -ExecutionPolicy Bypass -File Run_Helper.ps1
+>   ```
+> - **From Explorer:** right-click `Run_Helper.ps1` → **Run with PowerShell**
+>   → confirm the UAC prompt. (The right-click "Run with PowerShell" entry
+>   already elevates and bypasses the policy for that one file.)
 
 Right-click `Run_Helper.ps1` → **Run with PowerShell** → confirm the UAC prompt. First run auto-downloads `tun2socks.exe` and `wintun.dll` if they're missing.
 
