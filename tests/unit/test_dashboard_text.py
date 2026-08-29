@@ -85,7 +85,8 @@ class TestConsoleSafe(unittest.TestCase):
 
     def test_non_ascii_becomes_dots_when_unicode_off(self):
         with mock.patch.object(dashboard, "USE_UNICODE", False):
-            self.assertEqual(dashboard._console_safe("café ✓"), "caf..")
+            # printable ASCII (incl. spaces) passes, everything else dots
+            self.assertEqual(dashboard._console_safe("café ✓"), "caf. .")
 
     def test_unicode_mode_leaves_text_alone(self):
         with mock.patch.object(dashboard, "USE_UNICODE", True):

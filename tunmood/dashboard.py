@@ -55,6 +55,7 @@ from tunmood.recovery import (         # noqa: E402
 )
 from tunmood.routes_txn import RouteTransaction   # noqa: E402
 from tunmood import startup_recovery              # noqa: E402
+from tunmood import integrity                     # noqa: E402
 
 
 # Crash log written next to this script. main() catches anything that gets
@@ -5849,6 +5850,10 @@ def main():
                     help="Disable automatic crash/degradation recovery "
                          "(auto-restart of a dead helper is off; the state "
                          "machine still reports phases)")
+    ap.add_argument("--trust-binaries", action="store_true",
+                    help="Skip the SHA-256 verification of tun2socks.exe / "
+                         "wintun.dll (only for binaries you rebuilt "
+                         "yourself - NOT recommended)")
     ap.add_argument("--vless-over-vpn", action="store_true")
     ap.add_argument("--vpn-interface", default=None)
     ap.add_argument("--endpoint-port", type=int, default=443)
@@ -5883,6 +5888,18 @@ def main():
 
     if not _admin():
         sys.exit("[!] Run this as Administrator (use Run_Helper.bat).")
+
+    # ── Binary integrity (tunmood/integrity.py) ─────────────────────────
+    # tun2socks.exe / wintun.dll run inside this ADMIN process: a swapped
+    # or corrupted binary is elevated code execution, so verify both
+    # against the pinned SHA-256 hashes BEFORE anything is launched.
+    # Refuses to start on MISSING/MISMATCH unless --trust-binaries.
+    _bin_ok, _bin_reports, _bin_msgs = integrity.verify_for_launch(
+        args.tun2socks, trust=args.trust_binaries)
+    for _m in _bin_msgs:
+        print(_m)
+    if not _bin_ok:
+        sys.exit(1)
 
     # Fix the console codepage/font up *before* deciding whether Unicode
     # glyphs are safe - this is what actually makes a plain cmd.exe or

@@ -54,6 +54,16 @@ class TestCrashLoopStoryline(unittest.TestCase):
         eng.register(FailureKind.PROCESS, [RecoveryAction(
             "restart the tunnel helper", repair=doomed_restart,
             verify=lambda: False)])
+
+        # The dashboard's wiring: the machine's transitions feed the engine.
+        def on_change(tr):
+            if tr.target is TunnelState.RUNNING:
+                eng.report_success()
+            elif tr.target is TunnelState.STOPPED and \
+                    (tr.reason or "").startswith("helper process"):
+                eng.report_failure(FailureKind.PROCESS, tr.reason)
+
+        m.observe(on_change)
         eng.start()
         try:
             # --- the good old days: the tunnel actually works once ---
@@ -61,22 +71,24 @@ class TestCrashLoopStoryline(unittest.TestCase):
             m.try_transition(TunnelState.VERIFYING, "routes installed")
             m.try_transition(TunnelState.RUNNING, "stable")
 
-            # --- crash #1: one verified recovery keeps faith ---
-            self.crash()
-            wait_for(lambda: eng.stats()["incidents"] == 1,
-                     what="first incident opened")
-
             # --- the tunnel turns unstable: every restart dies ---
-            # crash #2 -> incident 2 exhausts its 2 attempts
+            # crash #1 (from RUNNING) -> incident 1 exhausts (streak 1)
             self.crash()
             wait_for(lambda: eng.stats()["give_ups"] == 1,
+                     what="incident 1 exhausted")
+            # doomed relaunch + crash #2 -> incident 2 (streak 2)
+            m.try_transition(TunnelState.STARTING, "helper relaunched")
+            self.crash()
+            wait_for(lambda: eng.stats()["give_ups"] == 2,
                      what="incident 2 exhausted")
-            # crash #3 -> incident 3 exhausts -> streak of 3 -> give up
+            # doomed relaunch + crash #3 -> incident 3 -> streak of 3
+            m.try_transition(TunnelState.STARTING, "helper relaunched")
             self.crash()
             wait_for(lambda: eng.gave_up, what="crash-loop protection")
 
             # Between give-up and now, NOTHING restarts any more.
             before = self.restarts
+            m.try_transition(TunnelState.STARTING, "helper relaunched")
             self.crash()
             time.sleep(0.05)
             self.assertEqual(self.restarts, before)
@@ -88,7 +100,6 @@ class TestCrashLoopStoryline(unittest.TestCase):
                                 for ln in self.lines))
 
             # --- the human restarts manually: engine re-arms ---
-            self.m.reset("manual restart")
             self.eng.resume()
             self.assertFalse(self.eng.gave_up)
             self.m.try_transition(TunnelState.STARTING, "helper launched")

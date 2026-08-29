@@ -157,16 +157,21 @@ class RecoveryEngine:
         self._wakeup.set()
 
     def resume(self):
-        """Re-enable recovery after a pause (a fresh tunnel start began)."""
+        """Re-enable recovery (a fresh tunnel start began). Always re-arms:
+        clears crash-loop give-up and any stale incident - the dashboard
+        calls this on every launch, and a user-driven start is exactly the
+        'human intervened' event that ends a give-up."""
         with self._lock:
             was = self._paused
+            had_gave_up = self._gave_up
             self._paused = False
             self._incident = None
-            if was:
-                self._consecutive_failed = 0
-                self._gave_up = False
+            self._consecutive_failed = 0
+            self._gave_up = False
         if was:
             self._log("[i] Recovery armed.")
+        elif had_gave_up:
+            self._log("[i] Recovery re-armed after a fresh start.")
 
     @property
     def paused(self) -> bool:

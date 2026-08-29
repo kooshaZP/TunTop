@@ -15,9 +15,16 @@ Thanks for helping improve the v2ray TUN dashboard!
 ## Workflow
 
 ```bash
-# run the dashboard / helper through your manual checks before every commit
-python tunmood/dashboard.py --help
+# run the full test suite before every commit (no admin, no network needed)
+python -m unittest discover -s tests -t . -v
+
+# with the live-network tier included (needs Internet access)
+TUNTOP_NET_TESTS=1 python -m unittest discover -s tests -t . -v
 ```
+
+See `tests/README.md` for the tier layout (unit / routing / recovery /
+integration / network). New features need tests in the matching tier;
+bug fixes need a test that reproduces the bug first.
 
 - Keep PRs focused: one feature or fix per PR.
 - For UI changes, include a screenshot or GIF (the dashboard renders great in

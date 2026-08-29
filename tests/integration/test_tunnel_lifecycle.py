@@ -120,7 +120,8 @@ class TestFullSession(unittest.TestCase):
                      what="auto-restart to RUNNING")
             self.assertEqual(world.restarts, 1)
 
-            # 4. A restart that does NOT come back: three attempts fail.
+            # 4. A restart that does NOT come back: incident 2 exhausts
+            #    its 3 attempts (streak 1).
             world.helper_alive = False
 
             def broken_restart():
@@ -138,31 +139,32 @@ class TestFullSession(unittest.TestCase):
                      what="incident exhausted")
             self.assertEqual(world.restarts, 1 + 3)   # 1 ok + 3 failed tries
 
-            # 5. Second hopeless incident -> crash-loop protection trips.
+            # 5. A doomed relaunch dies again before it can verify:
+            #    another exhausted incident -> streak 2 -> crash-loop
+            #    protection trips.
+            m.try_transition(TunnelState.STARTING, "helper relaunched")
             m.try_transition(TunnelState.STOPPING, "helper process exited")
             m.try_transition(TunnelState.STOPPED, "helper process exited")
             wait_for(lambda: eng.gave_up, what="engine gave up")
 
-            # 6. After give-up, crashes are reported but nothing fires.
+            # 6. After give-up, crashes are still reported but NOTHING
+            #    fires any more.
             restarts_before = world.restarts
-            m.reset("user cleans up")
+            m.try_transition(TunnelState.STARTING, "helper relaunched")
             m.try_transition(TunnelState.STOPPED, "helper process exited")
             time.sleep(0.05)
             self.assertEqual(world.restarts, restarts_before)
 
-            # 7. A fresh user start re-arms the engine.
+            # 7. A fresh user start re-arms the engine (launch->resume()).
             eng.shutdown()
             eng.resume()
             self.assertFalse(eng.gave_up)
+
+            # The event stream the user read along the way is coherent.
+            self.assertTrue(any("Recovery verified" in ln for ln in log))
+            self.assertTrue(any("gave up" in ln for ln in log))
         finally:
             eng.shutdown()
-
-    def test_log_tells_the_story(self):
-        # The event stream built by the wiring is what a user reads (and
-        # what lands in the diagnostics export) - it must be coherent.
-        self.assertTrue(any("Recovery verified" in ln for ln in log)
-                        or any("restart the tunnel helper" in ln
-                               for ln in log))
 
 
 if __name__ == "__main__":

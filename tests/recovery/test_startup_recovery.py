@@ -80,7 +80,8 @@ class TestMarker(unittest.TestCase):
 class TestScan(unittest.TestCase):
     def test_clean_system_is_not_dirty(self):
         p, _, _ = make_probes()
-        f = scan(probes=p)
+        f = scan(probes=p,
+                 marker_path=os.path.join(tempfile.mkdtemp(), "none.json"))
         self.assertFalse(f.dirty)
         self.assertIsNone(f.marker)
         self.assertEqual(f.orphan_tun2socks, 0)

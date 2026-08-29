@@ -31,9 +31,9 @@ class TestVarint(unittest.TestCase):
         self.assertEqual(pos, 4)
 
     def test_continues_from_offset(self):
-        buf = b"\xff\x01\x02"          # varint 127 then byte 2
+        buf = b"\xff\x01\x02"          # varint 255 (two bytes) then byte 2
         value, pos = _read_varint(buf, 0)
-        self.assertEqual((value, pos), (127, 2))
+        self.assertEqual((value, pos), (255, 2))
         self.assertEqual(buf[pos], 2)
 
 
