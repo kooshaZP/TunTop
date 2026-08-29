@@ -92,3 +92,45 @@ def apply_to_args(ns, snap: dict, normalise_host=None) -> list:
     ns.vless_over_vpn = bool(snap.get("vless_over_vpn"))
     ns.no_vpn_bypass = bool(snap.get("no_vpn_bypass"))
     return applied
+
+
+def export_profile(path: str, name: str, snapshot: dict) -> tuple:
+    """Write a single profile to a standalone .json file for sharing.
+
+    The file is self-contained: it wraps the snapshot under a top-level
+    ``{"name": ..., "snapshot": ...}`` envelope so ``import_profile``
+    can validate it.  Returns (ok, message)."""
+    name = (name or "").strip()
+    if not name:
+        return False, "[!] Empty profile name - not exported."
+    try:
+        envelope = {"name": name, "snapshot": snapshot}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(envelope, f, indent=2)
+    except Exception as e:
+        return False, f"[!] Could not write profile: {e}"
+    return True, f"[+] Profile '{name}' exported to {os.path.basename(path)}."
+
+
+def import_profile(path: str) -> tuple:
+    """Read a standalone profile file previously created by ``export_profile``.
+
+    Returns (name, snapshot, error) where error is None on success,
+    or a human-readable error string."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, None, f"File not found: {path}"
+    except Exception as e:
+        return None, None, f"Could not read file: {e}"
+
+    if not isinstance(data, dict):
+        return None, None, "Invalid profile file (not a JSON object)."
+    name = data.get("name", "").strip()
+    snap = data.get("snapshot")
+    if not name:
+        return None, None, "Profile file missing 'name' field."
+    if not isinstance(snap, dict):
+        return None, None, "Profile file missing or invalid 'snapshot' field."
+    return name, snap, None
