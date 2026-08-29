@@ -1698,7 +1698,7 @@ def self_heal_tunnel(dns4, dns6):
     Best-effort: every step is individually guarded so one failing add cannot
     abort the rest, and the whole thing is wrapped so an unexpected error never
     crashes the running tunnel."""
-    print("[*] Self-healing: re-applying Wintun config and TUN routes...")
+    print("[*] Self-healing: re-applying Wintun config and TUN routes...", flush=True)
     try:
         if not wait_for_tun(timeout=5):
             print("[!] Self-heal: Wintun adapter is gone; cannot re-apply routes.")
@@ -1722,7 +1722,7 @@ def self_heal_tunnel(dns4, dns6):
                 _add_lan_bypass(_phys[0], _phys[1])
         except Exception:
             pass
-        print("[+] Self-heal applied.")
+        print("[+] Self-heal applied.", flush=True)
     except Exception as e:
         print(f"[!] Self-heal failed: {e}")
 
@@ -2229,8 +2229,8 @@ def main():
     # public default/split routes during install ordering.
     _add_lan_bypass(iface, gateway)
 
-    print()
-    print("[+] TUNNEL ACTIVE")
+    print(flush=True)
+    print("[+] TUNNEL ACTIVE", flush=True)
     if ipv4_ok:
         print("[+] IPv4: system -> Wintun -> tun2socks -> v2rayN (VPN-proof split default)")
     else:
@@ -2253,8 +2253,8 @@ def main():
           "https://api.ipify.org/ through the TUN)...")
     wait_for_tunnel_stable()
 
-    print("[*] Press Ctrl+C to stop.")
-    print()
+    print("[*] Press Ctrl+C to stop.", flush=True)
+    print(flush=True)
 
     last_vpn_status = None
     last_probe = 0.0
@@ -2280,10 +2280,10 @@ def main():
                 ok, msg = _probe_tunnel_once()
                 if ok:
                     fails = 0
-                    print(f"[MONITOR] tunnel OK: {msg}")
+                    print(f"[MONITOR] tunnel OK: {msg}", flush=True)
                 else:
                     fails += 1
-                    print(f"[MONITOR] tunnel check failed ({fails}/{mon_retries}): {msg}")
+                    print(f"[MONITOR] tunnel check failed ({fails}/{mon_retries}): {msg}", flush=True)
                     if fails >= mon_retries:
                         # Still in auto mode? Escalate DNS to DoH so resolution
                         # rides over TCP/443 instead of the broken UDP/53 path.

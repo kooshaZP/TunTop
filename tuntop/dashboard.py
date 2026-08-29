@@ -4948,6 +4948,10 @@ class BTopTui:
             child_env = os.environ.copy()
             child_env["PYTHONUTF8"] = "1"
             child_env["PYTHONIOENCODING"] = "utf-8"
+            child_env["PYTHONUNBUFFERED"] = "1"  # critical: helper stdout is
+            # piped (not a TTY), so Python block-buffers it by default.
+            # Without this the "[+] TUNNEL ACTIVE" marker can sit in a 4KB
+            # buffer forever, leaving the dashboard stuck at STARTING.
             self.proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 encoding="utf-8", errors="replace", env=child_env,
@@ -4973,6 +4977,12 @@ class BTopTui:
                 self._geo_disp_loaded = 0.0
                 self._geo_load_started_ts = None  # re-time this run's geo load
             self._geo_done_announced = False     # re-announce geo load per start
+            # Startup watchdog: if the helper doesn't emit "[+] TUNNEL ACTIVE"
+            # within STARTUP_TIMEOUT seconds it's almost certainly hung on a
+            # PowerShell/netsh call.  Kill it and report FAILED instead of
+            # leaving the dashboard stuck at STARTING forever.
+            self._start_ts = time.time()
+            self._start_timeout = 90  # seconds
             def _read():
                 for line in self.proc.stdout:
                     try:
@@ -5066,6 +5076,35 @@ class BTopTui:
                 self.tunnel.try_transition(TunnelState.STOPPED,
                                            "helper process exited")
             threading.Thread(target=_read, daemon=True).start()
+            # Watchdog: fires even when the helper produces zero output (hung
+            # on a netsh/PowerShell call).  Checks every 5 s; if the helper
+            # is still alive and still in STARTING after _start_timeout
+            # seconds, kill it so the user gets FAILED instead of a frozen
+            # dashboard.
+            def _startup_watchdog():
+                while self.proc and self.proc.poll() is None:
+                    time.sleep(5)
+                    if self.tunnel.current is not TunnelState.STARTING:
+                        return  # moved past STARTING - all good
+                    elapsed = time.time() - self._start_ts
+                    if elapsed > self._start_timeout:
+                        self.logs.put(
+                            f"[!] Helper hung for {elapsed:.0f}s without "
+                            f"completing startup (no '[+] TUNNEL ACTIVE' "
+                            f"marker). Killing it - check v2rayN and your "
+                            f"VLESS server, then try [S] again.")
+                        self.tunnel.try_transition(
+                            TunnelState.FAILED,
+                            f"helper hung for {elapsed:.0f}s during startup")
+                        try:
+                            self.proc.kill()
+                        except Exception:
+                            pass
+                        self.recovery.report_failure(
+                            FailureKind.PROCESS,
+                            f"helper hung for {elapsed:.0f}s")
+                        return
+            threading.Thread(target=_startup_watchdog, daemon=True).start()
         except Exception as e:
             # Still in STOPPED (the STARTING transition only happens after a
             # successful Popen): record the failure on the machine so the UI
