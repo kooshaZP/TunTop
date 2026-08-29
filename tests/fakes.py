@@ -1,4 +1,4 @@
-"""Shared test doubles for the whole suite.
+﻿"""Shared test doubles for the whole suite.
 
 `FakeRouter` is the in-memory routing table used wherever the real
 Windows route store would be touched (transactional route tests, the
@@ -23,7 +23,7 @@ class FakeRouter:
         self.calls = []
 
     def backend(self):
-        from tunmood.routes_txn import Backend
+        from tuntop.routes_txn import Backend
         return Backend(add_v4=self._add, exists_v4=self._exists,
                        del_v4=self._del, add_v6=self._add,
                        exists_v6=self._exists, del_v6=self._del)

@@ -1,4 +1,4 @@
-"""Integration tier: the dashboard's REAL bypass-install code path.
+﻿"""Integration tier: the dashboard's REAL bypass-install code path.
 
 Calls BTopTui._install_bypass_routes itself (the actual method, not a
 copy) with only the Windows edges patched out: the egress lookup and the
@@ -11,9 +11,9 @@ Run:  python -m unittest discover -s tests -t . -v
 import unittest
 from unittest import mock
 
-import tunmood.dashboard as dash
+import tuntop.dashboard as dash
 from tests.fakes import FakeRouter
-from tunmood.routes_txn import RouteTransaction
+from tuntop.routes_txn import RouteTransaction
 
 
 class FakeSelf:

@@ -1,4 +1,4 @@
-"""GeoIP database parsing: v2ray .dat (protobuf wire format), raw protobuf
+﻿"""GeoIP database parsing: v2ray .dat (protobuf wire format), raw protobuf
 and JSON variants, plus an on-disk cache. Moved verbatim out of the old
 single-file helper."""
 import hashlib
@@ -142,7 +142,7 @@ def download_geoip(dest_path, url=GEOIP_DAT_URL, sha_url=GEOIP_DAT_SHA_URL,
     sha = hashlib.sha256()
     done = 0
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "TunMood/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "TunTop/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             total = int(resp.headers.get("Content-Length") or 0)
             with os.fdopen(fd, "wb") as f:
@@ -176,7 +176,7 @@ def download_geoip(dest_path, url=GEOIP_DAT_URL, sha_url=GEOIP_DAT_SHA_URL,
         ref = None
         try:
             sreq = urllib.request.Request(
-                sha_url, headers={"User-Agent": "TunMood/1.0"})
+                sha_url, headers={"User-Agent": "TunTop/1.0"})
             with urllib.request.urlopen(sreq, timeout=30) as r:
                 txt = (r.read(512) or b"").decode("ascii", "replace")
             tok = txt.split()[0].strip().lower() if txt.split() else ""
@@ -196,7 +196,7 @@ def download_geoip(dest_path, url=GEOIP_DAT_URL, sha_url=GEOIP_DAT_SHA_URL,
     return done
 
 # ── Cross-run (on-disk) geo decode cache ──────────────────────────────────────
-# tunmood/helper.py is a brand-new Python process on every [S]/[T]→[S] cycle,
+# tuntop/helper.py is a brand-new Python process on every [S]/[T]→[S] cycle,
 # so the in-memory _GEOIP_CACHE below is wiped each time and the
 # whole .dat would be re-parsed from scratch every single run.  We mirror the
 # decoded result to a small pickle next to the script, keyed on the source

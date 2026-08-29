@@ -1,4 +1,4 @@
-"""Unit tests for tunmood.recovery - the recovery engine.
+﻿"""Unit tests for tuntop.recovery - the recovery engine.
 
 Deterministic: engines run with delay_scale=0.0 so backoff waits vanish,
 and a poll helper absorbs worker-thread scheduling jitter. Pure stdlib.
@@ -9,8 +9,8 @@ import threading
 import time
 import unittest
 
-from tunmood.recovery import FailureKind, RecoveryAction, RecoveryEngine
-from tunmood.state import TunnelState, TunnelStateMachine
+from tuntop.recovery import FailureKind, RecoveryAction, RecoveryEngine
+from tuntop.state import TunnelState, TunnelStateMachine
 
 
 def wait_for(predicate, timeout=3.0, what="condition"):

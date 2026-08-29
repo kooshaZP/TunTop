@@ -1,4 +1,4 @@
-"""Recovery tier: the crash storyline, told end to end.
+﻿"""Recovery tier: the crash storyline, told end to end.
 
 Not a single-engine unit test - this walks the exact sequence a user
 lives through when a machine is unstable: tunnel keeps dying, recovery
@@ -10,8 +10,8 @@ Run:  python -m unittest discover -s tests -t . -v
 import time
 import unittest
 
-from tunmood.recovery import FailureKind, RecoveryAction, RecoveryEngine
-from tunmood.state import TunnelState, TunnelStateMachine
+from tuntop.recovery import FailureKind, RecoveryAction, RecoveryEngine
+from tuntop.state import TunnelState, TunnelStateMachine
 
 
 def wait_for(predicate, timeout=3.0, what="condition"):
@@ -118,7 +118,7 @@ class TestCrashLoopStoryline(unittest.TestCase):
                              delay_scale=1.0)
         eng.register(FailureKind.DNS, [RecoveryAction(
             "futile fix", repair=lambda: False)])
-        from tunmood.recovery import _Incident
+        from tuntop.recovery import _Incident
         incident = _Incident(kind=FailureKind.DNS)
         eng._in_attempt = True
         eng._incident = incident

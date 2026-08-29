@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """btop-style dashboard for v2ray TUN monitoring.
 
 A separate, self-contained TUI inspired by btop/btop+ - panel-based layout,
@@ -7,7 +7,7 @@ active/inactive panel styling, and a clean dark theme.
 
 DOES NOT MODIFY ANY EXISTING FILE.  All helper logic is re-implemented locally.
 
-Usage:  python tunmood/dashboard.py --server IP [--port PORT] [--tun2socks PATH] [MODE FLAGS]
+Usage:  python tuntop/dashboard.py --server IP [--port PORT] [--tun2socks PATH] [MODE FLAGS]
 Run via Run_Helper.bat for admin elevation.
 """
 
@@ -35,27 +35,29 @@ _PKG_PARENT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 if _PKG_PARENT not in _sys.path:
     _sys.path.insert(0, _PKG_PARENT)
 
-from tunmood.routing import (          # noqa: E402
+from tuntop.routing import (          # noqa: E402
     _ps, _netsh, _teardown_wintun,
     _add_route_v4, _del_route_v4, _add_route_v6, _del_route_v6,
     _route_exists_v4, _route_exists_v6,
     _get_ipv4_default, _get_ipv6_default,
     _get_egress_for, _get_vpn_ipv4_default, _get_vpn_ipv6_default,
 )
-from tunmood.netdns import (           # noqa: E402
+from tuntop.netdns import (           # noqa: E402
     _host_from_url, _resolve, _resolve_cached, _resolve_detail,
     _dns_cache_clear, _dns_build_query, _dns_parse_answers,
     _dns_query_udp, _dns_query_doh,
 )
-from tunmood.state import (            # noqa: E402
+from tuntop.state import (            # noqa: E402
     TunnelState, TunnelStateMachine,
 )
-from tunmood.recovery import (         # noqa: E402
+from tuntop.recovery import (         # noqa: E402
     FailureKind, RecoveryAction, RecoveryEngine,
 )
-from tunmood.routes_txn import RouteTransaction   # noqa: E402
-from tunmood import startup_recovery              # noqa: E402
-from tunmood import integrity                     # noqa: E402
+from tuntop.routes_txn import RouteTransaction   # noqa: E402
+from tuntop import startup_recovery              # noqa: E402
+from tuntop import integrity                     # noqa: E402
+from tuntop import ui_text                       # noqa: E402
+from tuntop import profiles                      # noqa: E402
 
 
 # Crash log written next to this script. main() catches anything that gets
@@ -63,7 +65,7 @@ from tunmood import integrity                     # noqa: E402
 # the console, and waits for a keypress instead of letting the window just
 # vanish (the classic "it crashes when I try to open it" symptom, which is
 # usually really "it crashed and closed before I could read why").
-CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunmood_crash.log")
+CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TunTop_crash.log")
 
 # Where a downloaded geoip database lands when none is configured ([W] key /
 # missing-file auto-download on start). Next to the package so it survives
@@ -842,14 +844,14 @@ def _teardown_wintun():
 
 
 # ─── Live route helpers (for in-dashboard bypass-IP editing) ─────────────────
-# Re-implemented locally rather than imported from tunmood/helper.py, same
+# Re-implemented locally rather than imported from tuntop/helper.py, same
 # as everything else in this file - these mirror get_ipv4_default() and
 # get_vpn_ipv4_default() there closely enough to pick the same interface.
 
 def _get_ipv4_default():
     """IPv4 default route used to reach the Internet (interface + gateway).
 
-    Mirrors tunmood.helper get_ipv4_default(): never returns a connected
+    Mirrors tuntop.helper get_ipv4_default(): never returns a connected
     Windows VPN as the "physical" gateway (so geo/bypass traffic is not routed
     into the VPN), and recovers the physical NIC's configured gateway via CIM
     when a full-tunnel VPN has deleted the Wi-Fi default route.  The VPN
@@ -1129,7 +1131,7 @@ def _add_route_v6(dest, iface, gateway, metric=1):
 def _get_ipv6_default(vpn_interface=None):
     """IPv6 default route (next hop) used to send a bypass entry's IPv6
     address directly. Mirrors the VPN-exclusion fix in
-    tunmood.helper get_ipv6_default() so a connected Windows VPN is never
+    tuntop.helper get_ipv6_default() so a connected Windows VPN is never
     picked as the "safe" native gateway."""
     if vpn_interface:
         ps = rf"""
@@ -1461,82 +1463,28 @@ def get_vpn_status():
 # ─── Drawing primitives ─────────────────────────────────────────────────────
 
 def _console_safe(text):
-    """Keep child-process messages printable in classic cmd.exe.
-
-    The dashboard defaults to ASCII there because some cmd/font combinations
-    display Unicode as '?'.  Unexpected Unicode from a helper log should not
-    reintroduce the same problem.
-    """
-    text = str(text)
-    if USE_UNICODE:
-        return text
-    return "".join(ch if 32 <= ord(ch) < 127 or ch in "\t" else "." for ch in text)
+    """Keep child-process messages printable (see ui_text.console_safe)."""
+    return ui_text.console_safe(text, USE_UNICODE)
 
 
 def _pad(text, width):
-    t = str(text)
-    # Measure visible characters (strip ANSI codes) to avoid padding gaps
-    vis_w = len(re.sub(r'\x1b\[[^m]*m', '', t))
-    if vis_w > width:
-        return re.sub(r'\x1b\[[^m]*m', '', t)[:width]
-    return t + ' ' * max(0, width - vis_w)
+    """Right-pad to visible width (see ui_text.pad)."""
+    return ui_text.pad(text, width)
 
 
 def _hslice(text, start, width):
-    """Return a horizontal window of `text` (which may contain ANSI colour
-    codes) spanning visible columns [start, start+width). Escape sequences are
-    always preserved so the colour state continues correctly after a cut; only
-    the visible characters are windowed."""
-    out = []
-    vis = 0
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch == "\x1b":
-            j = i
-            while j < n and text[j] != "m":
-                j += 1
-            out.append(text[i:j + 1])
-            i = j + 1
-            continue
-        # Wide grapheme safety: treat anything outside ASCII as 1 column.
-        if start <= vis < start + width:
-            out.append(ch)
-        vis += 1
-        if vis > start + width:
-            break
-        i += 1
-    return "".join(out)
+    """ANSI-aware horizontal window (see ui_text.hslice)."""
+    return ui_text.hslice(text, start, width)
 
 
 def _hpad(text, width, start=0):
-    """Horizontally scroll `text` to column `start` (preserving ANSI) then
-    right-pad to `width` with spaces."""
-    s = _hslice(text, start, width) if start else text
-    vis_w = len(re.sub(r'\x1b\[[^m]*m', '', s))
-    if vis_w < width:
-        s = s + " " * (width - vis_w)
-    elif vis_w > width:
-        # start==0 fast path already handled by _hslice; this guards the
-        # (shouldn't happen) case of an over-long unescaped remainder.
-        s = re.sub(r'\x1b\[[^m]*m', '', s)[:width]
-    return s
+    """ANSI-aware scroll + right-pad (see ui_text.hpad)."""
+    return ui_text.hpad(text, width, start)
 
 
 def _split_hostport(s):
     """Split 'host:port' / '[ipv6]:port' / 'host' into (host, port)."""
-    s = s.strip()
-    if s.startswith("["):
-        rb = s.find("]")
-        if rb != -1:
-            host = s[1:rb]
-            port = s[rb + 2:] if s[rb + 1:rb + 2] == ":" else ""
-            return host, port
-    if ":" in s:
-        host, _, port = s.rpartition(":")
-        return host, port
-    return s, ""
+    return ui_text.split_hostport(s)
 
 
 def _format_log_line(raw):
@@ -1646,138 +1594,42 @@ def _format_log_line(raw):
 
 
 # Green -> yellow -> red, the same ramp btop uses for its CPU/mem/net meters.
-_GRAD_STOPS = ((76, 175, 80), (255, 193, 7), (244, 67, 54))
+_GRAD_STOPS = ui_text.GRAD_STOPS
 
 
 def _gradient_color(frac):
-    """24-bit ANSI foreground escape for frac in [0, 1] along the ramp above."""
-    frac = max(0.0, min(1.0, frac))
-    seg = frac * (len(_GRAD_STOPS) - 1)
-    i = min(len(_GRAD_STOPS) - 2, int(seg))
-    t = seg - i
-    r0, g0, b0 = _GRAD_STOPS[i]
-    r1, g1, b1 = _GRAD_STOPS[i + 1]
-    r = round(r0 + (r1 - r0) * t)
-    g = round(g0 + (g1 - g0) * t)
-    b = round(b0 + (b1 - b0) * t)
-    return f"\033[38;2;{r};{g};{b}m"
+    """24-bit ANSI ramp colour (see ui_text.gradient_color)."""
+    return ui_text.gradient_color(frac, _GRAD_STOPS)
 
 
 def _rgb(r, g, b):
-    """24-bit ANSI foreground escape for an absolute (r,g,b) colour."""
-    return f"\033[38;2;{r};{g};{b}m"
+    """24-bit ANSI foreground escape (see ui_text.rgb)."""
+    return ui_text.rgb(r, g, b)
 
 
 def _bar_stops(frac, width, stops, full=None, empty=None):
-    """Horizontal meter coloured along a CUSTOM stop list, e.g. the icy
-    cyan->mint ramp used by the shutdown panel. Same cell logic as _bar()."""
-    full = full if full is not None else PROGRESS_FULL
-    empty = empty if empty is not None else PROGRESS_EMPTY
-    frac = max(0.0, min(1.0, frac))
-    if width <= 0:
-        return ""
-    filled = int(round(frac * width))
-    cells = []
-    for i in range(filled):
-        t = i / max(1, width - 1)
-        seg = t * (len(stops) - 1)
-        j = min(len(stops) - 2, int(seg))
-        u = seg - j
-        r0, g0, b0 = stops[j]
-        r1, g1, b1 = stops[j + 1]
-        cells.append(_rgb(round(r0 + (r1 - r0) * u),
-                          round(g0 + (g1 - g0) * u),
-                          round(b0 + (b1 - b0) * u)) + full)
-    cells.append(f"{P_INACT}{empty * (width - filled)}")
-    cells.append(RESET)
-    return "".join(cells)
+    """Custom-ramp meter (see ui_text.bar_stops); glyphs resolved at call
+    time so glyph-set changes are always reflected."""
+    return ui_text.bar_stops(frac, width, stops,
+                             full if full is not None else PROGRESS_FULL,
+                             empty if empty is not None else PROGRESS_EMPTY,
+                             P_INACT, RESET)
 
 
 def _bar(frac, width, full=None, empty=None, gradient=True):
-    """Render a horizontal meter. Reads PROGRESS_FULL/EMPTY at call time
-    (rather than as stale default-argument values captured once at import)
-    so a later glyph-set change - e.g. --unicode/--ascii, or the real
-    terminal probe in main() - is always reflected.
-
-    gradient=True (the default) colours each filled cell along the
-    green->yellow->red ramp by its position in the bar, the way btop's own
-    meters shift colour across their length, instead of one flat colour for
-    the whole bar."""
-    full = full if full is not None else PROGRESS_FULL
-    empty = empty if empty is not None else PROGRESS_EMPTY
-    frac = max(0.0, min(1.0, frac))
-    if width <= 0:
-        return ""
-    filled = int(round(frac * width))
-    if not gradient:
-        return full * filled + empty * (width - filled)
-    cells = []
-    for i in range(filled):
-        cells.append(f"{_gradient_color(i / max(1, width - 1))}{full}")
-    cells.append(f"{P_INACT}{empty * (width - filled)}")
-    cells.append(RESET)
-    return "".join(cells)
+    """Render a horizontal meter (see ui_text.bar). Glyphs are read at
+    call time (rather than as stale default-argument values captured once
+    at import) so a later glyph-set change - e.g. --unicode/--ascii, or
+    the real terminal probe in main() - is always reflected."""
+    return ui_text.bar(frac, width,
+                       full if full is not None else PROGRESS_FULL,
+                       empty if empty is not None else PROGRESS_EMPTY,
+                       P_INACT, RESET, gradient)
 
 
 def _spark(values, width, mode=None):
-    """Gradient sparkline.
-
-    mode=None/"block" - classic ramp ( .:-=+*#@ ), ASCII-safe.
-    mode="half"       - half-block doubling (U+2580/2584/2588): 2x vertical
-                        resolution, using glyphs the program already draws.
-    mode="braille"    - U+2800 block: 4x vertical resolution.
-
-    Falls back to "block" automatically when Unicode glyphs are unavailable."""
-    if not values:
-        return " " * width
-    use_mode = mode or "block"
-    if use_mode in ("half", "braille") and not USE_UNICODE:
-        use_mode = "block"
-    vals = values[-width:]
-    lo, hi = min(vals), max(vals)
-    span = hi - lo if hi - lo > 1e-9 else 1.0
-    if use_mode == "block":
-        RAMP = " .:-=+*#@"
-        chars = []
-        for v in vals:
-            idx = min(len(RAMP) - 1, max(1, int(round((v - lo) / span * (len(RAMP) - 1)))))
-            chars.append(RAMP[idx])
-        return "".join(chars) + " " * max(0, width - len(vals))
-    if use_mode == "half":
-        chars = []
-        for v in vals:
-            frac = (v - lo) / span
-            lvl = round(frac * 8)        # 0..8 half-block sub-levels
-            if lvl >= 8:
-                chars.append("\u2588")
-            elif lvl >= 7:
-                chars.append("\u2580")
-            elif lvl >= 6:
-                chars.append("\u2584")
-            elif lvl >= 5:
-                chars.append("\u2580")
-            elif lvl >= 4:
-                chars.append("\u2584")
-            elif lvl >= 3:
-                chars.append("\u2580")
-            elif lvl >= 2:
-                chars.append("\u2584")
-            elif lvl >= 1:
-                chars.append("\u2580")
-            else:
-                chars.append(" ")
-        return "".join(chars) + " " * max(0, width - len(vals))
-    # braille: 4 vertical levels per column
-    chars = []
-    for v in vals:
-        frac = (v - lo) / span
-        lvl = min(4, int(round(frac * 4)))   # 0..4 dots from bottom
-        bits = 0
-        for d, bit in ((0, 0x40), (1, 0x04), (2, 0x02), (3, 0x01)):
-            if lvl >= d + 1:
-                bits |= bit
-        chars.append(chr(0x2800 | bits))
-    return "".join(chars) + " " * max(0, width - len(vals))
+    """Gradient sparkline (see ui_text.spark)."""
+    return ui_text.spark(values, width, mode, USE_UNICODE)
 
 
 def _panel(lines, title=None, width=60, active=True):
@@ -1842,7 +1694,7 @@ class BTopTui:
         self.proc = None
         self.logs = queue.Queue()
 
-        # Tunnel state machine (tunmood/state.py): the single source of
+        # Tunnel state machine (tuntop/state.py): the single source of
         # truth for what the tunnel is doing - far beyond the old
         # "helper process alive => RUNNING" boolean. Phases of the start
         # sequence, degradation, self-heal and teardown are all explicit
@@ -1852,7 +1704,7 @@ class BTopTui:
         self.tunnel = TunnelStateMachine()
         self.tunnel.observe(self._on_tunnel_state_change)
 
-        # Recovery engine (tunmood/recovery.py): bounded, backoff-based
+        # Recovery engine (tuntop/recovery.py): bounded, backoff-based
         # repair policy on top of the state machine. A dead helper gets
         # auto-restarted (max 3 attempts, 1s/2s/4s backoff, crash-loop
         # protection); persistent DEGRADED escalates to a restart only
@@ -2631,7 +2483,7 @@ class BTopTui:
 
     def _get_vless_iface_gateway(self):
         """Cached (interface, gateway) used to bypass the VLESS endpoint -
-        detected the same way tunmood/helper.py does, so a live-added
+        detected the same way tuntop/helper.py does, so a live-added
         bypass route lands on the same interface. Cached for the life of the
         dashboard; restart the dashboard if the active network path changes."""
         if self._iface_cache:
@@ -2724,7 +2576,7 @@ class BTopTui:
         IPs that are now routed direct. Safe to call from any thread: it only
         shells out and logs through the queue.
 
-        TRANSACTIONAL (tunmood/routes_txn.py): every route of the entry is
+        TRANSACTIONAL (tuntop/routes_txn.py): every route of the entry is
         applied as ONE all-or-nothing unit - each add is verified against the
         real routing table, and any failure rolls back the routes already
         applied. A half-installed bypass (IPv4 direct while IPv6 still dies
@@ -3286,23 +3138,11 @@ class BTopTui:
     # the tunnel so it takes effect - one key to switch setups.
 
     def _profile_file(self):
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "profiles.json")
+        return profiles.profile_file(os.path.dirname(os.path.abspath(__file__)))
 
     def _profile_snapshot(self):
-        """Everything that defines a setup."""
-        return {
-            "server": list(getattr(self.ns, "server", []) or []),
-            "port": getattr(self.ns, "port", 10808),
-            "dns4": getattr(self.ns, "dns4", "8.8.8.8"),
-            "endpoint_port": getattr(self.ns, "endpoint_port", 443),
-            "bypass_ip": list(getattr(self.ns, "bypass_ip", []) or []),
-            "geoip": getattr(self.ns, "geoip", None),
-            "geoip_code": getattr(self.ns, "geoip_code", "cn"),
-            "vless_over_vpn": bool(getattr(self.ns, "vless_over_vpn", False)),
-            "no_vpn_bypass": bool(getattr(self.ns, "no_vpn_bypass", False)),
-            "vpn_interface": getattr(self.ns, "vpn_interface", None),
-        }
+        """Everything that defines a setup (see profiles.snapshot_from_args)."""
+        return profiles.snapshot_from_args(self.ns)
 
     def _save_profile(self):
         name = self._read_line("Profile name to SAVE current settings as:",
@@ -3310,32 +3150,17 @@ class BTopTui:
                                examples=["home", "work-vpn", "ir-geo"])
         if not name:
             return
-        path = self._profile_file()
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-        data[name.strip()] = self._profile_snapshot()
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            self.log_lines.append(f"[!] Could not write profiles.json: {e}")
-            return
-        self.log_lines.append(f"[+] Profile '{name.strip()}' saved "
-                              f"({len(data)} profile(s) total).")
+        ok, msg = profiles.save_snapshot(self._profile_file(), name,
+                                         self._profile_snapshot())
+        self.log_lines.append(msg)
 
     def _load_profile(self):
-        path = self._profile_file()
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
+        data, err = profiles.load_store(self._profile_file())
+        if err == "missing":
             self.log_lines.append("[i] No profiles yet - save one with [O].")
             return
-        except Exception as e:
-            self.log_lines.append(f"[!] Could not read profiles.json: {e}")
+        if err:
+            self.log_lines.append(f"[!] Could not read profiles.json: {err}")
             return
         if not data:
             self.log_lines.append("[i] profiles.json is empty - save one with [O].")
@@ -3372,15 +3197,7 @@ class BTopTui:
                 sel = len(names) - 1
         name = names[sel]
         snap = data[name]
-        for attr in ("port", "dns4", "endpoint_port", "geoip",
-                     "geoip_code", "vpn_interface"):
-            if attr in snap:
-                setattr(self.ns, attr, snap[attr])
-        self.ns.server = list(snap.get("server") or [])
-        self.ns.bypass_ip = [_host_from_url(x) for x in (snap.get("bypass_ip") or [])
-                             if _host_from_url(x)]
-        self.ns.vless_over_vpn = bool(snap.get("vless_over_vpn"))
-        self.ns.no_vpn_bypass = bool(snap.get("no_vpn_bypass"))
+        profiles.apply_to_args(self.ns, snap, normalise_host=_host_from_url)
         self.endpoint_v4, self.endpoint_v6 = [], []
         for srv in self.ns.server:
             v4, v6 = _resolve(srv)
@@ -3595,7 +3412,7 @@ class BTopTui:
             here = os.path.dirname(os.path.abspath(__file__))
             if here not in sys.path:
                 sys.path.insert(0, here)
-            helper = importlib.import_module("tunmood.helper")
+            helper = importlib.import_module("tuntop.helper")
         except Exception as e:
             self._blog(f"[!] Could not import helper module: {e}")
             return
@@ -5313,7 +5130,7 @@ class BTopTui:
 
     def _geo_sweep_cidrs(self):
         """The full CIDR prefix set for --geoip-code (cached per process;
-        tunmood.geoip's cross-run disk cache makes even the first decode
+        tuntop.geoip's cross-run disk cache makes even the first decode
         instant for a cached file). Empty set when no geoip config is active.
         """
         if getattr(self, "_geo_sweep_cidrs_val", None) is not None:
@@ -5328,7 +5145,7 @@ class BTopTui:
                 if here not in sys.path:
                     sys.path.insert(0, here)
                 cidrs = set(importlib.import_module(
-                    "tunmood.geoip").parse_geoip(geo, code))
+                    "TunTop.geoip").parse_geoip(geo, code))
             except Exception:
                 cidrs = set()
         self._geo_sweep_cidrs_val = cidrs
@@ -5353,7 +5170,7 @@ class BTopTui:
         bug.
 
         The dashboard knows exactly which prefixes belong to --geoip-code
-        (tunmood.geoip keeps a cross-run disk cache, so decoding is instant
+        (tuntop.geoip keeps a cross-run disk cache, so decoding is instant
         even for a multi-megabyte .dat). We dump the live routing table ONCE,
         match DestinationPrefixes exactly against those CIDRs client-side, and
         batch-delete every match by interface + next-hop, so only leftover
@@ -5469,7 +5286,7 @@ class BTopTui:
         """Fetch the official v2fly geoip database in a BACKGROUND thread
         (a multi-megabyte HTTPS download must never freeze the UI thread).
 
-        Destination: the configured --geoip path, or tunmood/geoip.dat when
+        Destination: the configured --geoip path, or tuntop/geoip.dat when
         none is set (and then ns.geoip is pointed at it). force=True refreshes
         an existing file ([W] update); without force a missing-file trigger is
         expected (launch-time auto-download). Returns True if started."""
@@ -5500,7 +5317,7 @@ class BTopTui:
             try:
                 verb = "Updating" if updating else "Downloading"
                 self._blog(f"[*] {verb} geoip database from v2fly -> {dest}")
-                from tunmood.geoip import download_geoip
+                from tuntop.geoip import download_geoip
                 size = download_geoip(dest, progress=_prog)
                 dt = max(0.001, time.time() - t0)
                 self._blog(f"[+] Geoip saved: {size / 1048576:.1f} MB in "
@@ -5889,7 +5706,7 @@ def main():
     if not _admin():
         sys.exit("[!] Run this as Administrator (use Run_Helper.bat).")
 
-    # ── Binary integrity (tunmood/integrity.py) ─────────────────────────
+    # ── Binary integrity (tuntop/integrity.py) ─────────────────────────
     # tun2socks.exe / wintun.dll run inside this ADMIN process: a swapped
     # or corrupted binary is elevated code execution, so verify both
     # against the pinned SHA-256 hashes BEFORE anything is launched.
@@ -5910,7 +5727,7 @@ def main():
     # Resize the console so the full dashboard fits on one screen.
     _resize_console()
 
-    # ── Startup crash recovery (tunmood/startup_recovery.py) ────────────
+    # ── Startup crash recovery (tuntop/startup_recovery.py) ────────────
     # A hard-killed previous run leaves orphaned tun2socks, the Wintun
     # adapter + its routes, and per-host bypass routes behind. Detect and
     # clean ALL of it BEFORE the new tunnel starts, so this launch never
@@ -5996,7 +5813,7 @@ def main():
             return
         sys.stdout.write("\033[0m\033[?25h\033[2J\033[3J\033[H\n")
         print("=" * 70)
-        print("[!] TunMood crashed. Details below, and saved to:")
+        print("[!] TunTop crashed. Details below, and saved to:")
         print(f"    {CRASH_LOG}")
         print("=" * 70)
         print(tb)

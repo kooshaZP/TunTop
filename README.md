@@ -1,71 +1,62 @@
-# TunMood
+# TunTop
 
 [![CI](https://github.com/kooshaZP/TunTop/actions/workflows/ci.yml/badge.svg)](https://github.com/kooshaZP/TunTop/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/kooshaZP/TunTop/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](#requirements)
 [![Python](https://img.shields.io/badge/python-3.10%2B-informational)](#requirements)
-[![Dependencies](https://img.shields.io/badge/pip%20deps-zero-brightgreen)](#-files)
+[![Dependencies](https://img.shields.io/badge/pip%20deps-zero-brightgreen)](#features)
 
-**Route all of your Windows traffic through any VLESS proxy — and watch it happen live in a btop-style dashboard.**
+**A Windows full-tunnel for VLESS.**
 
-TunMood drives a Wintun TUN adapter from your v2rayN (VLESS) proxy so every app on the PC is tunneled, not just the browser: throughput graphs, a ~30-probe health suite, instant bypass add/remove, geoip country splitting, profiles, leak tests, and one-key diagnostics — all with **zero pip dependencies**.
-
-> ⚠️ The dashboard builds and owns the tunnel itself. Never run `tunmood/helper.py` directly — always launch through `Run_Helper.ps1` or `tunmood/dashboard.py`.
+v2rayN gives you the proxy. TunTop gives you system-wide routing.
 
 <p align="center">
-  <img src="docs/dashboard-3.jpg" width="720" alt="TunMood dashboard - live throughput graphs & health suite"><br>
-  <img src="docs/dashboard-2.jpg" width="320" alt="TunMood dashboard view 3">
-  <img src="docs/dashboard-4.jpg" width="360" alt="TunMood dashboard view 2">
-  
+  <img src="docs/dashboard-3.jpg" width="720" alt="TunTop dashboard - live throughput graphs and health suite"><br>
+  <img src="docs/dashboard-2.jpg" width="320" alt="TunTop dashboard view 3">
+  <img src="docs/dashboard-4.jpg" width="360" alt="TunTop dashboard view 2">
 </p>
 
+## Features
 
-## Contents
+- IPv4 and IPv6 full-tunnel routing via Wintun + tun2socks
+- DNS leak protection with UDP/53 and DoH fallback
+- Kill-safe cleanup — verified teardown on every exit
+- Live bypass add/remove without restarting the tunnel
+- Geo-IP country routing from `geoip.dat`
+- Health monitoring with ~30 probes
+- Self-healing — auto-restarts on tunnel failure
+- btop-style dashboard with throughput graphs, 7 color themes
+- Leak test, diagnostics export, profiles
+- Zero pip dependencies
 
-- [Why TunMood](#-why-tunmood)
-- [Features](#-features)
-- [How it works](#-how-it-works)
-- [Quick start](#-quick-start)
-- [Requirements](#requirements)
-- [Key reference](#️-key-reference)
-- [Project layout](#-project-layout)
-- [Tests](#-tests)
-- [Troubleshooting](#-troubleshooting)
-- [Contributing](#-contributing)
-- [Acknowledgments](#-acknowledgments)
-- [License](#-license)
+## Why do I need this?
 
-## 🤔 Why TunMood
+Most VLESS/v2ray setups only proxy the browser. TunTop routes **every app** on your PC through your VLESS server — system-wide — and shows you exactly what's happening in a live dashboard. A dead tunnel is obvious at a glance instead of discovered mid-download.
 
-Most VLESS/v2ray setups only proxy the browser, and checking whether the tunnel is actually healthy usually means squinting at a log file. TunMood takes a different approach:
+## Quick start (30 seconds)
 
-- **System-wide by default** — a real TUN adapter means every process is tunneled, not just apps that support a SOCKS/HTTP proxy setting.
-- **You can see it working** — a live dashboard instead of a blank terminal window, so a dead tunnel is obvious at a glance instead of discovered mid-download.
-- **No install footprint** — pure Python stdlib plus two auto-downloaded binaries (`tun2socks.exe`, `wintun.dll`); nothing touches `pip`.
-- **Safe to poke at** — routes can be added, removed, or re-applied live, and teardown is verified rather than assumed.
+### 1. Clone
 
-## ✨ Features
+```powershell
+git clone https://github.com/kooshaZP/TunTop.git
+cd TunTop
+```
 
-**Tunnel & routing**
-- Full-tunnel routing via Wintun + tun2socks (IPv4 *and* IPv6), with VPN-proof split defaults
-- Geo bypass — route a whole country direct from `geoip.dat`, re-appliable live with `[R]`
-- Instant bypass add/remove (`[A]`/`[X]`) — installs/deletes `/32` + `/128` routes from a background thread while the tunnel keeps running
+### 2. Set up v2rayN
 
-**Dashboard & monitoring**
-- Live btop-style UI: gradient area/line/braille throughput graphs, metric cards, mouse support, 7 color themes
-- Health-check suite with ~30 probes (`[C]`)
-- Leak test `[L]` — compares direct vs. tunneled exit IPs to prove the tunnel is actually doing something
-- Colored event log and one-key diagnostics export (`[D]`) — config, routes, logs, and last scan in a single file
+Install [v2rayN](https://github.com/2dust/v2rayN), add your VLESS server, and enable the local SOCKS inbound (default `127.0.0.1:10808`).
 
-**Live configuration**
-- Edit everything at runtime with no restart required: servers `[U]`, VPN mode `[V]`, VPN bypass `[Y]`, geo config `[F]`, SOCKS port `[P]`, DNS `[N]`, endpoint port `[E]`
-- Profiles — save and load complete setups with `[O]` / `[I]`
+### 3. Run
 
-**Reliability**
-- Self-healing helper that monitors the tunnel and re-applies routes/DNS on failure
-- Clean teardown — quitting verifies the route table is actually clear before exiting
+```powershell
+powershell -ExecutionPolicy Bypass -File Run_Helper.ps1
+```
 
-## 🏗️ How it works
+Right-click `Run_Helper.ps1` → **Run with PowerShell** → confirm the UAC prompt. First run auto-downloads `tun2socks.exe` and `wintun.dll` if they're missing.
+
+Press **[S]** to start the tunnel, **[C]** to run a health scan, **[L]** for a leak test.
+
+## How it works
 
 ```mermaid
 flowchart LR
@@ -73,97 +64,98 @@ flowchart LR
     B --> C[tun2socks]
     C --> D["v2rayN local SOCKS5 (127.0.0.1:10808)"]
     D --> E[Your VLESS server]
-    F[TunMood dashboard] -. builds & self-heals .-> B
+    F[TunTop dashboard] -. builds and self-heals .-> B
     F -. live routes / bypass / geoip .-> G[Windows routing table]
 ```
 
-`Run_Helper.ps1` launches the dashboard, which builds a Wintun adapter and feeds it through `tun2socks` into v2rayN's local SOCKS5 inbound. From there your VLESS server carries the traffic. The dashboard owns that tunnel for its whole lifetime — editing servers, bypass rules, or geoip splits updates the Windows routing table live instead of tearing everything down and starting over.
+TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into v2rayN's local SOCKS5 inbound, and manages the Windows routing table to direct all traffic through it. The dashboard owns the tunnel for its entire lifetime — editing servers, bypass rules, or geo splits updates the routing table live.
 
-## 🚀 Quick start
-
-1. **Get the repo**
-   ```powershell
-   git clone https://github.com/kooshaZP/TunTop.git
-   cd TunTop
-   ```
-2. **Set up v2rayN** — install [v2rayN](https://github.com/2dust/v2rayN), add your VLESS server, and enable the local SOCKS inbound (default `127.0.0.1:10808`).
-3. **Run the launcher**
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File Run_Helper.ps1
-   ```
-   or right-click `Run_Helper.ps1` → *Run with PowerShell* → confirm the UAC prompt. First run auto-downloads `tun2socks.exe` and `wintun.dll` if they're missing.
-4. **Pick your setup** — choose VPN mode, glyph mode, and geo bypass in the menus; the dashboard starts automatically.
-5. **Verify it** — press `[C]` inside the dashboard to run the health scan, or `[L]` for a leak test.
-
-### Requirements
-
-| What                  | Why                         |
-| --------------------- | ---------------------------- |
-| Windows 10 1803+ / 11 | `curl.exe`, Wintun            |
-| Python 3.10+          | stdlib only, no `pip install` |
-| Administrator         | route table management        |
-| v2rayN running        | provides the SOCKS5 inbound    |
-
-## ⌨️ Key reference
+## Key reference
 
 | Key                           | Action                                               |
 | ------------------------------ | ----------------------------------------------------- |
-| `[C]` / `[S]` / `[T]` / `[Q]` | Health scan / start / stop / quit (verifies cleanup)   |
-| `[A]` / `[X]`                 | Add/remove bypass **instantly** (no tunnel restart)    |
-| `[B]` `[Z]`                   | Bypass panel · legacy restart-mode toggle              |
-| `[L]` `[D]`                   | Leak test · export diagnostics                         |
-| `[O]` `[I]`                   | Save / load profile                                    |
-| `[U]` `[V]` `[Y]` `[F]`       | Servers · VPN mode · VPN bypass · geo config            |
-| `[P]` `[N]` `[E]`             | SOCKS port · DNS · endpoint port                        |
-| `[R]`                          | Re-apply geoip country bypass live                      |
-| `[G]` `[M]` `[H]`             | Graph mode · theme · hide help                          |
-| `1–6`, `0`                    | Hide/show panels                                        |
+| `[S]` `[T]` `[Q]`             | Start / stop / quit (verifies cleanup)                |
+| `[C]`                         | Health scan                                           |
+| `[A]` `[X]`                   | Add/remove bypass instantly (no restart)              |
+| `[L]` `[D]`                   | Leak test / export diagnostics                        |
+| `[O]` `[I]`                   | Save / load profile                                   |
+| `[U]` `[V]` `[Y]` `[F]`       | Servers / VPN mode / VPN bypass / geo config          |
+| `[P]` `[N]` `[E]`             | SOCKS port / DNS / endpoint port                      |
+| `[R]`                         | Re-apply geoip country bypass live                    |
+| `[G]` `[M]` `[H]`             | Graph mode / theme / hide help                        |
+| `1-6`, `0`                    | Hide/show panels                                      |
 
-## 📁 Project layout
+## Requirements
+
+| What                  | Why                         |
+| --------------------- | ---------------------------- |
+| Windows 10 1803+ / 11 | Wintun adapter driver         |
+| Python 3.10+          | stdlib only, no pip install   |
+| Administrator         | route table management        |
+| v2rayN running        | provides the SOCKS5 inbound   |
+
+## Project layout
 
 ```
-Run_Helper.ps1            <- launcher + one-click installer (PowerShell)
-tunmood/
-  dashboard.py             <- the btop-style dashboard (owns the tunnel)
+Run_Helper.ps1            <- launcher (PowerShell)
+tuntop/
+  dashboard.py             <- btop-style dashboard (owns the tunnel)
   helper.py                <- tunnel builder + self-heal monitor
-  routing.py                <- netsh/PowerShell route engine (add/delete/verify)
-  netdns.py                <- resolver: cache, UDP/53 + DoH fallbacks
-  geoip.py                  <- geoip.dat / JSON country-range parser
-profiles.json              <- created when you save profiles
+  routing.py               <- netsh/PowerShell route engine
+  netdns.py                <- DNS resolver with cache
+  geoip.py                 <- geoip.dat country-range parser
+  state.py                 <- tunnel state machine
+  recovery.py              <- backoff-based recovery engine
+  routes_txn.py            <- transactional route management
+  startup_recovery.py      <- crash detection + cleanup at launch
+  integrity.py             <- binary SHA-256 verification
+  ui_text.py               <- terminal text/layout primitives
+  profiles.py              <- profile save/load
+tests/                     <- 164 tests across 5 tiers
 ```
 
-`tun2socks.exe` and `wintun.dll` are auto-downloaded on first run and are not checked into the repo.
+`tun2socks.exe` and `wintun.dll` are auto-downloaded on first run and not in the repo.
 
-## 🧪 Tests
+## Troubleshooting
 
-There is currently no automated test suite checked into the repo.
+- **Dashboard won't start** — TunTop needs Administrator rights. Right-click `Run_Helper.ps1` → Run as Administrator.
+- **Health scan fails** — press `[D]` to export diagnostics (config, routes, logs, last scan) and attach it to an issue.
+- **Traffic leaks** — run `[L]` to compare direct vs tunneled exit IP, and confirm v2rayN's SOCKS5 inbound is listening on the port TunTop uses (`[P]`).
+- **Running alongside another VPN** — use VPN mode (`[V]`) and VPN bypass (`[Y]`) so TunTop rides the existing VPN instead of fighting for the default route.
+- **Still stuck?** Open an issue and attach the diagnostics file from `[D]`.
 
-## 🩺 Troubleshooting
+## Tests
 
-- **Dashboard won't start / UAC prompt fails** — TunMood needs Administrator rights to manage the route table. Re-run `Run_Helper.ps1` as Administrator.
-- **Health scan reports a failing probe** — press `[D]` to export diagnostics (config, routes, logs, last scan) before digging further; it's the fastest way to see what the scan actually saw.
-- **Traffic isn't going through the tunnel** — run a leak test with `[L]` to compare your direct vs. tunneled exit IP, and confirm v2rayN's SOCKS5 inbound is actually listening on the port TunMood is pointed at (`[P]`).
-- **Running alongside another VPN** — use VPN mode (`[V]`) and VPN bypass (`[Y]`) so TunMood's own connection can ride the existing VPN instead of fighting it for the default route.
-- **Still stuck?** Open an issue and attach the diagnostics file from `[D]` — see [Contributing](#-contributing).
+164 pure-stdlib tests across 5 tiers, runnable on any OS with no admin rights:
 
-## 🤝 Contributing
+```bash
+# Run the full suite (what CI runs)
+python -m unittest discover -s tests -t . -v
 
-See [CONTRIBUTING.md](https://github.com/kooshaZP/TunTop/blob/main/CONTRIBUTING.md) for the full guide. The short version:
+# Including live-network tests (needs Internet)
+TUNTOP_NET_TESTS=1 python -m unittest discover -s tests -t . -v
+```
 
-- **Standard library only** — no new pip dependencies without discussing them in an issue first.
+See `tests/README.md` for the tier layout (unit / routing / recovery / integration / network).
+
+## Contributing
+
+See [CONTRIBUTING.md](https://github.com/kooshaZP/TunTop/blob/main/CONTRIBUTING.md). Short version:
+
+- **Standard library only** — no new pip dependencies without discussing in an issue.
 - **The UI must never block** — DNS, PowerShell, and route operations belong on background threads.
-- **Cleanup is sacred** — anything that adds routes must be removable at exit, even if the helper child is force-killed.
-- Run both test suites before committing, and include a `diagnostics_[...].txt` (`[D]`) with any bug report.
+- **Cleanup is sacred** — anything that adds routes must be removable at exit.
+- Run tests before committing. Include diagnostics (`[D]`) with bug reports.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-TunMood builds on top of:
+TunTop builds on:
 
-- [v2rayN](https://github.com/2dust/v2rayN) for the VLESS client and local SOCKS5 inbound
-- [tun2socks](https://github.com/xjasonlyu/tun2socks) for TUN-to-SOCKS translation
-- [Wintun](https://www.wintun.net/) for the Windows TUN adapter driver
-- [btop](https://github.com/aristocratos/btop) for the dashboard's visual inspiration
+- [v2rayN](https://github.com/2dust/v2rayN) — VLESS client and SOCKS5 inbound
+- [tun2socks](https://github.com/xjasonlyu/tun2socks) — TUN-to-SOCKS translation
+- [Wintun](https://www.wintun.net/) — Windows TUN adapter driver
+- [btop](https://github.com/aristocratos/btop) — dashboard visual inspiration
 
-## 📄 License
+## License
 
 [MIT](https://github.com/kooshaZP/TunTop/blob/main/LICENSE)

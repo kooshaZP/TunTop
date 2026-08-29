@@ -1,4 +1,4 @@
-"""Network tier - tests that touch the REAL network.
+﻿"""Network tier - tests that touch the REAL network.
 
 These are the only tests in the suite that need live Internet access.
 They are SKIPPED unless the TUNTOP_NET_TESTS environment variable is set,
@@ -15,7 +15,7 @@ import os
 import socket
 import unittest
 
-from tunmood.netdns import _dns_query_doh, _dns_query_udp, _resolve_detail
+from tuntop.netdns import _dns_query_doh, _dns_query_udp, _resolve_detail
 
 _LIVE = unittest.skipUnless(os.environ.get("TUNTOP_NET_TESTS"),
                             "live-network test; set TUNTOP_NET_TESTS=1 to run")

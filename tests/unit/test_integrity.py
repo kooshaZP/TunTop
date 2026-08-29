@@ -1,4 +1,4 @@
-"""Unit-tier tests for tunmood.integrity - binary SHA-256 pinning.
+﻿"""Unit-tier tests for tuntop.integrity - binary SHA-256 pinning.
 
 Temp-file based (deterministic) plus one repo-integrity test that fails
 loudly if the vendored binaries and their pins ever drift apart.
@@ -12,8 +12,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from tunmood import integrity
-from tunmood.integrity import (
+from tuntop import integrity
+from tuntop.integrity import (
     PINNED_BINARIES, STATUS_MISSING, STATUS_MISMATCH, STATUS_OK,
     locate_wintun, sha256_of, verify_file, verify_for_launch,
 )
@@ -176,7 +176,7 @@ class TestRepoPins(unittest.TestCase):
                 continue        # binaries not vendored in this checkout
             self.assertEqual(sha256_of(path), pin.lower(),
                              f"{name} does not match its pin - update "
-                             f"PINNED_BINARIES in tunmood/integrity.py")
+                             f"PINNED_BINARIES in tuntop/integrity.py")
 
 
 if __name__ == "__main__":

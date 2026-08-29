@@ -1,8 +1,8 @@
 ﻿$ErrorActionPreference = 'Stop'
 
 $ScriptDir  = $PSScriptRoot
-$Helper     = Join-Path $ScriptDir 'tunmood/helper.py'
-$Tui        = Join-Path $ScriptDir 'tunmood/dashboard.py'
+$Helper     = Join-Path $ScriptDir 'tuntop/helper.py'
+$Tui        = Join-Path $ScriptDir 'tuntop/dashboard.py'
 $Tun2socks  = Join-Path $ScriptDir 'tun2socks-windows-amd64-v3.exe'
 
 $VlessEndpointPort = '443'
@@ -289,7 +289,7 @@ Write-Host " Geo    : $GeoLabel"
 Write-Host '  The dashboard builds and owns the tunnel (incl. IPv6) and shows it.'
 Write-Host '============================================================'
 
-# The dashboard (tunmood/dashboard.py) launches and OWNS tunmood/helper.py
+# The dashboard (tuntop/dashboard.py) launches and OWNS tuntop/helper.py
 # itself (main() -> app.launch()), capturing its output into the on-screen log
 # panel. Do NOT start a second helper here. Running one with -NoNewWindow
 # shares this console's stdout, so its setup/teardown text interleaves with

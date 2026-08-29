@@ -40,6 +40,6 @@ bug fixes need a test that reproduces the bug first.
 
 ## Adding a health check
 
-Health checks live in `build_checks()` (`tunmood/dashboard.py`). Each entry is
+Health checks live in `build_checks()` (`tuntop/dashboard.py`). Each entry is
 `(name, callable)` returning `(ok: bool, detail: str)`. PowerShell snippets are
 fine; keep them under ~5 s and never raise.

@@ -1,4 +1,4 @@
-"""Startup crash recovery - never launch a new tunnel on top of old state.
+﻿"""Startup crash recovery - never launch a new tunnel on top of old state.
 
 If TunTop is killed hard (Task Manager, power loss, a frozen helper), its
 cleanup never runs: the Wintun adapter and its routes stay installed,
@@ -31,8 +31,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from tunmood import routing
-from tunmood.netdns import _resolve_cached
+from tuntop import routing
+from tuntop.netdns import _resolve_cached
 
 #: Crash marker lives next to the package (survives reinstalls of the
 #: CWD; deleted only after a verified clean teardown).
@@ -120,7 +120,7 @@ def _wintun_route_count() -> int:
 
 
 def default_probes() -> Probes:
-    """The real Windows probes (PowerShell/netsh via tunmood.routing)."""
+    """The real Windows probes (PowerShell/netsh via tuntop.routing)."""
 
     def host_routes(hosts):
         found = []

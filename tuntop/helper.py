@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-tunmood/helper.py
+tuntop/helper.py
 
 Windows-wide TUN routing for v2rayN + xjasonlyu/tun2socks.
 
@@ -34,7 +34,7 @@ Fixes:
      and say so plainly instead of leaving that to guesswork.
 
 Usage (Administrator PowerShell/CMD):
-  python tunmood/helper.py --server YOUR_SERVER --port 10808 ^
+  python tuntop/helper.py --server YOUR_SERVER --port 10808 ^
       --tun2socks "C:\\tools\\tun2socks.exe"
 
 Your v2rayN SOCKS inbound must support UDP if you want UDP applications.
@@ -101,7 +101,7 @@ cleaned = False
 
 # Windows caps a whole CreateProcess command line at 32767 chars; the encoded
 # form of a big bulk-removal script exceeds it, so run_ps() falls back to
-# executing such scripts from a temp .ps1 file (mirrors tunmood/routing.py).
+# executing such scripts from a temp .ps1 file (mirrors tuntop/routing.py).
 _PS_CMDLINE_SAFE = 20000
 
 # NOTE: bulk geoip route removal (_remove_routes_bulk) deliberately shares the
@@ -556,7 +556,7 @@ def run_ps(script, timeout=15):
     base_cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass"]
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     if len(encoded) + 80 > _PS_CMDLINE_SAFE:
-        fd, path = tempfile.mkstemp(suffix=".ps1", prefix="tunmood_helper_")
+        fd, path = tempfile.mkstemp(suffix=".ps1", prefix="TunTop_helper_")
         try:
             with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
                 f.write(script)
@@ -676,7 +676,7 @@ _PKG_PARENT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 if _PKG_PARENT not in _sys.path:
     _sys.path.insert(0, _PKG_PARENT)
 
-from tunmood.geoip import parse_geoip  # noqa: E402
+from tuntop.geoip import parse_geoip  # noqa: E402
 
 
 def test_local_socks(port):

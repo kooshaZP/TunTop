@@ -1,4 +1,4 @@
-"""Routing-tier tests for tunmood.helper's pure logic.
+﻿"""Routing-tier tests for tuntop.helper's pure logic.
 
 The geoip file parser's protobuf primitives, PowerShell string quoting,
 and the routable-CIDR safety filter that keeps bad geoip.dat ranges from
@@ -8,7 +8,7 @@ Run:  python -m unittest discover -s tests -t . -v
 """
 import unittest
 
-from tunmood.helper import (
+from tuntop.helper import (
     _is_routable_bypass_cidr, _read_bytes, _read_varint, ps_quote,
 )
 

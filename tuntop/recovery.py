@@ -1,4 +1,4 @@
-"""Formal recovery engine - what to do when the tunnel breaks, and when.
+﻿"""Formal recovery engine - what to do when the tunnel breaks, and when.
 
 Phase 2 gave the tunnel explicit DEGRADED / RECOVERING states. This module
 is the POLICY that drives them, replacing ad-hoc "something failed, poke it
@@ -43,7 +43,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from tunmood.state import TunnelState, TunnelStateMachine
+from tuntop.state import TunnelState, TunnelStateMachine
 
 
 class FailureKind(enum.Enum):
@@ -134,7 +134,7 @@ class RecoveryEngine:
             if self._worker is not None:
                 return
             self._worker = threading.Thread(
-                target=self._work, name="tunmood-recovery", daemon=True)
+                target=self._work, name="TunTop-recovery", daemon=True)
             self._worker.start()
 
     def shutdown(self):

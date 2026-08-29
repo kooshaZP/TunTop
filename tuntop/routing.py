@@ -1,4 +1,4 @@
-"""PowerShell / netsh routing helpers (moved verbatim from the old
+﻿"""PowerShell / netsh routing helpers (moved verbatim from the old
 single-file dashboard): route add/delete with verification fallbacks,
 egress + default-route discovery, wintun teardown."""
 import base64
@@ -37,7 +37,7 @@ def _ps_file(script, timeout=8):
     No command-line length limit (the script travels via the filesystem), so
     arbitrarily large batched removals work. UTF-8 BOM so Windows PowerShell
     5.1 reads non-ASCII interface names correctly."""
-    fd, path = tempfile.mkstemp(suffix=".ps1", prefix="tunmood_")
+    fd, path = tempfile.mkstemp(suffix=".ps1", prefix="TunTop_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
             f.write(script)
@@ -93,14 +93,14 @@ def _teardown_wintun():
 
 
 # ─── Live route helpers (for in-dashboard bypass-IP editing) ─────────────────
-# Re-implemented locally rather than imported from tunmood/helper.py, same
+# Re-implemented locally rather than imported from tuntop/helper.py, same
 # as everything else in this file - these mirror get_ipv4_default() and
 # get_vpn_ipv4_default() there closely enough to pick the same interface.
 
 def _get_ipv4_default():
     """IPv4 default route used to reach the Internet (interface + gateway).
 
-    Mirrors tunmood/helper.py:get_ipv4_default(): never returns a connected
+    Mirrors tuntop/helper.py:get_ipv4_default(): never returns a connected
     Windows VPN as the "physical" gateway (so geo/bypass traffic is not routed
     into the VPN), and recovers the physical NIC's configured gateway via CIM
     when a full-tunnel VPN has deleted the Wi-Fi default route.  The VPN
@@ -380,7 +380,7 @@ def _add_route_v6(dest, iface, gateway, metric=1):
 def _get_ipv6_default(vpn_interface=None):
     """IPv6 default route (next hop) used to send a bypass entry's IPv6
     address directly. Mirrors the VPN-exclusion fix in
-    tunmood/helper.py:get_ipv6_default() so a connected Windows VPN is never
+    tuntop/helper.py:get_ipv6_default() so a connected Windows VPN is never
     picked as the "safe" native gateway."""
     if vpn_interface:
         ps = rf"""

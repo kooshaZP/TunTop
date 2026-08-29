@@ -1,4 +1,4 @@
-"""Headless integration check: drive the tunnel state machine exactly the
+﻿"""Headless integration check: drive the tunnel state machine exactly the
 way dashboard.py's hooks do (launch, helper markers, monitor probes,
 self-heal, crash, restart, user quit) and print the resulting event log.
 No admin rights, no network, no TUI - verifies the wiring logic end to end.
@@ -13,7 +13,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from tunmood.state import TunnelState, TunnelStateMachine
+from tuntop.state import TunnelState, TunnelStateMachine
 
 m = TunnelStateMachine()
 log = []

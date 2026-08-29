@@ -1,4 +1,4 @@
-"""Name resolution: URL normalisation, system resolver, cached lookups,
+﻿"""Name resolution: URL normalisation, system resolver, cached lookups,
 and UDP/53 + DoH wire-format fallbacks (moved verbatim from the old
 single-file dashboard)."""
 import base64
@@ -15,7 +15,7 @@ import time
 #     - and socket.getaddrinfo() cannot resolve a scheme/path/port, so such an
 #     entry used to sit at "(unresolved)" forever. _host_from_url() reduces any
 #     of those forms to the bare host/IP first (mirrors the same helper in
-#     tunmood/helper.py so both sides agree on what gets routed).
+#     tuntop/helper.py so both sides agree on what gets routed).
 #   * A broken system resolver. While the TUN is up, Windows DNS may point at
 #     the tunnel; if that path is dead, getaddrinfo() fails even though the
 #     network is fine. We then fall back to our own DNS queries (UDP/53 to

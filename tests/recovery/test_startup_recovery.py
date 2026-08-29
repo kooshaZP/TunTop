@@ -1,4 +1,4 @@
-"""Unit tests for tunmood.startup_recovery - Phase 5 crash recovery.
+﻿"""Unit tests for tuntop.startup_recovery - Phase 5 crash recovery.
 
 All system probes are fakes: deterministic, no Windows, no admin, no
 subprocesses. The marker tests use a temp path.
@@ -10,7 +10,7 @@ import os
 import tempfile
 import unittest
 
-from tunmood.startup_recovery import (
+from tuntop.startup_recovery import (
     Probes, StartupFindings, clear_marker, read_marker, recover, scan,
     startup_recover, write_marker,
 )

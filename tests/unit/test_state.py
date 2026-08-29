@@ -1,4 +1,4 @@
-"""Unit tests for tunmood.state - the tunnel state machine.
+﻿"""Unit tests for tuntop.state - the tunnel state machine.
 
 Pure stdlib (unittest), zero pip dependencies, no Windows-specific calls,
 no admin rights required: they run anywhere, including CI.
@@ -9,7 +9,7 @@ import threading
 import time
 import unittest
 
-from tunmood.state import (
+from tuntop.state import (
     TRANSITIONS,
     StateTransition,
     TransitionError,

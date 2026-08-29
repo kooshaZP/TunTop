@@ -1,4 +1,4 @@
-"""Integration tier: the complete tunnel storyline across modules.
+﻿"""Integration tier: the complete tunnel storyline across modules.
 
 state machine + recovery engine + startup recovery, wired exactly like
 the dashboard wires them (observer -> reports -> repairs -> transitions),
@@ -12,9 +12,9 @@ import tempfile
 import time
 import unittest
 
-from tunmood.recovery import FailureKind, RecoveryAction, RecoveryEngine
-from tunmood.state import TunnelState, TunnelStateMachine
-from tunmood.startup_recovery import read_marker, startup_recover
+from tuntop.recovery import FailureKind, RecoveryAction, RecoveryEngine
+from tuntop.state import TunnelState, TunnelStateMachine
+from tuntop.startup_recovery import read_marker, startup_recover
 
 
 def wait_for(predicate, timeout=3.0, what="condition"):
@@ -35,7 +35,7 @@ class FakeHelperWorld:
         self.restarts = 0
 
     def startup_probes(self):
-        from tunmood.startup_recovery import Probes
+        from tuntop.startup_recovery import Probes
         world = self
 
         class P:

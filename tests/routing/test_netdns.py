@@ -1,4 +1,4 @@
-"""Routing-tier tests for tunmood.netdns - pure functions only.
+﻿"""Routing-tier tests for tuntop.netdns - pure functions only.
 
 Covers URL normalisation and the raw DNS wire format (query building +
 answer parsing, including name compression and truncation tolerance).
@@ -10,7 +10,7 @@ import socket
 import struct
 import unittest
 
-from tunmood.netdns import _dns_build_query, _dns_parse_answers, _host_from_url
+from tuntop.netdns import _dns_build_query, _dns_parse_answers, _host_from_url
 
 
 def dns_response(answers, qname=b"\x07example\x03com\x00", qtype=1):

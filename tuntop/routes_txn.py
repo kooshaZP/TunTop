@@ -1,4 +1,4 @@
-"""Transactional route management - the Windows routing table is NOT the
+﻿"""Transactional route management - the Windows routing table is NOT the
 place for half-applied changes.
 
 The old install paths added routes one by one and kept going on failure.
@@ -24,7 +24,7 @@ surfaced to the log, but the transaction still returns a truthful report
 instead of exploding in a cleanup path.
 
 The Windows bindings are injected via `Backend` (defaulting to the
-battle-tested helpers in tunmood.routing), so tests run against a tiny
+battle-tested helpers in tuntop.routing), so tests run against a tiny
 in-memory routing table on any OS (see tests/test_routes_txn.py).
 
 Pure stdlib, zero pip dependencies.
@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from tunmood import routing
+from tuntop import routing
 
 
 @dataclass(frozen=True)
