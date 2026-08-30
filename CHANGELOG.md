@@ -2,6 +2,35 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.1] - 2026-08-30
+
+### Added
+- Layered package architecture (Phase 1): `core` / `network` / `tunnel` /
+  `monitor` / `config` / `geo` / `ui` subpackages with a strict downward
+  dependency rule (UI -> Core -> Network/Tunnel -> Windows).
+- `core.tunnel_manager` + `core.lifecycle`: the Core facade the UI must
+  drive instead of calling Windows internals or the tun2socks process
+  directly. Backward-compatible top-level module aliases preserved.
+- `config.profiles.secret_store`: Windows Credential Manager backed secret
+  storage (ctypes, zero pip deps) so profiles never embed plaintext secrets.
+- `config.models.Profile` and `config.defaults` for typed, shared config.
+- GitHub issue templates for IPv6 and DNS problems (in addition to bug /
+  routing / feature).
+- Packaged-build pipeline: `TunTop-x64.zip` with per-file SHA-256
+  checksums and an optional PyInstaller `TunTop.exe` step.
+
+### Changed
+- Profile store renamed to `MyTunTopProfile.json`.
+- Release zip renamed to `TunTop-x64.zip` and made self-contained
+  (vendored binaries included).
+- Test suite expanded to ~230 tests: added VPN-detection, sleep/wake,
+  Wi-Fi-change and VLESS-endpoint-down failure scenarios, plus a
+  `TunnelManager` lifecycle test and a secret-store test.
+
+### Fixed
+- `health_report`: `_suggest()` now uses longest-prefix matching so a
+  `tun2socks` failure surfaces the tun2socks fix (not the SOCKS5 one).
+
 ## [1.0.0] - 2026-08-29
 
 ### Added

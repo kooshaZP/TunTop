@@ -8,8 +8,9 @@ Run:  python -m unittest discover -s tests -t . -v
 """
 import unittest
 
-from tuntop.helper import (
-    _is_routable_bypass_cidr, _read_bytes, _read_varint, ps_quote,
+from tuntop.tunnel.helper import (
+    VPN_IFACE_RE, _is_routable_bypass_cidr, _read_bytes, _read_varint,
+    ps_quote,
 )
 
 
@@ -94,6 +95,33 @@ class TestRoutableBypassCidr(unittest.TestCase):
         self.assertFalse(_is_routable_bypass_cidr("not a cidr"))
         self.assertFalse(_is_routable_bypass_cidr("300.300.300.0/24"))
         self.assertFalse(_is_routable_bypass_cidr(""))
+
+
+class TestVpnIfaceDetection(unittest.TestCase):
+    """The VPN alias heuristic must catch every built-in Windows VPN tunnel
+    type yet never flag the physical NIC or the Wintun adapter (flagging
+    Wintun would make us exclude our own tunnel interface)."""
+
+    def _matches(self, alias):
+        # VPN_IFACE_RE is a raw-string pattern (injected into PowerShell via
+        # %-formatting), so compile it for matching with the inline (?i) flag.
+        import re
+        return re.search(VPN_IFACE_RE, alias, re.IGNORECASE) is not None
+
+    def test_builtin_vpn_types_are_detected(self):
+        for alias in ("My VPN", "PPTP Connection", "L2TP VPN", "SSTP",
+                      "IKEv2", "WAN Miniport (IKEv2)", "vpn0"):
+            self.assertTrue(self._matches(alias), alias)
+
+    def test_physical_and_tun_adapters_are_not_flagged(self):
+        for alias in ("Wi-Fi", "Ethernet", "Ethernet 2", "Local Area Connection",
+                      "Wintun", "wintun Tunnel", "Loopback Pseudo-Interface"):
+            self.assertFalse(self._matches(alias), alias)
+
+    def test_case_insensitive(self):
+        self.assertTrue(self._matches("Shirazu-VPN"))
+        self.assertTrue(self._matches("pptp"))
+        self.assertFalse(self._matches("WINTUN"))  # still not a VPN alias
 
 
 if __name__ == "__main__":

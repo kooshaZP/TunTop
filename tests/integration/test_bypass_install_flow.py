@@ -11,7 +11,7 @@ Run:  python -m unittest discover -s tests -t . -v
 import unittest
 from unittest import mock
 
-import tuntop.dashboard as dash
+import tuntop.ui.dashboard as dash
 from tests.fakes import FakeRouter
 from tuntop.routes_txn import RouteTransaction
 

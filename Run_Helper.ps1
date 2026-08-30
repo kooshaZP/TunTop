@@ -1,8 +1,8 @@
 ﻿$ErrorActionPreference = 'Stop'
 
 $ScriptDir  = $PSScriptRoot
-$Helper     = Join-Path $ScriptDir 'tuntop/helper.py'
-$Tui        = Join-Path $ScriptDir 'tuntop/dashboard.py'
+$Helper     = Join-Path $ScriptDir 'tuntop/tunnel/helper.py'
+$Tui        = Join-Path $ScriptDir 'tuntop/ui/dashboard.py'
 $Tun2socks  = Join-Path $ScriptDir 'tun2socks-windows-amd64-v3.exe'
 
 $VlessEndpointPort = '443'
@@ -21,9 +21,41 @@ $GeoIpFile         = Join-Path $GeoIpDir 'geoip.dat'
 $GeoIpCode         = ''
 
 function Find-Python {
+    <#
+      A 'python'/'python3' on PATH can resolve to a BROKEN Windows Store
+      app-execution-alias stub (AppData\Local\Microsoft\WindowsApps\python*.exe)
+      that prints "Python was not found" and exits 9009 instead of running
+      (it happens when this script is elevated). So we test-run every
+      candidate with -c and only accept one that actually starts a Python 3
+      interpreter. The 'py' launcher is also tried.
+    #>
+    function Test-Py ([string]$Src) {
+        # Quote-free probe: PowerShell strips embedded double-quotes from the
+        # -c string when spawning a native process, so the simpler
+        # sys.version_info[0] form (no nested quotes) is required.
+        try {
+            $v = & $Src -c 'import sys;print(sys.version_info[0])' 2>$null
+            return ($LASTEXITCODE -eq 0 -and ($v -match '^3'))
+        } catch { return $false }
+    }
     foreach ($c in 'python', 'python3', 'py') {
-        $p = Get-Command $c -ErrorAction SilentlyContinue
-        if ($p) { return $p.Source }
+        $hits = @(Get-Command $c -All -ErrorAction SilentlyContinue |
+                  Where-Object { $_.CommandType -eq 'Application' } |
+                  Select-Object -ExpandProperty Source -Unique)
+        foreach ($src in $hits) {
+            if (Test-Py $src) { return $src }
+        }
+    }
+    # Last resort: sweep PATH for any python*.exe that actually runs.
+    foreach ($dir in ($env:PATH -split ';')) {
+        if (-not $dir) { continue }
+        try {
+            $exes = @(Get-ChildItem -LiteralPath $dir -Filter 'python*.exe' -ErrorAction SilentlyContinue |
+                      Select-Object -ExpandProperty FullName)
+        } catch { continue }
+        foreach ($src in $exes) {
+            if (Test-Py $src) { return $src }
+        }
     }
     return $null
 }
@@ -289,7 +321,7 @@ Write-Host " Geo    : $GeoLabel"
 Write-Host '  The dashboard builds and owns the tunnel (incl. IPv6) and shows it.'
 Write-Host '============================================================'
 
-# The dashboard (tuntop/dashboard.py) launches and OWNS tuntop/helper.py
+# The dashboard (tuntop/ui/dashboard.py) launches and OWNS tuntop/tunnel/helper.py
 # itself (main() -> app.launch()), capturing its output into the on-screen log
 # panel. Do NOT start a second helper here. Running one with -NoNewWindow
 # shares this console's stdout, so its setup/teardown text interleaves with
@@ -297,8 +329,13 @@ Write-Host '============================================================'
 # helpers fight over tun2socks + the routes, which tears the tunnel down (or
 # duplicates it) a few seconds in. Let the dashboard own the tunnel setup.
 
+# Launch as a module (-m tuntop.ui.dashboard) instead of by file path.
+# Running "py tuntop/ui/dashboard.py" puts tuntop/ui/ on sys.path, so the
+# dashboard's "from tuntop.routing import ..." fails with
+# ModuleNotFoundError: No module named 'tuntop'. Running it as a module keeps
+# the repo root (this script's folder) on sys.path, so the package resolves.
 $pyArgs = @(
-    $Tui,
+    '-m', 'tuntop.ui.dashboard',
     '--server', $Servers,
     '--endpoint-port', $VlessEndpointPort,
     '--port', $SocksPort,

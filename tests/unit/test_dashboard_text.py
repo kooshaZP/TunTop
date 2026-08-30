@@ -1,7 +1,7 @@
 ﻿"""Unit-tier tests for the dashboard's pure text/layout helpers.
 
 These render every panel line, so an off-by-one here is a garbled screen.
-The helpers are pure string functions; `tuntop.dashboard` is imported
+The helpers are pure string functions; `tuntop.ui.dashboard` is imported
 (which is safe headless - verified by CI) and nothing terminal-related is
 touched.
 
@@ -10,7 +10,7 @@ Run:  python -m unittest discover -s tests -t . -v
 import unittest
 from unittest import mock
 
-from tuntop import dashboard
+from tuntop.ui import dashboard
 
 
 class TestSplitHostPort(unittest.TestCase):

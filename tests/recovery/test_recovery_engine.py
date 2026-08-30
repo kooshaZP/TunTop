@@ -289,6 +289,91 @@ class TestValidation(unittest.TestCase):
                                        "repairs_failed": 0, "give_ups": 0})
 
 
+class TestRealWorldScenarios(unittest.TestCase):
+    """Higher-level failure situations from the field, each mapped to the
+    FailureKind the dashboard's monitors actually raise.
+
+    * VLESS endpoint unreachable  -> PROXY
+    * PC wakes from sleep         -> ADAPTER (tunnel NIC dropped)
+    * Wi-Fi switches / reconnects -> ROUTES (default route vanished)
+    * DNS server changed          -> DNS
+    """
+
+    def test_vless_endpoint_down_gives_up_and_stays_degraded(self):
+        # The VLESS server (PROXY) is hard-down: every repair fails, so the
+        # engine must give up rather than loop forever, leaving the tunnel
+        # DEGRADED (not silently RUNNING, not crashed).
+        m = TunnelStateMachine(initial=TunnelState.RUNNING)
+        attempts = []
+        eng = make_engine(m, max_attempts=2)
+        eng.register(FailureKind.PROXY, [RecoveryAction(
+            "restart v2rayN", repair=lambda: attempts.append(1) or False)])
+        try:
+            eng.report_failure(FailureKind.PROXY, "endpoint unreachable")
+            wait_for(lambda: eng.stats()["give_ups"] == 1, what="proxy give-up")
+            self.assertEqual(len(attempts), 2)        # bounded retries
+            self.assertIs(m.current, TunnelState.DEGRADED)
+        finally:
+            eng.shutdown()
+
+    def test_sleep_wake_adapter_dropped_then_recovered(self):
+        # On wake the Wintun adapter is gone (ADAPTER). First repair fails
+        # (driver not ready yet); the backoff re-tries and the second
+        # succeeds -> RUNNING. No per-second reinstall: the schedule climbs.
+        m = TunnelStateMachine(initial=TunnelState.RUNNING)
+        calls = []
+        eng = make_engine(m, max_attempts=2)
+
+        def repair():
+            calls.append(1)
+            return len(calls) >= 2          # first attempt too early
+
+        eng.register(FailureKind.ADAPTER,
+                     [RecoveryAction("rebuild wintun", repair=repair)])
+        try:
+            eng.report_failure(FailureKind.ADAPTER, "adapter missing after wake")
+            # Wait for the repair to actually run (the machine is already
+            # RUNNING at start, so waiting on RUNNING would be trivially true).
+            wait_for(lambda: len(calls) == 2, what="two repair attempts")
+            wait_for(lambda: m.current is TunnelState.RUNNING,
+                     what="adapter recovered")
+            self.assertEqual(eng.stats()["repairs_ok"], 1)
+        finally:
+            eng.shutdown()
+
+    def test_wifi_change_route_lost_then_restored(self):
+        # Wi-Fi reconnect drops the default route (ROUTES). A single repair
+        # re-installs it; the tunnel returns to RUNNING.
+        m = TunnelStateMachine(initial=TunnelState.RUNNING)
+        eng = make_engine(m)
+        eng.register(FailureKind.ROUTES, [RecoveryAction(
+            "reinstall default route", repair=lambda: True)])
+        try:
+            eng.report_failure(FailureKind.ROUTES, "default route vanished")
+            wait_for(lambda: eng.stats()["repairs_ok"] == 1,
+                     what="route repair ran")
+            wait_for(lambda: m.current is TunnelState.RUNNING,
+                     what="routes restored")
+        finally:
+            eng.shutdown()
+
+    def test_dns_change_resolves_after_repair(self):
+        # User flipped DNS servers; resolution briefly fails (DNS) then a
+        # flush/restart of the resolver clears it.
+        m = TunnelStateMachine(initial=TunnelState.DEGRADED)
+        eng = make_engine(m)
+        eng.register(FailureKind.DNS, [RecoveryAction(
+            "flush resolver", repair=lambda: True)])
+        try:
+            eng.report_failure(FailureKind.DNS, "new DNS server not resolving")
+            wait_for(lambda: eng.stats()["repairs_ok"] == 1,
+                     what="dns repair ran")
+            wait_for(lambda: m.current is TunnelState.RUNNING,
+                     what="DNS resolved")
+        finally:
+            eng.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()
 

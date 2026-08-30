@@ -22,13 +22,18 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -t . -v
 
-      - name: Build release package
-        run: python build_release.py
+      - name: Build standalone executable
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          python build_release.py --with-exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/TunTop-x64.zip
+            dist/TunTop.exe
+            dist/checksums.txt
           generate_release_notes: true
           draft: false
           prerelease: false

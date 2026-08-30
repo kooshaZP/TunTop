@@ -98,6 +98,17 @@ class TestSuggest(unittest.TestCase):
         s = _suggest("mystery probe xyz")
         self.assertEqual(s, "")
 
+    def test_tun2socks_not_matched_as_socks(self):
+        # Regression: "tun2socks" contains "socks"; it must resolve to the
+        # tun2socks (crash/restart) tip, not the SOCKS5 inbound tip.
+        s = _suggest("tun2socks process died")
+        self.assertIn("crashed", s)
+        self.assertNotIn("SOCKS5 inbound", s)
+
+    def test_socks5_still_matches(self):
+        s = _suggest("SOCKS5 inbound closed")
+        self.assertIn("SOCKS5 inbound", s)
+
 
 if __name__ == "__main__":
     unittest.main()

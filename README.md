@@ -107,19 +107,33 @@ TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into v2rayN's l
 ```
 Run_Helper.ps1            <- launcher (PowerShell)
 tuntop/
-  dashboard.py             <- btop-style dashboard (owns the tunnel)
-  helper.py                <- tunnel builder + self-heal monitor
-  routing.py               <- netsh/PowerShell route engine
-  netdns.py                <- DNS resolver with cache
-  geoip.py                 <- geoip.dat country-range parser
-  state.py                 <- tunnel state machine
-  recovery.py              <- backoff-based recovery engine
-  routes_txn.py            <- transactional route management
-  startup_recovery.py      <- crash detection + cleanup at launch
-  integrity.py             <- binary SHA-256 verification
-  ui_text.py               <- terminal text/layout primitives
-  profiles.py              <- profile save/load
-tests/                     <- 164 tests across 5 tiers
+  core/                    <- tunnel orchestration (UI only talks to this)
+    tunnel_manager.py      <- lifecycle facade (start/stop/recover)
+    state.py               <- tunnel state machine
+    recovery.py            <- backoff-based recovery engine
+    routes_txn.py          <- transactional route management
+    startup_recovery.py    <- crash detection + cleanup at launch
+    integrity.py           <- binary SHA-256 verification
+    events.py              <- structured logging
+  network/                 <- routing / DNS / VPN (Windows edge)
+    routing.py             <- netsh/PowerShell route engine
+    dns.py                 <- DNS resolver with cache
+    vpn.py                 <- VPN detection / coexistence
+  tunnel/                  <- Wintun + tun2socks (Windows edge)
+    helper.py              <- tunnel builder + self-heal monitor
+    wintun.py              <- Wintun adapter management
+    tun2socks.py           <- tun2socks process management
+  monitor/                 <- health / traffic / leak / diagnostics
+    health.py              <- visual health report
+    traffic.py             <- live traffic stats
+  config/                  <- profiles + models + defaults
+    profiles.py            <- profile save/load + protected secrets
+  geo/                     <- geoip.dat parser
+    geoip.py
+  ui/                      <- btop-style dashboard (owns the tunnel)
+    dashboard.py
+    themes.py              <- terminal text/layout primitives
+tests/                     <- 170+ tests across 5 tiers
 ```
 
 `tun2socks.exe` and `wintun.dll` are auto-downloaded on first run and not in the repo.
@@ -154,6 +168,14 @@ See [CONTRIBUTING.md](https://github.com/kooshaZP/TunTop/blob/main/CONTRIBUTING.
 - **The UI must never block** — DNS, PowerShell, and route operations belong on background threads.
 - **Cleanup is sacred** — anything that adds routes must be removable at exit.
 - Run tests before committing. Include diagnostics (`[D]`) with bug reports.
+
+## Project docs & roadmap
+
+- [MILESTONE-v1.0.md](docs/MILESTONE-v1.0.md) — feature freeze, the definition of "stable", and the v1.0 criteria
+- [TEST-MATRIX.md](docs/TEST-MATRIX.md) — Windows 10/11 · Wi-Fi/Ethernet · VPN-active · IPv4/IPv6 · DNS-failure · sleep/wake test matrix
+- [KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) — known bugs and edge-case register
+- [CHANGELOG.md](CHANGELOG.md) — release history
+- [FAQ.md](FAQ.md) — common questions and answers
 
 ## Acknowledgments
 

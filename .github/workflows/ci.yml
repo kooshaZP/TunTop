@@ -22,7 +22,7 @@ jobs:
 
       - name: Syntax-check all Python entry points
         run: |
-          python -m py_compile tuntop/dashboard.py tuntop/helper.py tuntop/routing.py tuntop/netdns.py tuntop/geoip.py tuntop/state.py tuntop/recovery.py tuntop/routes_txn.py tuntop/startup_recovery.py tuntop/integrity.py tuntop/ui_text.py tuntop/profiles.py tuntop/structured_log.py tuntop/health_report.py
+          python -m py_compile tuntop/ui/dashboard.py tuntop/tunnel/helper.py tuntop/network/routing.py tuntop/network/dns.py tuntop/geo/geoip.py tuntop/core/state.py tuntop/core/recovery.py tuntop/core/routes_txn.py tuntop/core/startup_recovery.py tuntop/core/integrity.py tuntop/ui/themes.py tuntop/config/profiles.py tuntop/core/events.py tuntop/monitor/health.py
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -t . -v

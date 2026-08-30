@@ -7,8 +7,8 @@ active/inactive panel styling, and a clean dark theme.
 
 DOES NOT MODIFY ANY EXISTING FILE.  All helper logic is re-implemented locally.
 
-Usage:  python tuntop/dashboard.py --server IP [--port PORT] [--tun2socks PATH] [MODE FLAGS]
-Run via Run_Helper.bat for admin elevation.
+Usage:  python tuntop/ui/dashboard.py --server IP [--port PORT] [--tun2socks PATH] [MODE FLAGS]
+Run via Run_Helper.ps1 for admin elevation.
 """
 
 import argparse
@@ -34,6 +34,23 @@ import sys as _sys
 _PKG_PARENT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 if _PKG_PARENT not in _sys.path:
     _sys.path.insert(0, _PKG_PARENT)
+
+
+def app_dir() -> str:
+    """Directory that holds TunTop's runtime assets (tun2socks.exe / wintun.dll).
+
+    When frozen by PyInstaller (``--onefile``) the script runs from a temp
+    extraction dir, so the real assets live under ``sys._MEIPASS``; when run
+    from source they ship inside the ``tuntop`` package (this file lives in
+    ``tuntop/ui/``, so the assets are one level up). Always resolves to the
+    directory the *assets* are shipped in, never the temp sandbox.
+    """
+    if getattr(_sys, "frozen", False):
+        return getattr(_sys, "_MEIPASS", _os.path.dirname(_sys.executable))
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    if _os.path.basename(here) == "ui":
+        return _os.path.dirname(here)
+    return here
 
 from tuntop.routing import (          # noqa: E402
     _ps, _netsh, _teardown_wintun,
@@ -3435,9 +3452,10 @@ class BTopTui:
         try:
             import importlib
             here = os.path.dirname(os.path.abspath(__file__))
-            if here not in sys.path:
-                sys.path.insert(0, here)
-            helper = importlib.import_module("tuntop.helper")
+            pkg_dir = os.path.dirname(here)   # tuntop/ package (helper ships in tuntop/tunnel/)
+            if pkg_dir not in sys.path:
+                sys.path.insert(0, pkg_dir)
+            helper = importlib.import_module("tuntop.tunnel.helper")
         except Exception as e:
             self._blog(f"[!] Could not import helper module: {e}")
             return
@@ -4908,7 +4926,9 @@ class BTopTui:
         self.recovery.resume()
         self.logs.put("[*] Start requested - launching tunnel helper...")
         import sys as _sys
-        cmd = [_sys.executable, os.path.join(os.path.dirname(__file__), "helper.py"),
+        # helper.py ships in the tuntop/tunnel package, one level up from this
+        # ui module, not alongside dashboard.py.
+        cmd = [_sys.executable, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tunnel", "helper.py"),
                "--server", *self.ns.server, "--port", str(self.ns.port),
                "--tun2socks", self.ns.tun2socks, "--dns4", self.ns.dns4]
         if getattr(self.ns, "no_vpn_bypass", False):
@@ -5725,7 +5745,7 @@ def main():
     ap.add_argument("--server", nargs="+", default=["198.51.100.1"],
                     help="VLESS server IP or hostname (repeatable: --server a b)")
     ap.add_argument("--port", type=int, default=10808, help="SOCKS5 inbound port")
-    ap.add_argument("--tun2socks", default=os.path.join(os.path.dirname(__file__), "tun2socks-windows-amd64-v3.exe"))
+    ap.add_argument("--tun2socks", default=os.path.join(app_dir(), "tun2socks-windows-amd64-v3.exe"))
     ap.add_argument("--no-vpn-bypass", action="store_true")
     ap.add_argument("--no-auto-recover", action="store_true",
                     help="Disable automatic crash/degradation recovery "

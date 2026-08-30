@@ -34,8 +34,10 @@ Fixes:
      and say so plainly instead of leaving that to guesswork.
 
 Usage (Administrator PowerShell/CMD):
-  python tuntop/helper.py --server YOUR_SERVER --port 10808 ^
-      --tun2socks "C:\\tools\\tun2socks.exe"
+  This module is launched and owned by tuntop/ui/dashboard.py (run
+  Run_Helper.ps1).  It is not invoked directly:
+  python tuntop/ui/dashboard.py --server YOUR_SERVER --port 10808 ^
+       --tun2socks "C:\\tools\\tun2socks.exe"
 
 Your v2rayN SOCKS inbound must support UDP if you want UDP applications.
 """
@@ -670,13 +672,25 @@ def _read_bytes(buf, pos):
     return buf[pos:pos + length], pos + length
 
 
+def _clean_err(err):
+    """Pull a human-readable line out of a PowerShell stderr blob, skipping
+    the '#< CLIXML' progress/telemetry records PowerShell wraps around errors
+    so the geo-install failure reason is actually readable."""
+    for line in (err or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#<"):
+            continue
+        return line
+    return ""
+
+
 import os as _os
 import sys as _sys
-_PKG_PARENT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_PKG_PARENT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 if _PKG_PARENT not in _sys.path:
     _sys.path.insert(0, _PKG_PARENT)
 
-from tuntop.geoip import parse_geoip  # noqa: E402
+from tuntop.geo.geoip import parse_geoip  # noqa: E402
 
 
 def test_local_socks(port):

@@ -9,7 +9,8 @@ import unittest
 
 from tuntop.profiles import (
     profile_file, snapshot_from_args, load_store, save_snapshot,
-    apply_to_args, export_profile, import_profile,
+    apply_to_args, export_profile, import_profile, secret_store,
+    SecretStoreError, PROFILE_FILENAME,
 )
 
 
@@ -30,7 +31,11 @@ class _FakeArgs:
 
 class TestProfileFile(unittest.TestCase):
     def test_path(self):
-        self.assertEqual(profile_file("/pkg"), os.path.join("/pkg", "profiles.json"))
+        self.assertEqual(profile_file("/pkg"),
+                         os.path.join("/pkg", PROFILE_FILENAME))
+
+    def test_default_filename_is_branded(self):
+        self.assertEqual(PROFILE_FILENAME, "MyTunTopProfile.json")
 
 
 class TestSnapshotFromArgs(unittest.TestCase):
@@ -176,6 +181,25 @@ class TestImportProfile(unittest.TestCase):
         self.assertIn("snapshot", err.lower())
         os.unlink(path)
         os.rmdir(d)
+
+
+class TestSecretStore(unittest.TestCase):
+    """Secrets must never be written to the shareable JSON profile. On a
+    platform without a protected store (e.g. CI / non-Windows) any attempt
+    to persist a secret must fail loudly rather than fall back to plaintext.
+    """
+
+    def test_unavailable_store_refuses_to_persist(self):
+        if secret_store.available():
+            self.skipTest("protected store present on this platform")
+        with self.assertRaises(SecretStoreError):
+            secret_store.put("vless-key", "super-secret-uuid")
+
+    def test_unavailable_store_reports_unavailable(self):
+        self.assertEqual(secret_store.available(),
+                         os.name == "nt" and
+                         __import__("tuntop.profiles", fromlist=["_HAS_WINCRED"])
+                         ._HAS_WINCRED)
 
 
 if __name__ == "__main__":
