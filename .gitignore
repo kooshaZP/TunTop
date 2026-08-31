@@ -23,6 +23,8 @@ __pycache__/
 # the stock version and never push your edits, or move your values into an
 # untracked override file instead.
 # Run_Helper.local.ps1
+# *.TunTopProfile.json   # uncomment to also ignore saved profiles (they may
+#                       # contain your server IP and local geoip.dat path)
 
 # --- editor / OS ----------------------------------------------------------
 .vscode/
@@ -30,3 +32,5 @@ __pycache__/
 *.swp
 Thumbs.db
 desktop.ini
+
+tuntop/tunnel/.tuntop_control.json

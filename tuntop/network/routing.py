@@ -83,9 +83,15 @@ def _ps(script, timeout=8):
 
 
 def _teardown_wintun():
+    """Best-effort teardown of stale tunnel state: removes routes from BOTH
+    tunnel adapters (the primary 'wintun' and, when a previous run used
+    --proxy2-port, the secondary 'wintun2') and force-kills every orphaned
+    tun2socks process. A crash mid-session with proxy2 active otherwise
+    leaves the second adapter and its routes behind for the next launch."""
     try:
-        _ps("Get-NetRoute -InterfaceAlias 'wintun' -ErrorAction SilentlyContinue | "
-            "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
+        for adapter in ("wintun", "wintun2"):
+            _ps(f"Get-NetRoute -InterfaceAlias '{adapter}' -ErrorAction SilentlyContinue | "
+                "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
         _ps("Get-Process -ErrorAction SilentlyContinue | Where-Object {$_.ProcessName -like 'tun2socks*'} | "
             "ForEach-Object { Stop-Process -Force -Id $_.Id -ErrorAction SilentlyContinue }")
     except Exception:
@@ -203,7 +209,7 @@ $r | Select-Object InterfaceAlias, NextHop | ConvertTo-Json -Compress
 
 
 def _get_vpn_ipv4_default(vpn_interface=None):
-    """Connected Windows VPN's IPv4 default route (for --vless-over-vpn)."""
+    """Connected Windows VPN's IPv4 default route (for --proxy-over-vpn)."""
     if vpn_interface:
         ps = rf"""
 $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias '{vpn_interface}' -ErrorAction SilentlyContinue |
@@ -240,7 +246,7 @@ $best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
 
 
 def _get_vpn_ipv6_default(vpn_interface=None):
-    """IPv6 counterpart of _get_vpn_ipv4_default for --vless-over-vpn."""
+    """IPv6 counterpart of _get_vpn_ipv4_default for --proxy-over-vpn."""
     if vpn_interface:
         ps = rf"""
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{vpn_interface}' -ErrorAction SilentlyContinue |

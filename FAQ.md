@@ -3,18 +3,18 @@
 ## General
 
 ### What is TunTop?
-TunTop routes all Windows traffic through a VLESS proxy (via v2rayN) system-wide using a Wintun TUN adapter. It includes a live btop-style dashboard with throughput graphs, health monitoring, and instant bypass controls.
+TunTop routes all Windows traffic through any local SOCKS5 proxy (v2rayN, Xray, sing-box, Clash Meta, ...) system-wide using a Wintun TUN adapter. It includes a live btop-style dashboard with throughput graphs, health monitoring, and instant bypass controls.
 
 ### Do I need to install anything?
-Just Python 3.10+ and v2rayN. TunTop has zero pip dependencies — it uses only the Python standard library. The `tun2socks.exe` and `wintun.dll` binaries are auto-downloaded on first run.
+Just Python 3.10+ and a SOCKS5-capable proxy client. TunTop has zero pip dependencies — it uses only the Python standard library. The `tun2socks.exe` and `wintun.dll` binaries are auto-downloaded on first run.
 
 ### Does it work with Windows 10?
 Yes, Windows 10 version 1803 or later.
 
 ## Setup
 
-### v2rayN isn't running / SOCKS port is wrong
-TunTop connects to v2rayN's local SOCKS5 inbound (default port 10808). Make sure v2rayN is running and the SOCKS inbound is enabled. Press `[P]` in the dashboard to change the port if yours uses a different one.
+### The proxy isn't running / SOCKS port is wrong
+TunTop connects to your proxy client's local SOCKS5 inbound (default port 10808). Make sure the proxy client is running and the SOCKS inbound is enabled. Press `[P]` in the dashboard to change the port if yours uses a different one.
 
 ### How do I run as Administrator?
 Right-click `Run_Helper.ps1` → "Run with PowerShell" → confirm the UAC prompt. Or open an Administrator PowerShell and run `.\Run_Helper.ps1`.

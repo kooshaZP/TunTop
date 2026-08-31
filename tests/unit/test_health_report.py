@@ -92,7 +92,7 @@ class TestSuggest(unittest.TestCase):
 
     def test_vless_suggestion(self):
         s = _suggest("VLESS server unreachable")
-        self.assertIn("v2rayN", s)
+        self.assertIn("proxy client", s)
 
     def test_unknown_probe(self):
         s = _suggest("mystery probe xyz")

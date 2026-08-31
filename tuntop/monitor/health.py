@@ -14,12 +14,12 @@ from __future__ import annotations
 # Maps a probe name (or prefix) to a short, actionable suggestion.
 _FIX_SUGGESTIONS: dict[str, str] = {
     "vless server": (
-        "Check that v2rayN is running and the VLESS server address is "
-        "reachable. Try pressing [U] to change the server."
+        "Check that your proxy client is running and the proxy server "
+        "address is reachable. Try pressing [U] to change the server."
     ),
     "socks": (
-        "Ensure v2rayN's SOCKS5 inbound is enabled on the expected port. "
-        "Press [P] to change the port."
+        "Ensure your proxy client's SOCKS5 inbound is enabled on the "
+        "expected port. Press [P] to change the port."
     ),
     "dns": (
         "DNS resolution failed. Press [N] to switch DNS servers, or check "
@@ -46,7 +46,7 @@ _FIX_SUGGESTIONS: dict[str, str] = {
         "Press [T] then [S] to restart."
     ),
     "leak": (
-        "Traffic is leaking outside the tunnel. Verify v2rayN's SOCKS "
+        "Traffic is leaking outside the tunnel. Verify your proxy's SOCKS "
         "inbound and press [R] to re-apply routes."
     ),
     "vpn": (
@@ -54,7 +54,7 @@ _FIX_SUGGESTIONS: dict[str, str] = {
         "configure VPN bypass."
     ),
     "latency": (
-        "High latency detected. The VLESS server may be overloaded or "
+        "High latency detected. The proxy server may be overloaded or "
         "your connection is slow."
     ),
 }

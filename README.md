@@ -6,9 +6,9 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-informational)](#requirements)
 [![Dependencies](https://img.shields.io/badge/pip%20deps-zero-brightgreen)](#features)
 
-**A Windows full-tunnel for VLESS.**
+**A Windows full-tunnel for any SOCKS5 proxy.**
 
-v2rayN gives you the proxy. TunTop gives you system-wide routing.
+v2rayN, Xray, sing-box, Clash Meta — any proxy client with a local SOCKS5 inbound works. TunTop gives you system-wide routing.
 
 <p align="center">
   <img src="docs/dashboard-3.jpg" width="720" alt="TunTop dashboard - live throughput graphs and health suite"><br>
@@ -31,7 +31,7 @@ v2rayN gives you the proxy. TunTop gives you system-wide routing.
 
 ## Why do I need this?
 
-Most VLESS/v2ray setups only proxy the browser. TunTop routes **every app** on your PC through your VLESS server — system-wide — and shows you exactly what's happening in a live dashboard. A dead tunnel is obvious at a glance instead of discovered mid-download.
+Most proxy setups only cover the browser. TunTop routes **every app** on your PC through your proxy — system-wide — and shows you exactly what's happening in a live dashboard. A dead tunnel is obvious at a glance instead of discovered mid-download.
 
 ## Quick start (30 seconds)
 
@@ -42,23 +42,31 @@ git clone https://github.com/kooshaZP/TunTop.git
 cd TunTop
 ```
 
-### 2. Set up v2rayN
+### 2. Set up a proxy client
 
-Install [v2rayN](https://github.com/2dust/v2rayN), add your VLESS server, and enable the local SOCKS inbound (default `127.0.0.1:10808`).
+Install any SOCKS5-capable proxy client — e.g. [v2rayN](https://github.com/2dust/v2rayN), Xray, sing-box, or Clash Meta — and enable its local SOCKS inbound (default `127.0.0.1:10808`).
 
 ### 3. Run
 
+**Easiest — double-click `Start_TunTop.bat`.** It fixes the two classic
+"downloaded from GitHub and it won't run" problems automatically (strips the
+Mark-of-the-Web with `Unblock-File`, runs with `-ExecutionPolicy Bypass`),
+styles the console (title, UTF-8, 120×36, TrueType font so the box glyphs
+render), and starts `Run_Helper.ps1`.
+
 > ⚠️ **Windows blocks `.ps1` scripts by default.** PowerShell's default
-> execution policy is `Restricted`, so double-clicking `Run_Helper.ps1`
-> does nothing (or opens it in Notepad). Use **one** of these:
+> execution policy is `Restricted`, and files downloaded from GitHub carry the
+> Mark-of-the-Web, so double-clicking `Run_Helper.ps1` does nothing (or opens
+> it in Notepad). Use **one** of these:
 >
-> - **From a terminal** (recommended — also bypasses the policy):
+> - **`Start_TunTop.bat`** (recommended — fixes both blockers + styling)
+> - **From a terminal** (also bypasses the policy):
 >   ```powershell
 >   powershell -ExecutionPolicy Bypass -File Run_Helper.ps1
 >   ```
 > - **From Explorer:** right-click `Run_Helper.ps1` → **Run with PowerShell**
->   → confirm the UAC prompt. (The right-click "Run with PowerShell" entry
->   already elevates and bypasses the policy for that one file.)
+>   → confirm the UAC prompt. (The script also unblocks itself and, if the
+>   policy is `Restricted`, relaunches under `Bypass` on its own.)
 
 Right-click `Run_Helper.ps1` → **Run with PowerShell** → confirm the UAC prompt. First run auto-downloads `tun2socks.exe` and `wintun.dll` if they're missing.
 
@@ -70,13 +78,13 @@ Press **[S]** to start the tunnel, **[C]** to run a health scan, **[L]** for a l
 flowchart LR
     A[Apps on Windows] --> B[Wintun TUN adapter]
     B --> C[tun2socks]
-    C --> D["v2rayN local SOCKS5 (127.0.0.1:10808)"]
-    D --> E[Your VLESS server]
+    C --> D["Local SOCKS5 proxy (127.0.0.1:10808)"]
+    D --> E[Your proxy's upstream server]
     F[TunTop dashboard] -. builds and self-heals .-> B
     F -. live routes / bypass / geoip .-> G[Windows routing table]
 ```
 
-TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into v2rayN's local SOCKS5 inbound, and manages the Windows routing table to direct all traffic through it. The dashboard owns the tunnel for its entire lifetime — editing servers, bypass rules, or geo splits updates the routing table live.
+TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into your proxy's local SOCKS5 inbound, and manages the Windows routing table to direct all traffic through it. The dashboard owns the tunnel for its entire lifetime — editing servers, bypass rules, or geo splits updates the routing table live.
 
 ## Key reference
 
@@ -84,14 +92,18 @@ TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into v2rayN's l
 | ------------------------------ | ----------------------------------------------------- |
 | `[S]` `[T]` `[Q]`             | Start / stop / quit (verifies cleanup)                |
 | `[C]`                         | Health scan                                           |
-| `[A]` `[X]`                   | Add/remove bypass instantly (no restart)              |
+| `[A]` `[X]`                   | Add/remove bypass instantly, with target choice: direct / proxy2 / vpn (no restart) |
 | `[L]` `[D]`                   | Leak test / export diagnostics                        |
 | `[O]` `[I]`                   | Save / load profile                                   |
-| `[U]` `[V]` `[Y]` `[F]`       | Servers / VPN mode / VPN bypass / geo config          |
-| `[P]` `[N]` `[E]`             | SOCKS port / DNS / endpoint port                      |
+| `[U]` `[V]` `[Y]` `[F]`       | Servers (live) / VPN mode / VPN bypass / geo config (code + egress, live) |
+| `[Z]`                         | Add/change/remove the second proxy (proxy2) at runtime |
+| `[P]` `[N]` `[E]`             | SOCKS port / DNS (live, no restart) / endpoint port (live) |
 | `[R]`                         | Re-apply geoip country bypass live                    |
 | `[G]` `[M]` `[H]`             | Graph mode / theme / hide help                        |
 | `1-6`, `0`                    | Hide/show panels                                      |
+
+On short windows (16:9 screens) the panels shrink first — health-check rows,
+then the graph — and the help footer is only removed as the last resort.
 
 ## Requirements
 
@@ -100,7 +112,7 @@ TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into v2rayN's l
 | Windows 10 1803+ / 11 | Wintun adapter driver         |
 | Python 3.10+          | stdlib only, no pip install   |
 | Administrator         | route table management        |
-| v2rayN running        | provides the SOCKS5 inbound   |
+| A SOCKS5 proxy client (v2rayN, Xray, sing-box, Clash Meta, ...) running locally | provides the SOCKS5 inbound |
 
 ## Project layout
 

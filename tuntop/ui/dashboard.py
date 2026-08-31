@@ -859,9 +859,13 @@ def _ipv6_tun_verdict(port, url="https://www.cloudflare.com/cdn-cgi/trace"):
 
 
 def _teardown_wintun():
+    """Best-effort teardown of stale tunnel state: removes routes from BOTH
+    tunnel adapters ('wintun' + optional 'wintun2' second pipe) and kills
+    orphaned tun2socks processes. Mirrors tuntop.network.routing's version."""
     try:
-        _ps("Get-NetRoute -InterfaceAlias 'wintun' -ErrorAction SilentlyContinue | "
-            "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
+        for _adapter in ("wintun", "wintun2"):
+            _ps(f"Get-NetRoute -InterfaceAlias '{_adapter}' -ErrorAction SilentlyContinue | "
+                "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
         _ps("Get-Process -ErrorAction SilentlyContinue | Where-Object {$_.ProcessName -like 'tun2socks*'} | "
             "ForEach-Object { Stop-Process -Force -Id $_.Id -ErrorAction SilentlyContinue }")
     except Exception:
@@ -1834,6 +1838,14 @@ class BTopTui:
         self._show_help = True      # footer key/action guide; toggle with [H]
         self._hidden = set()         # section ids hidden via [1]-[5],[B]; [0] shows all
         self._bypass_res_cache = {}   # entry -> (v4_list, v6_list) last good result
+        # Second-hop (proxy2) resolver state - a SEPARATE dict, not a field on
+        # the direct one, so a target can never leak across (2.4 design rule).
+        self._proxy2_res_cache = {}
+        self._proxy2_res_state = {}
+        # Third routing target: "vpn" (egress through a CONNECTED Windows VPN).
+        # Separate store, same isolation rule as direct/proxy2.
+        self._vpn_res_cache = {}
+        self._vpn_res_state = {}
         # Per-entry resolution state for the extra bypass list. Owned by the
         # background resolver thread; read (under the lock) by the draw thread.
         #   status : pending | ok | fail
@@ -1868,6 +1880,18 @@ class BTopTui:
         self._live_geo_added = []  # geo routes this dashboard process installed live (for cleanup on stop)
         self._live_bypass_added = []  # live [A] bypass-IP routes (for cleanup on stop)
         self._geo_dl_active = False   # a background geoip download is running
+        self._geo_applied_target = None  # egress target the live geo routes currently point at
+
+        # Adaptive layout: the panels shrink FIRST, the help footer is removed
+        # LAST (short windows / 16:9 screens). _fixed_rows is the previous
+        # frame's height of everything above the event log; the shrink budget
+        # for this frame is derived from it, so it converges one frame (~40 ms)
+        # after a resize. All three are recomputed at the top of draw().
+        self._fixed_rows = None
+        self._checks_cap = None      # max health-check rows shown this frame
+        self._graph_cap = None       # min graph rows per direction this frame
+        self._help_rows = 4          # help footer rows this frame (4 / 2 / 0)
+        self._shrink_size = None     # (h, w) the shrink budget was computed for
 
         # Bypass add mode. False (default) = INSTANT: [A]/[X] resolve and
         # install/remove the /32 - /128 routes live in a background thread, so
@@ -2534,6 +2558,22 @@ class BTopTui:
             return _get_vpn_ipv6_default(getattr(self.ns, "vpn_interface", None))
         return _get_ipv6_default()
 
+    # Windows loopback pseudo-interface. Used as a "blackhole" next-hop for the
+    # IPv6 fallback below: a /128 pointed here has nowhere real to go, so the
+    # TCP connect fails and Happy Eyeballs falls back to the IPv4 /32.
+    _LOOPBACK_IFACE = "Loopback Pseudo-Interface 1"
+
+    def _ipv6_is_local(self, addr):
+        """True if `addr` is assigned to any local adapter. Safety guard so the
+        IPv6-blackhole fallback never blackholes one of our own addresses."""
+        try:
+            ok, out = _ps(
+                f"@(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue "
+                f"| Where-Object {{$_.IPAddress -eq '{addr}'}}).Count -gt 0")
+            return ok and out.strip().strip('"').lower() in ("true", "1")
+        except Exception:
+            return False
+
     # ── Extra bypass entries: add / remove / resolve (background) ─────────
     #
     # Design note (this is what fixed the "-> (unresolved)" forever bug):
@@ -2606,23 +2646,59 @@ class BTopTui:
         return {"status": "pending", "ips": [], "err": None, "tries": 0,
                 "next": 0.0, "routed": False, "source": None, "last": 0.0}
 
-    def _install_bypass_routes(self, entry, ep4, ep6, log=True):
-        """Install /32 + /128 bypass routes for one entry. Returns the list of
-        IPs that are now routed direct. Safe to call from any thread: it only
-        shells out and logs through the queue.
+    def _tun2_constants(self):
+        """(TUN2, TUN2_IP4, TUN2_IP6) from the helper module - imported lazily
+        the same way _reapply_geo_bypass_worker does, so the UI layer keeps its
+        import graph pointing at Core/Tunnel facades only."""
+        import importlib
+        here = os.path.dirname(os.path.abspath(__file__))
+        pkg_dir = os.path.dirname(here)   # tuntop/ package
+        if pkg_dir not in sys.path:
+            sys.path.insert(0, pkg_dir)
+        helper = importlib.import_module("tuntop.tunnel.helper")
+        return helper.TUN2, helper.TUN2_IP4, helper.TUN2_IP6
+
+    def _install_bypass_routes(self, entry, ep4, ep6, log=True, target="direct"):
+        """Install /32 + /128 routes for one entry. Returns the list of IPs
+        that are now routed. Safe to call from any thread: it only shells out
+        and logs through the queue.
+
+        target="direct" (default): bypass routes via the physical NIC - the
+        traffic stays OUT of the tunnel entirely.
+        target="proxy2": routes point at the SECOND TUN adapter (wintun2, only
+        present when --proxy2-port is set) - the traffic exits through the
+        second proxy instead of the primary one.
 
         TRANSACTIONAL (tuntop/routes_txn.py): every route of the entry is
         applied as ONE all-or-nothing unit - each add is verified against the
         real routing table, and any failure rolls back the routes already
         applied. A half-installed bypass (IPv4 direct while IPv6 still dies
         inside the TUN) can no longer happen."""
-        iface_gw = self._get_vless_iface_gateway()
+        if target == "proxy2":
+            t2, t2_ip4, t2_ip6 = self._tun2_constants()
+            iface_gw = (t2, t2_ip4)      # wintun2's own address = its next hop,
+            v6_target = (t2, t2_ip6)     # exactly how the primary TUN is used
+        elif target == "vpn":
+            # Egress through a CONNECTED Windows VPN (same egress the geoip
+            # "via Windows VPN" mode uses). No VPN default route -> nothing
+            # planned; the resolver retries with backoff and reports why.
+            v4d = _get_vpn_ipv4_default(getattr(self.ns, "vpn_interface", None))
+            iface_gw = (v4d[0], v4d[1]) if v4d else None
+            v6d = _get_vpn_ipv6_default(getattr(self.ns, "vpn_interface", None))
+            v6_target = (v6d[0], v6d[1]) if v6d else None
+        else:
+            iface_gw = self._get_vless_iface_gateway()
+            v6_target = None
         # ── Plan ────────────────────────────────────────────────────────
         planned = []                   # (ip, RouteOp) in apply order
         for ip in ep4:
-            # Route via the interface/gateway Windows would really use to reach
-            # this IP (correct for split-tunnel VPNs), not the bare default.
-            eg = _get_egress_for(ip) or iface_gw
+            if target in ("proxy2", "vpn"):
+                eg = iface_gw
+            else:
+                # Route via the interface/gateway Windows would really use to
+                # reach this IP (correct for split-tunnel VPNs), not the bare
+                # default.
+                eg = _get_egress_for(ip) or iface_gw
             if not eg:
                 if log:
                     self._blog(f"[!] No egress found for {ip} ({entry}); bypass route "
@@ -2631,16 +2707,28 @@ class BTopTui:
             planned.append(
                 (ip, ("v4", f"{ip}/32", eg[0], eg[1])))
         if ep6:
-            v6gw = self._get_vless_iface_gateway_v6()
-            if not v6gw:
-                if log:
-                    self._blog("[i] No usable IPv6 gateway - IPv6 bypass routes are "
-                               "not installed live; they apply on tunnel restart.")
+            if target in ("proxy2", "vpn"):
+                if not v6_target:
+                    if log:
+                        self._blog("[i] No IPv6 gateway on the target egress - "
+                                   "IPv6 bypass routes are not installed live; "
+                                   "they apply on tunnel restart.")
+                else:
+                    v6iface, v6gateway = v6_target
+                    for ip in ep6:
+                        planned.append(
+                            (ip, ("v6", f"{ip}/128", v6iface, v6gateway)))
             else:
-                v6iface, v6gateway = v6gw
-                for ip in ep6:
-                    planned.append(
-                        (ip, ("v6", f"{ip}/128", v6iface, v6gateway)))
+                v6gw = self._get_vless_iface_gateway_v6()
+                if not v6gw:
+                    if log:
+                        self._blog("[i] No usable IPv6 gateway - IPv6 bypass routes are "
+                                   "not installed live; they apply on tunnel restart.")
+                else:
+                    v6iface, v6gateway = v6gw
+                    for ip in ep6:
+                        planned.append(
+                            (ip, ("v6", f"{ip}/128", v6iface, v6gateway)))
         if not planned:
             return []
         # ── Apply (all-or-nothing) ──────────────────────────────────────
@@ -2667,14 +2755,26 @@ class BTopTui:
             self._live_bypass_added.append((fam, dest, iface, gw))
         return applied
 
-    def _bypass_resolve_entry(self, entry, log=True):
+    def _bypass_stores(self, target):
+        """(state_dict, cache_dict) for a routing target. Deliberately SEPARATE
+        stores per target (never one dict with a target field): a direct entry
+        and a proxy2 entry with the same name cannot collide, and no code path
+        can accidentally install one target's route for the other's entry."""
+        if target == "proxy2":
+            return self._proxy2_res_state, self._proxy2_res_cache
+        if target == "vpn":
+            return self._vpn_res_state, self._vpn_res_cache
+        return self._bypass_res_state, self._bypass_res_cache
+
+    def _bypass_resolve_entry(self, entry, log=True, target="direct"):
         """Resolve ONE entry (full fallback stack) and install its routes if it
         resolved. Updates the shared state. Returns the state dict copy."""
         ep4, ep6, err, src = _resolve_detail(entry, use_cache=False, fallback=True)
         now = time.time()
         ips = list(ep4) + list(ep6)
+        state, cache = self._bypass_stores(target)
         with self._bypass_res_lock:
-            st = self._bypass_res_state.setdefault(entry, self._bypass_new_state())
+            st = state.setdefault(entry, self._bypass_new_state())
             prev_ips = list(st.get("ips") or [])
             prev_status = st.get("status")
             st["last"] = now
@@ -2682,9 +2782,10 @@ class BTopTui:
             changed = (ips != prev_ips) or not prev_ips
             applied = []
             if changed or not prev_ips:
-                applied = self._install_bypass_routes(entry, ep4, ep6, log=log)
+                applied = self._install_bypass_routes(entry, ep4, ep6, log=log,
+                                                      target=target)
             with self._bypass_res_lock:
-                st = self._bypass_res_state.setdefault(entry, self._bypass_new_state())
+                st = state.setdefault(entry, self._bypass_new_state())
                 st.update(status="ok", ips=ips, err=None, tries=0, source=src,
                           next=now + self._BYPASS_REFRESH)
                 if applied:
@@ -2692,7 +2793,7 @@ class BTopTui:
                 elif changed:
                     st["routed"] = False
                 out = dict(st)
-            self._bypass_res_cache[entry] = (list(ep4), list(ep6))
+            cache[entry] = (list(ep4), list(ep6))
             if changed:
                 # The health checks probe the routes for the *resolved* IPs, so
                 # rebuild them now that we know what those are.
@@ -2702,8 +2803,14 @@ class BTopTui:
                     pass
             if log and changed:
                 via = f" via {src}" if src and src not in ("system", "literal") else ""
-                route_note = (f"; routed direct: {', '.join(applied)}"
-                              if applied else "; route not installed yet (will retry)")
+                if target == "proxy2":
+                    route_note = (f"; routed via proxy2: {', '.join(applied)}"
+                                  if applied else
+                                  "; proxy2 route not installed yet (will retry)")
+                else:
+                    route_note = (f"; routed direct: {', '.join(applied)}"
+                                  if applied else
+                                  "; route not installed yet (will retry)")
                 if prev_status == "fail":
                     self._blog(f"[+] Bypass '{entry}' resolved again{via} -> "
                                f"{', '.join(ips)}{route_note}")
@@ -2711,16 +2818,17 @@ class BTopTui:
                     self._blog(f"[+] Bypass '{entry}' -> {', '.join(ips)}{via}{route_note}")
             elif log and not out["routed"]:
                 # Resolved, same IPs, but the route never made it in - retry it.
-                applied = self._install_bypass_routes(entry, ep4, ep6, log=False)
+                applied = self._install_bypass_routes(entry, ep4, ep6, log=False,
+                                                      target=target)
                 if applied:
                     with self._bypass_res_lock:
-                        self._bypass_res_state[entry]["routed"] = True
+                        state[entry]["routed"] = True
                     self._blog(f"[+] Bypass route(s) installed for {entry}: "
                                f"{', '.join(applied)}")
             return out
         # Failure: schedule an exponential-backoff retry (3, 6, 12, 24, 48, 60s).
         with self._bypass_res_lock:
-            st = self._bypass_res_state.setdefault(entry, self._bypass_new_state())
+            st = state.setdefault(entry, self._bypass_new_state())
             st["tries"] = int(st.get("tries") or 0) + 1
             delay = min(self._BYPASS_RETRY_MAX, 3.0 * (2 ** (st["tries"] - 1)))
             st.update(status="fail", err=err or "could not resolve",
@@ -2733,10 +2841,16 @@ class BTopTui:
                        f"in the background (attempt {tries}).")
         return out
 
-    def _bypass_normalise_list(self):
-        """Make sure every entry in ns.bypass_ip is a bare host/IP. Entries can
-        arrive as URLs from --bypass-ip too, not just from the [A] key."""
-        current = list(getattr(self.ns, "bypass_ip", []) or [])
+    def _bypass_normalise_list(self, target="direct"):
+        """Make sure every entry in the target's bypass list is a bare host/IP.
+        Entries can arrive as URLs from --bypass-ip/--proxy2-bypass-ip too, not
+        just from the [A] key."""
+        if target == "proxy2":
+            current = list(getattr(self.ns, "proxy2_bypass_ip", []) or [])
+        elif target == "vpn":
+            current = list(getattr(self.ns, "vpn_bypass_ip", []) or [])
+        else:
+            current = list(getattr(self.ns, "bypass_ip", []) or [])
         fixed, changed = [], False
         for raw in current:
             host = _host_from_url(raw)
@@ -2753,29 +2867,40 @@ class BTopTui:
             else:
                 changed = True
         if changed:
-            self.ns.bypass_ip = fixed
+            if target == "proxy2":
+                self.ns.proxy2_bypass_ip = fixed
+            elif target == "vpn":
+                self.ns.vpn_bypass_ip = fixed
+            else:
+                self.ns.bypass_ip = fixed
             self.checks = build_checks(self.ns)
         return fixed
 
     def _bypass_resolve_tick(self):
         """One pass over the extra bypass entries: resolve whatever is due.
         Called by the background thread (and directly by the tests)."""
-        entries = self._bypass_normalise_list()
         now = time.time()
-        with self._bypass_res_lock:
-            for gone in [e for e in self._bypass_res_state if e not in entries]:
-                self._bypass_res_state.pop(gone, None)
-                self._bypass_res_cache.pop(gone, None)
-            due = []
-            for entry in entries:
-                st = self._bypass_res_state.get(entry)
-                if st is None:
-                    self._bypass_res_state[entry] = self._bypass_new_state()
-                    due.append(entry)
-                elif st.get("next", 0.0) <= now:
-                    due.append(entry)
-        for entry in due:
-            self._bypass_resolve_entry(entry)
+        for target in ("direct", "proxy2", "vpn"):
+            if target == "proxy2" and not getattr(self.ns, "proxy2_port", None):
+                continue   # second hop disabled: nothing to resolve for it
+            if target == "vpn" and not getattr(self.ns, "vpn_bypass_ip", None):
+                continue   # nothing was ever pointed at the VPN egress
+            entries = self._bypass_normalise_list(target)
+            state, cache = self._bypass_stores(target)
+            with self._bypass_res_lock:
+                for gone in [e for e in state if e not in entries]:
+                    state.pop(gone, None)
+                    cache.pop(gone, None)
+                due = []
+                for entry in entries:
+                    st = state.get(entry)
+                    if st is None:
+                        state[entry] = self._bypass_new_state()
+                        due.append(entry)
+                    elif st.get("next", 0.0) <= now:
+                        due.append(entry)
+            for entry in due:
+                self._bypass_resolve_entry(entry, target=target)
 
     def _ensure_bypass_resolver(self):
         """Start (or restart) the background bypass resolver. Called from
@@ -2801,10 +2926,11 @@ class BTopTui:
                 self._blog(f"[!] Bypass resolver error: {e}")
             time.sleep(0.5)
 
-    def _add_bypass_ip(self, raw):
-        """[A] - add an entry to the bypass list. Accepts an IP, a hostname or
+    def _add_bypass_ip(self, raw, target="direct"):
+        """[A] - add an entry to a bypass list. Accepts an IP, a hostname or
         a full URL. The entry is resolved + routed live in the background and
-        the tunnel keeps running."""
+        the tunnel keeps running. target="proxy2" adds it to the second-hop
+        list (routes point at wintun2 instead of the physical NIC)."""
         entry = _host_from_url(raw)
         if not entry:
             self.log_lines.append(f"[!] {raw!r} is not a usable IP/hostname.")
@@ -2813,42 +2939,64 @@ class BTopTui:
         if entry != str(raw).strip():
             norm_note = (f" (normalised from '{str(raw).strip()}' - a bypass route "
                          "needs a host/IP, not a URL)")
-        current = list(getattr(self.ns, "bypass_ip", []) or [])
+        if target == "proxy2":
+            current = list(getattr(self.ns, "proxy2_bypass_ip", []) or [])
+        elif target == "vpn":
+            current = list(getattr(self.ns, "vpn_bypass_ip", []) or [])
+        else:
+            current = list(getattr(self.ns, "bypass_ip", []) or [])
         already = entry in current
         if not already:
             current.append(entry)
-            self.ns.bypass_ip = current
+            if target == "proxy2":
+                self.ns.proxy2_bypass_ip = current
+            elif target == "vpn":
+                self.ns.vpn_bypass_ip = current
+            else:
+                self.ns.bypass_ip = current
             self.checks = build_checks(self.ns)
+        state, _cache = self._bypass_stores(target)
         with self._bypass_res_lock:
-            st = self._bypass_res_state.get(entry)
+            st = state.get(entry)
             if st is None or st.get("status") != "ok":
-                self._bypass_res_state[entry] = self._bypass_new_state()
+                state[entry] = self._bypass_new_state()
+        target_note = " (second hop: proxy2)" if target == "proxy2" else (
+            " (egress: Windows VPN)" if target == "vpn" else "")
         if already:
             self.log_lines.append(
-                f"[i] '{entry}' is already in the bypass list - re-applying now.")
+                f"[i] '{entry}' is already in the {target} bypass list - "
+                "re-applying now.")
         else:
-            self.log_lines.append(f"[+] Added '{entry}'{norm_note} to the bypass list.")
+            self.log_lines.append(f"[+] Added '{entry}'{norm_note} to the "
+                                  f"{target} bypass list{target_note}.")
         self.log_lines.append(
             "    (resolving + installing the route live in the background "
             "- no restart needed)")
         self._ensure_bypass_resolver()
 
-    def _remove_bypass_ip(self, entry):
+    def _remove_bypass_ip(self, entry, target="direct"):
         entry = _host_from_url(entry) or entry
-        current = list(getattr(self.ns, "bypass_ip", []) or [])
+        if target == "proxy2":
+            current = list(getattr(self.ns, "proxy2_bypass_ip", []) or [])
+        elif target == "vpn":
+            current = list(getattr(self.ns, "vpn_bypass_ip", []) or [])
+        else:
+            current = list(getattr(self.ns, "bypass_ip", []) or [])
         if entry not in current:
-            self.log_lines.append(f"[!] '{entry}' is not in the current bypass list: "
-                                   f"{', '.join(current) if current else '(empty)'}")
+            self.log_lines.append(f"[!] '{entry}' is not in the current {target} "
+                                  f"bypass list: "
+                                  f"{', '.join(current) if current else '(empty)'}")
             return
         # Capture the IPs we already know for this entry BEFORE dropping its
         # state/cache, so the live-route delete (used when auto-restart is off)
         # actually has something to remove. The background resolver stores the
-        # resolved IPs in _bypass_res_state[entry]["ips"] and _bypass_res_cache.
+        # resolved IPs in <state>[entry]["ips"] and the per-target cache.
+        state, cache = self._bypass_stores(target)
         with self._bypass_res_lock:
-            st = self._bypass_res_state.get(entry) or {}
+            st = state.get(entry) or {}
             known = list(st.get("ips") or [])
         if not known:
-            k4, k6 = self._bypass_res_cache.get(entry, ([], []))
+            k4, k6 = cache.get(entry, ([], []))
             known = list(k4) + list(k6)
         if not known:
             k4, k6 = _resolve_cached(entry)
@@ -2858,36 +3006,64 @@ class BTopTui:
         # background thread so the keypress never blocks the UI (a hung RasMan /
         # netsh call could otherwise freeze the whole dashboard for seconds).
         current.remove(entry)
-        self.ns.bypass_ip = current
-        self._bypass_res_cache.pop(entry, None)
+        if target == "proxy2":
+            self.ns.proxy2_bypass_ip = current
+        elif target == "vpn":
+            self.ns.vpn_bypass_ip = current
+        else:
+            self.ns.bypass_ip = current
+        cache.pop(entry, None)
         with self._bypass_res_lock:
-            self._bypass_res_state.pop(entry, None)
+            state.pop(entry, None)
         self.checks = build_checks(self.ns)
-        self.log_lines.append(f"[-] Removed '{entry}' from the bypass list.")
+        self.log_lines.append(f"[-] Removed '{entry}' from the {target} bypass list.")
         # Removal is ALWAYS a live, backgrounded route delete - it must never
         # restart the tunnel (that would reload geo and briefly drop traffic for
-        # no reason). The entry is already gone from ns.bypass_ip, so the next
+        # no reason). The entry is already gone from the bypass list, so the next
         # tunnel start/restart simply won't re-apply it. The [A] key is the only
         # one gated by the auto-restart ([Z]) toggle.
-        self._remove_bypass_routes_async(entry, known)
+        self._remove_bypass_routes_async(entry, known, target=target)
 
-    def _remove_bypass_routes_async(self, entry, known):
-        """Delete an entry's live bypass routes off the UI thread. `known` is the
-        list of IPs captured by _remove_bypass_ip (or [] if none were known yet).
-        Logs results through the thread-safe _blog() queue."""
+    def _remove_bypass_routes_async(self, entry, known, target="direct"):
+        """Delete an entry's live routes off the UI thread. `known` is the
+        list of IPs captured by _remove_bypass_ip (or [] if none were known
+        yet). `target` must match the target the routes were installed with:
+        proxy2 routes live on the wintun2 adapter, direct ones on the egress
+        the physical lookup picks. Logs results through _blog()."""
         if not known:
             k4, k6 = _resolve_cached(entry)
             known = list(k4) + list(k6)
         if not known:
-            self._blog(f"[-] Removed '{entry}' from the bypass list "
+            self._blog(f"[-] Removed '{entry}' from the {target} bypass list "
                        "(no resolved IPs - nothing to delete).")
             return
+
+        if target == "proxy2":
+            t2, t2_ip4, t2_ip6 = self._tun2_constants()
 
         def _worker():
             ep4 = [ip for ip in known if ":" not in ip]
             ep6 = [ip for ip in known if ":" in ip]
             removed, failed = [], []
+            if target == "vpn":
+                # VPN egress detected in the background thread (PowerShell -
+                # never on the UI thread).
+                vg = _get_vpn_ipv4_default(getattr(self.ns, "vpn_interface", None))
+                vg6 = _get_vpn_ipv6_default(getattr(self.ns, "vpn_interface", None))
             for ip in ep4:
+                if target == "proxy2":
+                    if _del_route_v4(f"{ip}/32", t2, t2_ip4):
+                        removed.append(ip)
+                    else:
+                        failed.append(ip)
+                    continue
+                if target == "vpn":
+                    if vg:
+                        ok = _del_route_v4(f"{ip}/32", vg[0], vg[1])
+                    else:
+                        ok = _del_route_v4(f"{ip}/32", "", "")
+                    (removed if ok else failed).append(ip)
+                    continue
                 eg = _get_egress_for(ip) or self._get_vless_iface_gateway()
                 if not eg:
                     # No egress info - try a prefix-wide delete anyway; the
@@ -2902,15 +3078,39 @@ class BTopTui:
                 else:
                     failed.append(ip)
             if ep6:
-                v6gw = self._get_vless_iface_gateway_v6()
-                for ip in ep6:
-                    ok = False
-                    if v6gw:
-                        ok = _del_route_v6(f"{ip}/128", v6gw[0], v6gw[1])
-                    if ok:
-                        removed.append(ip)
-                    else:
-                        failed.append(ip)
+                if target == "proxy2":
+                    for ip in ep6:
+                        if _del_route_v6(f"{ip}/128", t2, t2_ip6):
+                            removed.append(ip)
+                        else:
+                            failed.append(ip)
+                elif target == "vpn":
+                    for ip in ep6:
+                        if vg6:
+                            ok = _del_route_v6(f"{ip}/128", vg6[0], vg6[1])
+                        else:
+                            ok = _del_route_v6(f"{ip}/128", "", "")
+                        (removed if ok else failed).append(ip)
+                else:
+                    v6gw = self._get_vless_iface_gateway_v6()
+                    for ip in ep6:
+                        ok = False
+                        # Prefer a targeted delete when we know the gateway it
+                        # was installed with.
+                        if v6gw:
+                            ok = _del_route_v6(f"{ip}/128", v6gw[0], v6gw[1])
+                        if ok:
+                            removed.append(ip)
+                            continue
+                        # No gateway detected (or the targeted delete missed):
+                        # fall back to a prefix-wide Remove-NetRoute that ignores
+                        # iface/nexthop, so a route installed earlier (when a
+                        # gateway existed) is still removed even if the gateway
+                        # is no longer detected - mirrors the IPv4 path.
+                        if _del_route_v6(f"{ip}/128", "", ""):
+                            removed.append(ip)
+                        else:
+                            failed.append(ip)
             if removed:
                 self._blog(f"[-] Removed bypass route(s): {', '.join(removed)}")
             elif not failed:
@@ -2989,6 +3189,15 @@ class BTopTui:
         (Esc cancels). Replaces the old 'type the exact entry' prompt so there
         is no guessing or spelling of long hostnames."""
         items = list(getattr(self.ns, "bypass_ip", []) or [])
+        # Combined picker: direct entries first, then proxy2/vpn ones (tagged).
+        targets = ["direct"] * len(items)
+        if getattr(self.ns, "proxy2_port", None):
+            p2 = list(getattr(self.ns, "proxy2_bypass_ip", []) or [])
+            items = items + p2
+            targets = targets + ["proxy2"] * len(p2)
+        vp = list(getattr(self.ns, "vpn_bypass_ip", []) or [])
+        items = items + vp
+        targets = targets + ["vpn"] * len(vp)
         if not items:
             self.log_lines.append("[i] No extra bypass entries to remove.")
             return
@@ -3009,7 +3218,7 @@ class BTopTui:
                     return
                 if k == "enter":
                     entry = items[sel]
-                    self._remove_bypass_ip(entry)
+                    self._remove_bypass_ip(entry, target=targets[sel])
                     return
                 if k == "up":
                     sel = max(0, sel - 1)
@@ -3030,7 +3239,7 @@ class BTopTui:
             self._prev_lines = []
             self._full_repaint = True
 
-    def _bypass_resolved_list(self):
+    def _bypass_resolved_list(self, target="direct"):
         """Snapshot of every extra bypass entry for the UI:
         [{entry, ips, status, detail}, ...].
 
@@ -3039,9 +3248,14 @@ class BTopTui:
         retried (the background resolver keeps trying)."""
         out = []
         now = time.time()
+        state, _cache = self._bypass_stores(target)
+        if target == "proxy2":
+            entries = list(getattr(self.ns, "proxy2_bypass_ip", []) or [])
+        else:
+            entries = list(getattr(self.ns, "bypass_ip", []) or [])
         with self._bypass_res_lock:
-            states = {k: dict(v) for k, v in self._bypass_res_state.items()}
-        for entry in (getattr(self.ns, "bypass_ip", []) or []):
+            states = {k: dict(v) for k, v in state.items()}
+        for entry in entries:
             st = states.get(entry)
             if st is None:
                 out.append({"entry": entry, "ips": [], "status": "pending",
@@ -3060,12 +3274,19 @@ class BTopTui:
                           f"retry in {wait}s, attempt {st.get('tries', 0)})")
             else:
                 detail = "(resolving...)"
+            if target == "proxy2":
+                detail += " [proxy2]"
+            elif target == "vpn":
+                detail += " [vpn]"
             out.append({"entry": entry, "ips": ips, "status": status, "detail": detail})
         return out
 
     def _bypass_labels(self):
         """Rows for the [X] remove picker - same non-blocking state as the panel."""
-        return [f"{it['entry']}  ->  {it['detail']}" for it in self._bypass_resolved_list()]
+        rows = (self._bypass_resolved_list("direct")
+                + self._bypass_resolved_list("proxy2")
+                + self._bypass_resolved_list("vpn"))
+        return [f"{it['entry']}  ->  {it['detail']}" for it in rows]
 
     def _apply_launch_change(self, reason):
         """A setting that shapes the helper's COMMAND LINE was edited at
@@ -3120,6 +3341,7 @@ class BTopTui:
         if not hosts:
             self.log_lines.append(f"[!] No usable host in {val!r} - servers unchanged.")
             return
+        old_v4, old_v6 = list(self.endpoint_v4), list(self.endpoint_v6)
         self.ns.server = hosts
         # Re-resolve the endpoints for display/health immediately (best effort).
         self.endpoint_v4, self.endpoint_v6 = [], []
@@ -3136,7 +3358,36 @@ class BTopTui:
         except Exception as e:
             self.log_lines.append(f"[!] Health-check rebuild failed: {e}")
         self.log_lines.append(f"[*] Servers set to: {', '.join(hosts)}.")
-        self._apply_launch_change("server list changed")
+        # LIVE apply - the VLESS transport is reached by IP, so NO TUN restart
+        # is needed: drop the old endpoints' host routes and install ones for
+        # the new servers (keeps the proxy's own connection out of the TUN).
+        self._rehost_endpoint_routes(old_v4 + old_v6, hosts)
+
+    def _rehost_endpoint_routes(self, old_ips, hosts):
+        """Live server change: delete the old VLESS endpoints' /32-/128 host
+        routes and install fresh ones for the new servers - all off the UI
+        thread. Only a display/health refresh happens on the main thread."""
+        def _worker():
+            gone = []
+            for ip in old_ips:
+                ok = (_del_route_v4(f"{ip}/32", "", "") if ":" not in ip
+                      else _del_route_v6(f"{ip}/128", "", ""))
+                if ok:
+                    gone.append(ip)
+            if gone:
+                self._blog(f"[-] Old server host routes removed: {', '.join(gone)}")
+            for srv in hosts:
+                v4, v6 = _resolve(srv)
+                if not v4 and not v6:
+                    self._blog(f"[!] Could not resolve new server '{srv}' - "
+                               "its host route will be retried automatically.")
+                    continue
+                applied = self._install_bypass_routes(srv, v4, v6,
+                                                      log=True, target="direct")
+                if applied:
+                    self._blog(f"[+] Server '{srv}' now bypassed direct "
+                               f"({', '.join(applied)}) - no TUN restart needed.")
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _edit_geo(self):
         new_code = self._read_line(
@@ -3150,9 +3401,34 @@ class BTopTui:
             return
         self.ns.geoip_code = new_code.strip().lower()
         self.log_lines.append(f"[*] Geo bypass code set to '{self.ns.geoip_code}'.")
+        # Egress target - same "direct / proxy2 / vpn" choice as [A], and it
+        # can be changed while the app is running (routes are re-pointed live).
+        t = self._read_line(
+            "Route geoip country traffic via: [Enter]=keep current, "
+            "1=direct, 2=proxy2, 3=vpn (Windows VPN):",
+            title="GEOIP  -  CHOOSE EGRESS",
+            examples=[f"current: {self._geo_target()}",
+                      "2 needs proxy2 configured (press [Z])",
+                      "the choice applies live - no tunnel restart"])
+        t = (t or "").strip()
+        target = self._geo_target()
+        if t == "1":
+            target = "direct"
+        elif t == "2":
+            if getattr(self.ns, "proxy2_port", None):
+                target = "proxy2"
+            else:
+                self.log_lines.append(
+                    "[!] proxy2 is not configured (press [Z] to add it) - "
+                    "keeping the current egress.")
+        elif t == "3":
+            target = "winvpn"
+        if target != self._geo_target():
+            self._set_geo_target(target)
+            self.log_lines.append(f"[*] Geo egress target: {target}.")
         if getattr(self.ns, "geoip", None):
             # A geo file is configured - re-apply the ranges LIVE, no restart.
-            self._reapply_geo_bypass()
+            self._reapply_geo_bypass(target=target)
         else:
             path = self._read_line(
                 "Path to v2rayN geoip.dat (empty = cancel):",
@@ -3209,27 +3485,34 @@ class BTopTui:
         size = _get_window_size() or (80, 24)
         avail = max(5, min(20, size[1] - 6))
         sel, top = 0, 0
-        while True:
-            top = max(0, min(sel - avail // 2, max(0, len(names) - avail)))
-            self._draw_list_overlay("LOAD PROFILE", labels, sel, top, avail)
-            k = self._read_nav_key()
-            if k is None or k == "esc":
-                self.log_lines.append("[*] Load cancelled.")
-                return
-            if k == "enter":
-                break
-            if k == "up":
-                sel = max(0, sel - 1)
-            elif k == "down":
-                sel = min(len(names) - 1, sel + 1)
-            elif k == "pgup":
-                sel = max(0, sel - avail)
-            elif k == "pgdn":
-                sel = min(len(names) - 1, sel + avail)
-            elif k == "home":
-                sel = 0
-            elif k == "end":
-                sel = len(names) - 1
+        try:
+            while True:
+                top = max(0, min(sel - avail // 2, max(0, len(names) - avail)))
+                self._draw_list_overlay("LOAD PROFILE", labels, sel, top, avail)
+                k = self._read_nav_key()
+                if k is None or k == "esc":
+                    self.log_lines.append("[*] Load cancelled.")
+                    return
+                if k == "enter":
+                    break
+                if k == "up":
+                    sel = max(0, sel - 1)
+                elif k == "down":
+                    sel = min(len(names) - 1, sel + 1)
+                elif k == "pgup":
+                    sel = max(0, sel - avail)
+                elif k == "pgdn":
+                    sel = min(len(names) - 1, sel + avail)
+                elif k == "home":
+                    sel = 0
+                elif k == "end":
+                    sel = len(names) - 1
+        finally:
+            # Force the dashboard to fully repaint on the next frame (the overlay
+            # cleared the screen, so a per-line diff would leave stale rows).
+            self._last_frame = ""
+            self._prev_lines = []
+            self._full_repaint = True
         name = names[sel]
         snap = data[name]
         profiles.apply_to_args(self.ns, snap, normalise_host=_host_from_url)
@@ -3374,6 +3657,20 @@ class BTopTui:
         self.launch()
         self.log_lines.append(f"[+] Restarted with SOCKS port {new_port}")
 
+    def _write_control_file(self):
+        """Write the helper's live-reconfig control file (the exact path the
+        helper polls in its monitor loop). Currently carries the DNS choice,
+        so a running tunnel re-binds its DNS without a restart."""
+        path = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "tunnel", ".tuntop_control.json"))
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"dns4": getattr(self.ns, "dns4", None),
+                           "dns6": getattr(self.ns, "dns6", None)}, f)
+        except Exception as e:
+            self.log_lines.append(f"[!] Could not write control file: {e}")
+
     def _change_dns(self, new_dns):
         import ipaddress
         ip = new_dns.strip()
@@ -3386,13 +3683,32 @@ class BTopTui:
         if ip == old_dns:
             self.log_lines.append(f"[i] Already using DNS4 {old_dns}.")
             return
-        self.log_lines.append(
-            f"[*] Changing DNS4 {old_dns} -> {ip}; restarting tunnel to reconfigure Wintun...")
-        self.stop()
         self.ns.dns4 = ip
-        self.checks = build_checks(self.ns)
-        self.launch()
-        self.log_lines.append(f"[+] Restarted with DNS4 {ip}")
+        try:
+            self.checks = build_checks(self.ns)
+        except Exception as e:
+            self.log_lines.append(f"[!] Health-check rebuild failed: {e}")
+        self.log_lines.append(
+            f"[*] Changing DNS4 {old_dns} -> {ip} LIVE - no tunnel restart needed.")
+        # 1) Tell the RUNNING helper via the control file: it rebinds its
+        #    active DNS and re-applies the Wintun config, so a later self-heal
+        #    keeps the NEW choice instead of reverting to the launch value.
+        self._write_control_file()
+        # 2) Apply immediately here too (the helper's monitor loop would get
+        #    there within ~1 s; doing it now makes [N] instant).
+        def _apply():
+            try:
+                _ps("Set-DnsClientServerAddress -InterfaceAlias 'wintun' "
+                    f"-ServerAddresses '{ip}' -ErrorAction SilentlyContinue; "
+                    "Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null")
+                self._blog(f"[+] Wintun DNS set to {ip} (live).")
+            except Exception as e:
+                self._blog(f"[!] Live DNS apply failed ({e}) - the helper's "
+                           "monitor loop will re-apply it within seconds.")
+        threading.Thread(target=_apply, daemon=True).start()
+        self.log_lines.append(
+            "[i] Applies to NEW lookups right away; apps that cached the old "
+            "answer refresh on their next resolver query.")
 
     def _change_endpoint_port(self, new_port_str):
         try:
@@ -3415,13 +3731,99 @@ class BTopTui:
             f"[+] Endpoint (VLESS server) port set to {new_port}; "
             "health check now targets this port.")
 
-    def _reapply_geo_bypass(self):
+    def _edit_proxy2(self):
+        """[Z] - add / change / remove the SECOND proxy (proxy2) while the app
+        is running. Brings the second TUN hop (wintun2) up or down via a
+        transparent background tunnel restart - no need to quit and relaunch,
+        and no re-answering of the launch menu."""
+        if getattr(self.ns, "proxy2_port", None):
+            val = self._read_line(
+                f"proxy2 is ON at 127.0.0.1:{self.ns.proxy2_port}. "
+                "Type OFF to remove it, a port number to switch, "
+                "or press Enter to cancel:",
+                title="PROXY2  -  SECOND HOP",
+                examples=["OFF   -> disable proxy2",
+                          "10809 -> switch to that port",
+                          "Enter -> cancel"])
+            if not val:
+                return
+            if val.strip().lower() == "off":
+                self.ns.proxy2_port = None
+                self.ns.proxy2_server = []
+                self.log_lines.append("[*] proxy2 disabled - restarting the "
+                                      "tunnel in the background to tear wintun2 down...")
+                self._apply_launch_change("proxy2 removed")
+            else:
+                self._proxy2_set_port(val)
+        else:
+            val = self._read_line(
+                "Port of the SECOND local SOCKS5 proxy (e.g. 10809):",
+                title="ADD PROXY2  -  SECOND HOP",
+                examples=["the 2nd proxy client's inbound SOCKS5 port",
+                          "hosts added via [A] -> 2 will route through it",
+                          "empty = cancel"])
+            self._proxy2_set_port(val)
+
+    def _proxy2_set_port(self, val):
+        try:
+            port = int(val)
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            self.log_lines.append(f"[!] Invalid port: {val!r}")
+            return
+        self.ns.proxy2_port = port
+        srv = self._read_line(
+            "proxy2's own upstream server(s) (comma/space separated, "
+            "empty = none):",
+            title="PROXY2 SERVERS",
+            examples=["IP/hostname(s) of the 2nd proxy's server",
+                      "kept direct so the second hop can connect"])
+        hosts = []
+        if srv:
+            for part in re.split(r"[,\s]+", srv.strip()):
+                h = _host_from_url(part)
+                if h and h not in hosts:
+                    hosts.append(h)
+        self.ns.proxy2_server = hosts
+        try:
+            self.checks = build_checks(self.ns)
+        except Exception as e:
+            self.log_lines.append(f"[!] Health-check rebuild failed: {e}")
+        self.log_lines.append(
+            f"[*] proxy2 set to 127.0.0.1:{port}"
+            + (f" (upstream: {', '.join(hosts)})" if hosts else "")
+            + " - restarting the tunnel in the background to bring wintun2 up...")
+        self._apply_launch_change("proxy2 added/changed")
+
+    def _geo_target(self):
+        """Current geoip egress target: 'direct' | 'proxy2' | 'winvpn'.
+        Falls back to the legacy --geoip-via-win-vpn bool when no explicit
+        target has been chosen in [F] yet."""
+        t = getattr(self.ns, "geoip_target", None)
+        if t in ("direct", "proxy2", "winvpn"):
+            return t
+        return "winvpn" if getattr(self.ns, "geoip_via_win_vpn", False) else "direct"
+
+    def _set_geo_target(self, t):
+        """Persist a geoip egress target chosen in [F]. Keeps the legacy
+        bool flags in sync so profiles/launch flags stay correct."""
+        self.ns.geoip_target = t
+        self.ns.geoip_via_win_vpn = (t == "winvpn")
+        # An explicit choice wins over the legacy wintun (--geoip-via-vpn) mode.
+        self.ns.geoip_via_vpn = False
+
+    def _reapply_geo_bypass(self, target=None):
         """Re-install the configured geoip country bypass LIVE, without a full
         stop/start of the tunnel. Imports the helper module's pure-Python geo
         decoder + batched route installer and runs them in this process, so a
         changed geoip file or country code takes effect immediately. Routes
         installed here are tracked in self._live_geo_added and removed on stop()
         (the helper's own atexit only cleans what IT added at startup).
+
+        target: egress for the country ranges - 'direct' (physical adapter),
+        'proxy2' (second TUN hop) or 'winvpn' (connected Windows VPN). None
+        keeps the currently configured target.
 
         This is invoked synchronously from the main thread by the [R] key, so it
         MUST NOT do the slow work inline: parse_geoip() (uncached) and
@@ -3436,13 +3838,15 @@ class BTopTui:
                 "[!] No geoip file configured - set --geoip (and optional "
                 "--geoip-code) and (re)start, or pick it in the launch menu.")
             return
+        target = target or self._geo_target()
         code = (getattr(self.ns, "geoip_code", None) or "cn")
         self.log_lines.append(
-            f"[*] Re-applying geoip bypass '{code}' live from {geo} ...")
+            f"[*] Re-applying geoip bypass '{code}' live from {geo} "
+            f"(via {target}) ...")
         threading.Thread(target=self._reapply_geo_bypass_worker,
-                         args=(geo, code), daemon=True).start()
+                         args=(geo, code, target), daemon=True).start()
 
-    def _reapply_geo_bypass_worker(self, geo, code):
+    def _reapply_geo_bypass_worker(self, geo, code, target="direct"):
         """Background worker for _reapply_geo_bypass(): does the actual parse +
         route install off the UI thread, logs via the thread-safe _blog(), and
         routes the helper's stdout (GEO markers + geoip diagnostics) through the
@@ -3470,7 +3874,33 @@ class BTopTui:
         except Exception as e:
             self._blog(f"[!] geoip parse failed ({code}): {e}")
             return
-        if getattr(self.ns, "geoip_via_win_vpn", False):
+        # Egress target changed live? Remove the routes that still point at
+        # the OLD egress first, so no country CIDR ends up with two routes
+        # (one via the old egress, one via the new).
+        if (self._live_geo_added and self._geo_applied_target
+                and self._geo_applied_target != target):
+            self._blog(f"[*] Geo egress changed {self._geo_applied_target} -> "
+                       f"{target}; removing the old country routes first...")
+            for fam, dest, iface, gw in list(self._live_geo_added):
+                if fam == "v4":
+                    _del_route_v4(dest, iface, gw)
+                else:
+                    _del_route_v6(dest, iface, gw)
+            self._live_geo_added = []
+        if target == "proxy2":
+            # Route the country ranges through the SECOND proxy hop (wintun2),
+            # exactly how proxy2-tagged bypass entries are routed.
+            if not getattr(self.ns, "proxy2_port", None):
+                self._blog("[!] geoip via proxy2 requested but proxy2 is not "
+                           "configured (press [Z]) - using the direct egress.")
+                target = "direct"
+            else:
+                t2, t2_ip4, t2_ip6 = self._tun2_constants()
+                g_iface, g_gw = t2, t2_ip4
+                v6iface, v6gw = t2, t2_ip6
+                self._blog(f"[*] geoip:{code} routed via the second proxy (wintun2).")
+        if target == "direct" and (self._geo_target() == "winvpn"
+                                   or getattr(self.ns, "geoip_via_win_vpn", False)):
             # Route the country ranges out through a CONNECTED Windows VPN.
             vpn4 = _get_vpn_ipv4_default(getattr(self.ns, "vpn_interface", None))
             vpn6 = _get_vpn_ipv6_default(getattr(self.ns, "vpn_interface", None))
@@ -3495,7 +3925,7 @@ class BTopTui:
                     v6iface, v6gw = vpn6[0], vpn6[1]
                 self._blog(
                     f"[*] geoip:{code} routed via connected Windows VPN ({g_iface}).")
-        elif getattr(self.ns, "geoip_via_vpn", False):
+        elif target == "direct" and getattr(self.ns, "geoip_via_vpn", False):
             # Mode 3 ("vpn as geo"): tunnel the country ranges through wintun
             # instead of sending them direct via the physical adapter.
             helper.ensure_wintun_ipv4()
@@ -3537,6 +3967,7 @@ class BTopTui:
         new = [t for t in helper.geoip_added[before:] if t not in self._live_geo_added]
         self._live_geo_added.extend(new)
         helper.geoip_added = helper.geoip_added[:before]
+        self._geo_applied_target = target
         if new:
             self._blog(
                 f"[+] Geo bypass '{code}' re-applied live ({len(new)} routes).")
@@ -3634,6 +4065,9 @@ class BTopTui:
         elif key == 'f':
             self._edit_geo()
             return True
+        elif key == 'z':
+            self._edit_proxy2()
+            return True
         elif key == 'o':
             self._save_profile()
             return True
@@ -3682,14 +4116,39 @@ class BTopTui:
             self._hscroll = max(0, self._hscroll + (step if key == 'right' else -step))
             return True
         elif key == 'a':
+            # Target choice: direct by default (existing muscle memory - just
+            # press Enter and type a host); pick proxy2 only when the second
+            # pipe is actually configured.
+            target = "direct"
+            examples = ["Enter -> direct (bypass the TUN entirely)",
+                        "2     -> through the second proxy (if configured)",
+                        "3     -> out through a connected Windows VPN"]
+            if getattr(self.ns, "proxy2_port", None):
+                t = self._read_line(
+                    "Route via: [Enter]=direct, 2=proxy2 "
+                    f"(127.0.0.1:{self.ns.proxy2_port}), 3=vpn:",
+                    title="ADD BYPASS  -  CHOOSE TARGET",
+                    examples=examples)
+                if t and t.strip() == "2":
+                    target = "proxy2"
+                elif t and t.strip() == "3":
+                    target = "vpn"
+            else:
+                t = self._read_line(
+                    "Route via: [Enter]=direct, 3=vpn (Windows VPN):",
+                    title="ADD BYPASS  -  CHOOSE TARGET",
+                    examples=examples)
+                if t and t.strip() == "3":
+                    target = "vpn"
             val = self._read_line(
-                "IP, hostname or URL to route DIRECT (not through the TUN):",
+                "IP, hostname or URL to route via "
+                f"{target.upper() if target == 'proxy2' else 'DIRECT (not through the TUN)'}:",
                 title="ADD BYPASS  -  INSTANT, NO RESTART",
                 examples=["https://whatismyip.com/   (a full URL is fine)",
                           "example.com   or   sub.example.com:443",
                           "1.2.3.4   or   2606:4700::1111"])
             if val:
-                self._add_bypass_ip(val)
+                self._add_bypass_ip(val, target=target)
             return True
         elif key == 'x':
             self._select_bypass()
@@ -3703,6 +4162,7 @@ class BTopTui:
             else:
                 self._hidden.add('bypass')
                 self.log_lines.append("[*] Bypass list panel: hidden (toggle with [B]).")
+            self._shrink_size = None   # panel height changed -> re-budget
             return True
         elif key == 'p':
             val = self._read_line(f"New SOCKS5 port (current {self.ns.port}):")
@@ -3733,6 +4193,7 @@ class BTopTui:
             return True
         elif key == 'h':
             self._show_help = not self._show_help
+            self._shrink_size = None   # footer height changed -> re-budget
             self.log_lines.append(
                 f"[*] Help {'hidden' if not self._show_help else 'shown'} "
                 f"(toggle with [H])")
@@ -3754,6 +4215,7 @@ class BTopTui:
                 else:
                     self._hidden.add(sec)
                     self.log_lines.append(f"[*] Section hidden: {sec} (toggle with [{key}])")
+            self._shrink_size = None   # a panel's height changed -> re-budget
             self._full_repaint = True
             return True
         elif key == 'r':
@@ -3866,6 +4328,49 @@ class BTopTui:
         # garbled after a few frames. Keeping every row strictly inside the
         # viewport (w-1) avoids it entirely.
         w = max(40, min(widths) - 1)
+
+        # ── Adaptive shrink: units shrink FIRST, help footer removed LAST ──
+        # On short windows (e.g. 16:9 screens) the fixed panels used to keep
+        # their full size while the help footer was dropped first. Instead:
+        #   1. health-check rows shrink (page of 8-12 -> down to 5)
+        #   2. the throughput graph shrinks (5 -> 2 rows per direction)
+        #   3. the help footer halves (4 -> 2 rows)
+        #   4. and only THEN the footer is removed entirely.
+        #
+        # FEEDBACK-LOOP GUARD: the budget is derived from the panels' measured
+        # height, and the panels' height depends on the budget - recomputing it
+        # every frame oscillates (shrink -> smaller measurement -> un-shrink ->
+        # bigger measurement -> shrink ...), which showed up as the graph/log
+        # flickering big/small at certain window sizes. So the budget is only
+        # recomputed when the window size (or a panel toggle) CHANGES, and the
+        # height measurement is only taken from a frame with NO caps applied,
+        # so it always reflects the un-shrunk layout.
+        self._checks_cap = None
+        self._graph_cap = None
+        self._help_rows = 4 if self._show_help else 0
+        if self._shrink_size != (h, w):
+            self._shrink_size = (h, w)
+            self._fixed_rows = None        # force a clean un-shrunk measurement
+        if self._show_help and self._fixed_rows:
+            deficit = (self._fixed_rows + 4 + 8 + 2) - h   # 8 = min log rows
+            if deficit > 0:
+                # A cap only frees rows if its panel is actually drawn.
+                if "checks" not in self._hidden and self.results:
+                    page = max(8, min(12, (w - 2) // 40))
+                    take = min(max(0, page - 5), deficit)
+                    if take:
+                        self._checks_cap = page - take
+                        deficit -= take
+                if deficit > 0 and "graph" not in self._hidden:
+                    cap = max(2, 5 - (deficit + 1) // 2)   # 2 rows freed per step
+                    deficit -= 2 * (5 - cap)
+                    if cap < 5:
+                        self._graph_cap = cap
+                if deficit > 0 and self._help_rows == 4:
+                    self._help_rows = 2
+                    deficit -= 2
+                if deficit > 0:
+                    self._help_rows = 0    # last resort: footer gone
         # Telemetry now runs in a background thread (see _telemetry_worker), so
         # draw() only reads the latest samples - it must never block on the
         # PowerShell/socket calls, or a slow proxy (get_ping can hang for
@@ -3997,6 +4502,17 @@ class BTopTui:
         if getattr(self.ns, "geoip", None):
             gcode = str(getattr(self.ns, "geoip_code", "cn")).upper()
             pairs.append(("GEO", BRIGHT + gcode + RESET))
+        if getattr(self.ns, "proxy2_port", None):
+            # Second pipe status - only rendered when --proxy2-port is set, so
+            # the bar looks unchanged for anyone not using the feature. The
+            # wintun2 pipe lives and dies with the helper subprocess, so its
+            # up/down mirrors the tunnel's operational state (never guessed
+            # from a route that might be stale).
+            p2_up = state in (TunnelState.RUNNING.value,
+                              TunnelState.DEGRADED.value)
+            pairs.append(("PROXY2", (GREEN if p2_up else YELLOW)
+                          + f"127.0.0.1:{self.ns.proxy2_port} "
+                          + ("up" if p2_up else "down") + RESET))
         if getattr(self.ns, "vless_over_vpn", False) and self._vpn_status:
             vpn_ok = self._vpn_status != "NOT CONNECTED"
             pairs.append(("VPN", (GREEN if vpn_ok else YELLOW)
@@ -4111,7 +4627,10 @@ class BTopTui:
             vpn_dot = DOT_OK
         bl.append(" " + vpn_dot + " " + _kv("VPN", vpn_val))
         if getattr(self.ns, "geoip", None):
-            if getattr(self.ns, "geoip_via_win_vpn", False):
+            _gt = self._geo_target()
+            if _gt == "proxy2":
+                geo_egress, geo_dot = "via second proxy (proxy2)", DOT_OK
+            elif _gt == "winvpn":
                 geo_egress, geo_dot = "via connected Windows VPN", DOT_OK
             elif getattr(self.ns, "geoip_via_vpn", False):
                 geo_egress, geo_dot = "tunneled via wintun (vpn-as-geo)", DOT_WARN
@@ -4310,7 +4829,7 @@ class BTopTui:
         # "live" edge on the newest sample; both share one scale so download
         # and upload are directly comparable.
         graph_w = IW                 # edge-to-edge: span the full inner width
-        series_h = 5                 # area rows per direction (taller = smoother)
+        series_h = max(2, min(5, self._graph_cap or 5))  # area rows per direction (taller = smoother)
         gmode = self._resolve_graph_mode()   # block | half | braille | line
 
         # ── Mood engine ─────────────────────────────────────────────────
@@ -4585,6 +5104,8 @@ class BTopTui:
         # ── Health checks table (paged) ────────────────────────────────
         if "checks" not in self._hidden:
             page_size = max(8, min(12, IW // 40))
+            if self._checks_cap:
+                page_size = max(5, min(page_size, self._checks_cap))
             self.page_size = page_size
             page_count = max(1, (max(done, 1) + page_size - 1) // page_size)
             self.page = min(self.page, max(0, page_count - 1))
@@ -4665,16 +5186,22 @@ class BTopTui:
         # before the log loses rows, never the other way around. _show_help is
         # toggled with [H] (key or the footer button).
         GUIDE_MIN_LOG = 8  # keep the guide only while the log can stay this tall
-        footer_h = 4 if self._show_help else 0   # four help rows: controls / live-edit / config / sections
+        footer_h = self._help_rows   # 4 / 2 / 0 - decided by the shrink budget
         log_visible = h - len(L) - footer_h - 2   # -2 = this panel's own borders
-        if self._show_help and log_visible < GUIDE_MIN_LOG:
-            # Not enough room for both the guide and a usable log - drop the
-            # guide so the log keeps its rows (guide disappears first).
+        if self._show_help and footer_h and log_visible < GUIDE_MIN_LOG:
+            # Absolute fallback (first frame after a resize, before the shrink
+            # budget has a measurement): drop the guide so the log keeps its
+            # rows. Normally the panels ABOVE have already shrunk instead.
             footer_h = 0
             log_visible = h - len(L) - footer_h - 2
         if log_visible < 3:
             log_visible = 3
         self._log_visible = log_visible
+        # Measure everything above the log + footer - but ONLY from a frame
+        # with no shrink caps applied, so the next budget is computed from the
+        # UNSHRUNK height (measuring a shrunk frame feeds the feedback loop).
+        if not self._checks_cap and not self._graph_cap:
+            self._fixed_rows = len(L)
 
         if "log" not in self._hidden:
             total = len(self.log_lines)
@@ -4736,30 +5263,36 @@ class BTopTui:
             L.append(_row(gap.join(segs)))
 
         if footer_h:
-            _help_row([
-                ('h', "[H] Hide help"), ('c', "[C] Scan"), ('s', "[S] Start"),
-                ('t', "[T] Stop"), ('q', "[Q] Quit"), ('l', "[L] Leak Test"),
-                ('d', "[D] Diagnostics"), ('m', "[M] Color"), ('g', "[G] Graph"),
-            ])
-            _help_row([
-                ('a', "[A] +Bypass (instant)"), ('x', "[X] -Bypass (instant)"),
-                ('b', "[B] Bypass List"),
-                ('r', "[R] Re-apply Geo"), ('p', "[P] Port"), ('n', "[N] DNS"),
-                ('e', "[E] Endpoint"),
-            ])
-            _help_row([
-                ('u', "[U] Servers"), ('v', "[V] Proxy(VLESS) thru VPN"),
-                ('y', "[Y] VPN Bypass"), ('f', "[F] Geo Config"),
-                ('w', "[W] Get/Update GeoIP"),
-                ('o', "[O] Save Profile"), ('i', "[I] Load Profile"),
-                ('k', "[K/J] Page"), ('up', "[Arrows] Scroll"),
-            ])
-            _help_row([
-                ('1', "[1] Metrics"), ('2', "[2] Endpoint"),
-                ('3', "[3] Bypass"), ('4', "[4] Graph"),
-                ('5', "[5] Checks"), ('6', "[6] Log"),
-                ('0', "[0] Show All"),
-            ])
+            _help_rows = [
+                [
+                    ('h', "[H] Hide help"), ('c', "[C] Scan"), ('s', "[S] Start"),
+                    ('t', "[T] Stop"), ('q', "[Q] Quit"), ('l', "[L] Leak Test"),
+                    ('d', "[D] Diagnostics"), ('m', "[M] Color"), ('g', "[G] Graph"),
+                ],
+                [
+                    ('a', "[A] +Bypass (instant)"), ('x', "[X] -Bypass (instant)"),
+                    ('b', "[B] Bypass List"),
+                    ('r', "[R] Re-apply Geo"), ('z', "[Z] Proxy2"), ('p', "[P] Port"), ('n', "[N] DNS"),
+                    ('e', "[E] Endpoint"),
+                ],
+                [
+                    ('u', "[U] Servers"), ('v', "[V] Proxy(VLESS) thru VPN"),
+                    ('y', "[Y] VPN Bypass"), ('f', "[F] Geo Config"),
+                    ('w', "[W] Get/Update GeoIP"),
+                    ('o', "[O] Save Profile"), ('i', "[I] Load Profile"),
+                    ('k', "[K/J] Page"), ('up', "[Arrows] Scroll"),
+                ],
+                [
+                    ('1', "[1] Metrics"), ('2', "[2] Endpoint"),
+                    ('3', "[3] Bypass"), ('4', "[4] Graph"),
+                    ('5', "[5] Checks"), ('6', "[6] Log"),
+                    ('0', "[0] Show All"),
+                ],
+            ]
+            # Shrink-aware: 2 footer rows keep the essentials (controls +
+            # live-edit); only a full window shows all four.
+            for items in _help_rows[:footer_h]:
+                _help_row(items)
 
         # ── Render to terminal ─────────────────────────────────────────
         # Flicker reduction strategy:
@@ -4934,11 +5467,18 @@ class BTopTui:
         if getattr(self.ns, "no_vpn_bypass", False):
             cmd.append("--no-vpn-bypass")
         if getattr(self.ns, "vless_over_vpn", False):
-            cmd.append("--vless-over-vpn")
+            cmd.append("--proxy-over-vpn")
         if getattr(self.ns, "vpn_interface", None):
             cmd += ["--vpn-interface", self.ns.vpn_interface]
         for ip in getattr(self.ns, "bypass_ip", []) or []:
             cmd += ["--bypass-ip", ip]
+        if getattr(self.ns, "proxy2_port", None):
+            # Second proxy pipe: the port flag turns the whole feature on.
+            cmd += ["--proxy2-port", str(self.ns.proxy2_port)]
+            for s in getattr(self.ns, "proxy2_server", []) or []:
+                cmd += ["--proxy2-server", s]
+            for ip in getattr(self.ns, "proxy2_bypass_ip", []) or []:
+                cmd += ["--proxy2-bypass-ip", ip]
         geo_ready = bool(getattr(self.ns, "geoip", None))
         if geo_ready and not os.path.isfile(self.ns.geoip):
             # Configured geoip file is not on disk: start the tunnel WITHOUT
@@ -4957,9 +5497,9 @@ class BTopTui:
             cmd += ["--geoip", self.ns.geoip]
             if getattr(self.ns, "geoip_code", "cn") != "cn":
                 cmd += ["--geoip-code", self.ns.geoip_code]
-        if getattr(self.ns, "geoip_via_vpn", False):
+        if getattr(self.ns, "geoip_via_vpn", False) and self._geo_target() == "direct":
             cmd.append("--geoip-via-vpn")
-        if getattr(self.ns, "geoip_via_win_vpn", False):
+        if self._geo_target() == "winvpn":
             cmd.append("--geoip-via-win-vpn")
 
         try:
@@ -5461,15 +6001,19 @@ class BTopTui:
 
     @staticmethod
     def _count_wintun_routes():
-        ok, out = _ps(
-            "Get-NetRoute -InterfaceAlias 'wintun' -ErrorAction SilentlyContinue | "
-            "Measure-Object | Select-Object -ExpandProperty Count")
-        if ok:
-            try:
-                return int(out.strip())
-            except Exception:
-                return 0
-        return 0
+        """Routes on BOTH tunnel adapters (wintun + optional wintun2) - the
+        shutdown progress verifies the second pipe's routes are gone too."""
+        total = 0
+        for _adapter in ("wintun", "wintun2"):
+            ok, out = _ps(
+                f"Get-NetRoute -InterfaceAlias '{_adapter}' -ErrorAction SilentlyContinue | "
+                "Measure-Object | Select-Object -ExpandProperty Count")
+            if ok:
+                try:
+                    total += int(out.strip())
+                except Exception:
+                    pass
+        return total
 
     @staticmethod
     def _tun2socks_running():
@@ -5755,7 +6299,15 @@ def main():
                     help="Skip the SHA-256 verification of tun2socks.exe / "
                          "wintun.dll (only for binaries you rebuilt "
                          "yourself - NOT recommended)")
-    ap.add_argument("--vless-over-vpn", action="store_true")
+    ap.add_argument("--proxy-over-vpn", "--vless-over-vpn", action="store_true",
+                    dest="vless_over_vpn")
+    ap.add_argument("--proxy2-port", type=int, default=None, metavar="PORT",
+                    help="SOCKS5 port of a SECOND local proxy; hosts marked "
+                         "'proxy2' are routed through it")
+    ap.add_argument("--proxy2-server", nargs="+", default=[], metavar="HOST_OR_IP",
+                    help="The second proxy's own upstream server(s) (bypassed direct)")
+    ap.add_argument("--proxy2-bypass-ip", action="append", default=[], metavar="HOST_OR_IP",
+                    help="IP/hostname to route through the SECOND proxy (repeatable)")
     ap.add_argument("--vpn-interface", default=None)
     ap.add_argument("--endpoint-port", type=int, default=443)
     ap.add_argument("--dns4", default="8.8.8.8")
@@ -5785,6 +6337,9 @@ def main():
     # Accept URLs / host:port anywhere a host is expected - a route needs a
     # bare host or IP, so normalise once, up front (the [A] key does the same).
     args.bypass_ip = [h for h in (_host_from_url(x) for x in (args.bypass_ip or [])) if h]
+    args.proxy2_bypass_ip = [h for h in (_host_from_url(x)
+                                         for x in (args.proxy2_bypass_ip or [])) if h]
+    args.proxy2_server = [_host_from_url(s) or s for s in (args.proxy2_server or [])]
     args.server = [_host_from_url(s) or s for s in (args.server or [])]
 
     if not _admin():

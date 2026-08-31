@@ -2,7 +2,7 @@
 """
 tuntop/helper.py
 
-Windows-wide TUN routing for v2rayN + xjasonlyu/tun2socks.
+Windows-wide TUN routing for any local SOCKS5 proxy + xjasonlyu/tun2socks.
 
 Fixes:
   1. Do NOT pass tun2socks --interface by default. This avoids the
@@ -39,7 +39,7 @@ Usage (Administrator PowerShell/CMD):
   python tuntop/ui/dashboard.py --server YOUR_SERVER --port 10808 ^
        --tun2socks "C:\\tools\\tun2socks.exe"
 
-Your v2rayN SOCKS inbound must support UDP if you want UDP applications.
+Your proxy client's SOCKS5 inbound must support UDP if you want UDP applications.
 """
 
 import argparse
@@ -69,6 +69,17 @@ TUN6 = "fd00:dead:beef::1"
 DNS4 = "8.8.8.8"
 DNS6 = "2606:4700:4700::1111"
 
+# Second proxy pipe (optional, behind --proxy2-port).  A second TUN adapter +
+# tun2socks process against a second local SOCKS5 port; specific destinations
+# can then be routed through it while the PRIMARY pipe keeps owning the default
+# route.  CRITICAL: TUN2 must never receive a default route (0/0) - two
+# adapters fighting over 0/0 is exactly the routing-loop bug the teardown
+# guarantees exist to prevent.  TUN2 only ever receives specific-destination
+# routes (see the dashboard's proxy2 bypass targeting).
+TUN2 = "wintun2"
+TUN2_IP4 = "192.168.124.1"
+TUN2_IP6 = "fd00:dead:beef:1::1"
+
 # Active DNS servers resolved from the CLI --dns4/--dns6 flags at the top of
 # main().  _ensure_wintun_address() reads these so that re-adding the Wintun
 # address mid-run (e.g. after tun2socks recreates the adapter) keeps the
@@ -83,6 +94,56 @@ _ACTIVE_DOH_TEMPLATE = None
 
 added_routes = []
 geoip_added = []   # country-range bypass routes from --geoip (potentially thousands)
+
+# ── Live-reconfiguration channel (dashboard -> running helper) ──────────────
+# The dashboard owns the UI and this helper runs as its child process. For
+# settings that must take effect WITHOUT a tunnel restart (DNS for now), the
+# dashboard writes this tiny JSON file and the monitor loop (1 s tick) picks
+# the change up, rebinds the _ACTIVE_DNS* globals and re-applies the Wintun
+# config - so self-heal also keeps the NEW choice instead of reverting to the
+# launch-time --dns4/--dns6 values. Cheap: the loop only stats the file until
+# its mtime actually changes.
+CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            ".tuntop_control.json")
+_control_mtime = 0.0
+
+
+def poll_control_file():
+    """Apply dashboard-written live changes (currently: DNS4/DNS6). Returns
+    True when a change was applied. Never raises - a malformed/partial write
+    must not take the tunnel down."""
+    global _ACTIVE_DNS4, _ACTIVE_DNS6, _control_mtime
+    try:
+        mtime = os.path.getmtime(CONTROL_FILE)
+    except OSError:
+        return False
+    if mtime == _control_mtime:
+        return False
+    _control_mtime = mtime
+    try:
+        with open(CONTROL_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    changed = []
+    d4 = data.get("dns4")
+    d6 = data.get("dns6")
+    if d4 and d4 != _ACTIVE_DNS4:
+        _ACTIVE_DNS4 = str(d4)
+        changed.append(f"DNS4 -> {_ACTIVE_DNS4}")
+    if d6 and d6 != _ACTIVE_DNS6:
+        _ACTIVE_DNS6 = str(d6)
+        changed.append(f"DNS6 -> {_ACTIVE_DNS6}")
+    if not changed:
+        return False
+    print(f"[*] Live config change applied: {'; '.join(changed)}", flush=True)
+    try:
+        configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
+    except Exception as e:
+        print(f"[!] Live DNS re-apply failed: {e}", flush=True)
+    return True
 
 # When a connected Windows VPN injects its own default + /32 routes (often at a
 # very low metric), those /32s are MORE specific than Wintun's /1 split routes
@@ -99,6 +160,7 @@ vpn_override_iface = None     # connected VPN interface we shadowed (set in main
 phys_bypass_metric_saved = None  # physical (geo) InterfaceMetric to restore on exit
 phys_bypass_iface = None
 tun_proc = None
+tun2_proc = None   # second proxy pipe's tun2socks process (None = disabled)
 cleaned = False
 
 # Windows caps a whole CreateProcess command line at 32767 chars; the encoded
@@ -579,7 +641,12 @@ def preflight_cleanup():
     startup. Also drop the Wintun adapter itself so tun2socks recreates it
     fresh (a stale adapter can make tun2socks fail to bind)."""
     print("[*] Checking for leftover state from a previous run...")
+    # Both pipes: the primary 'wintun' and (when a previous run used
+    # --proxy2-port) the secondary 'wintun2'. Removing state for an adapter
+    # that doesn't exist is a harmless no-op.
     run_ps(f"Get-NetRoute -InterfaceAlias '{TUN}' -ErrorAction SilentlyContinue | "
+           "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
+    run_ps(f"Get-NetRoute -InterfaceAlias '{TUN2}' -ErrorAction SilentlyContinue | "
            "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
 
     _, out, _ = run_ps("Get-Process | Where-Object {$_.ProcessName -like 'tun2socks*'} | "
@@ -592,6 +659,7 @@ def preflight_cleanup():
         time.sleep(1)
 
     run_ps(f"Remove-NetAdapter -Name '{TUN}' -Force -Confirm:$false -ErrorAction SilentlyContinue")
+    run_ps(f"Remove-NetAdapter -Name '{TUN2}' -Force -Confirm:$false -ErrorAction SilentlyContinue")
     time.sleep(1)
 
 
@@ -705,9 +773,10 @@ def test_local_socks(port):
         s.close()
 
 
-def wait_for_tun(timeout=15):
+def wait_for_tun(timeout=15, name=None):
+    name = name or TUN
     ps = (
-        "Get-NetAdapter -Name 'wintun' -ErrorAction SilentlyContinue | "
+        f"Get-NetAdapter -Name '{ps_quote(name)}' -ErrorAction SilentlyContinue | "
         "Select-Object -First 1 Name,ifIndex | ConvertTo-Json -Compress"
     )
     for _ in range(timeout):
@@ -734,27 +803,37 @@ def _doh_template_for(ip, override=None):
     return _DOH_TEMPLATES.get(ip)
 
 
-def _set_wintun_addresses_plain(dns4, dns6):
+def _set_wintun_addresses_plain(dns4, dns6, device=None, ip4=None, ip6=None,
+                                 set_dns=True):
     """Assign the Wintun IPv4/IPv6 addresses and set the DNS servers the plain
     (UDP/53) way. Shared by configure_tun() and the DoH path (which layers DoH
-    on top of the addresses)."""
+    on top of the addresses).
+
+    `device`/`ip4`/`ip6` default to the PRIMARY pipe's adapter; the second
+    proxy pipe (TUN2) passes its own. `set_dns=False` assigns addresses only -
+    a secondary pipe must never steal DNS resolution from the primary."""
+    device = device or TUN
+    ip4 = ip4 or TUN4
+    ip6 = ip6 or TUN6
     run([
         "netsh", "interface", "ipv4", "set", "address",
-        f"name={TUN}", "source=static", f"addr={TUN4}", f"mask={TUN4_MASK}"
+        f"name={device}", "source=static", f"addr={ip4}", f"mask={TUN4_MASK}"
     ], check=True)
-    run([
-        "netsh", "interface", "ipv4", "set", "dnsservers",
-        f"name={TUN}", "source=static", f"address={dns4}",
-        "register=none", "validate=no"
-    ])
+    if set_dns:
+        run([
+            "netsh", "interface", "ipv4", "set", "dnsservers",
+            f"name={device}", "source=static", f"address={dns4}",
+            "register=none", "validate=no"
+        ])
     run([
         "netsh", "interface", "ipv6", "add", "address",
-        TUN, f"{TUN6}/64"
+        device, f"{ip6}/64"
     ])
-    run([
-        "netsh", "interface", "ipv6", "add", "dnsserver",
-        TUN, dns6, "index=1"
-    ])
+    if set_dns:
+        run([
+            "netsh", "interface", "ipv6", "add", "dnsserver",
+            device, dns6, "index=1"
+        ])
 
 
 def _enable_doh_on_wintun(ip, template):
@@ -1632,6 +1711,14 @@ def cleanup():
         except subprocess.TimeoutExpired:
             tun_proc.kill()
 
+    if tun2_proc is not None and tun2_proc.poll() is None:
+        print("[*] Stopping tun2socks (second proxy pipe)...")
+        tun2_proc.terminate()
+        try:
+            tun2_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            tun2_proc.kill()
+
     print("[*] Done.")
 
 
@@ -1673,35 +1760,61 @@ _VERIFY_URLS = [
 ]
 
 
+_VERIFY_PRINT_LOCK = threading.Lock()
+
+
+def _verify_worker(url, timeout, attempts, tag, shared):
+    """Retry ONE verification URL until it succeeds or `attempts` run out.
+    Runs on its own thread (all URLs are probed at the SAME time), so a dead
+    endpoint can never delay the ones that work. First success anywhere wins."""
+    for i in range(1, attempts + 1):
+        ok, msg = _probe_tunnel_once(url, timeout=timeout)
+        if ok:
+            shared["ok"] = True
+            shared["msg"] = msg
+            return
+        with _VERIFY_PRINT_LOCK:
+            if shared["ok"]:
+                return
+            shared["last_err"] = msg.split(": ", 1)[-1] if ": " in msg else msg
+            print(f"    [{i}/{attempts}]{tag} {url}: {msg}", flush=True)
+        time.sleep(2)
+
+
 def wait_for_tunnel_stable(timeout=5):
     """Block until DNS + HTTP verification through the TUN succeeds.
 
-    Tries each of _VERIFY_URLS in order.  For each URL, up to 5 probes
-    with 2-second gaps (10 s max per URL).  If all URLs fail, auto-escalates
-    to DoH DNS and retries.  Total worst-case: ~60 s (down from ~160 s).
+    ALL _VERIFY_URLS are probed CONCURRENTLY (one worker thread each), so a
+    blocked/unreachable endpoint no longer delays the working ones - the first
+    success wins, in seconds, instead of waiting out 5 failed attempts per URL
+    one by one. Each URL still retries up to 5 times with 2-second gaps.
+    If every URL fails, auto-escalates to DoH DNS and retries the same way.
 
     Returns True if the tunnel is verified, False if all attempts fail."""
     global _ACTIVE_DNS_MODE
+    shared = {"ok": False, "msg": "", "last_err": ""}
 
-    for phase, url in enumerate(["plain DNS"] + _VERIFY_URLS):
-        is_dns_phase = (phase == 0)
-        if is_dns_phase:
-            continue  # DNS mode doesn't need its own loop; each URL tests DNS+HTTP
+    def _run_round(tag=""):
+        shared["ok"] = False
+        shared["msg"] = ""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(_VERIFY_URLS)) as ex:
+            futs = [ex.submit(_verify_worker, url, timeout, 5, tag, shared)
+                    for url in _VERIFY_URLS]
+            # Return as soon as ANY endpoint verifies the tunnel.
+            for fut in concurrent.futures.as_completed(futs):
+                if shared["ok"]:
+                    for f in futs:
+                        f.cancel()
+                    with _VERIFY_PRINT_LOCK:
+                        print(f"[+] Tunnel stable: {shared['msg']}", flush=True)
+                    return True
+        return False
 
-    last_err = ""
-    for url in _VERIFY_URLS:
-        for i in range(1, 6):  # 5 attempts per URL
-            ok, msg = _probe_tunnel_once(url, timeout=timeout)
-            if ok:
-                print(f"[+] Tunnel stable: {msg}", flush=True)
-                return True
-            last_err = msg.split(": ", 1)[-1] if ": " in msg else msg
-            print(f"    [{i}/5] {url}: {msg}", flush=True)
-            time.sleep(2)
-        # This URL failed all 5 attempts; try the next one.
-        print(f"    [*] {url} unreachable, trying next endpoint...", flush=True)
+    if _run_round():
+        return True
 
-    print(f"[!] All verification endpoints failed (last: {last_err}). "
+    print(f"[!] All verification endpoints failed (last: "
+          f"{shared['last_err'] or 'no probe answered'}). "
           f"Routes are installed but egress through the TUN is not working yet.",
           flush=True)
 
@@ -1714,15 +1827,8 @@ def wait_for_tunnel_stable(timeout=5):
             configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
         except Exception as e:
             print(f"[!] DoH switch failed: {e}", flush=True)
-        for url in _VERIFY_URLS:
-            for i in range(1, 6):
-                ok, msg = _probe_tunnel_once(url, timeout=timeout)
-                if ok:
-                    print(f"[+] Tunnel stable (via DoH): {msg}", flush=True)
-                    return True
-                last_err = msg.split(": ", 1)[-1] if ": " in msg else msg
-                print(f"    [{i}/5] (DoH) {url}: {msg}", flush=True)
-                time.sleep(2)
+        if _run_round(" (DoH)"):
+            return True
     return False
 
 
@@ -1764,22 +1870,78 @@ def self_heal_tunnel(dns4, dns6):
         print(f"[!] Self-heal failed: {e}")
 
 
+def start_tun2socks_pipe(device_name, ip4, ip6, port, tun2socks_path,
+                         dns4=None, dns6=None):
+    """Bring up one TUN adapter + tun2socks process against one local SOCKS5
+    port. Returns the Popen handle. Raises SystemExit on failure, same as the
+    original inline code in main().
+
+    Extracted verbatim from main() so the second proxy pipe (TUN2, behind
+    --proxy2-port) can reuse the exact same bring-up sequence. The PRIMARY
+    pipe (device_name == TUN) additionally gets the full DNS delivery
+    configuration (plain/DoH/NetBIOS via configure_tun); a secondary pipe
+    only gets its interface addresses - DNS must stay on the primary
+    adapter, or the two would fight over resolver settings."""
+    print(f"[*] Checking local SOCKS5 proxy at 127.0.0.1:{port}...")
+    if not test_local_socks(port):
+        sys.exit(
+            f"[!] 127.0.0.1:{port} is not accepting TCP connections. "
+            "Start your proxy client and verify its SOCKS5 inbound is "
+            "listening on this port."
+        )
+
+    # Critical: no --interface.
+    # This avoids the Windows UDP bind path that produced WSAEINVAL.
+    cmd = [
+        tun2socks_path,
+        "--device", device_name,
+        "--proxy", f"socks5://127.0.0.1:{port}",
+    ]
+    print("[*] Starting tun2socks without --interface:")
+    print("    " + " ".join(cmd))
+
+    try:
+        proc = subprocess.Popen(cmd)
+    except FileNotFoundError:
+        sys.exit(f"[!] tun2socks not found: {tun2socks_path}")
+
+    time.sleep(1)
+    if proc.poll() is not None:
+        sys.exit(f"[!] tun2socks exited immediately: {proc.returncode}")
+
+    if not wait_for_tun(name=device_name):
+        sys.exit(f"[!] Wintun adapter '{device_name}' did not appear.")
+
+    if device_name == TUN:
+        print(f"[*] Configuring Wintun: DNS4={dns4}  DNS6={dns6}")
+        configure_tun(dns4, dns6)
+    else:
+        # Secondary pipe: addresses only, never DNS (the primary owns it).
+        _set_wintun_addresses_plain(dns4, dns6, device=device_name,
+                                    ip4=ip4, ip6=ip6, set_dns=False)
+    return proc
+
+
 def main():
-    global tun_proc
+    global tun_proc, tun2_proc
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--server", nargs="+", required=True,
                     help="VLESS server hostname or IP (repeatable: --server a b)")
     ap.add_argument("--port", type=int, default=10808,
-                    help="v2rayN local SOCKS5 port")
+                    help="Local SOCKS5 port of your proxy client (v2rayN, Xray, "
+                         "sing-box, Clash, etc.)")
     ap.add_argument("--tun2socks", default="tun2socks.exe",
                     help="Path to tun2socks.exe")
     ap.add_argument("--vpn-server", action="append", default=[], metavar="HOST_OR_IP",
                     help="Windows VPN server to bypass (repeatable; needed for some third-party VPN clients)")
     ap.add_argument("--no-vpn-bypass", action="store_true",
                     help="Do not add bypass routes for connected Windows VPN endpoints")
-    ap.add_argument("--vless-over-vpn", action="store_true",
-                    help="Send the VLESS server connection through the active Windows VPN (its server remains bypassed)")
+    ap.add_argument("--proxy-over-vpn", "--vless-over-vpn", action="store_true",
+                    dest="vless_over_vpn",
+                    help="Send the proxy's own outbound connection through the "
+                         "active Windows VPN (its server remains bypassed). "
+                         "--vless-over-vpn is accepted as a legacy alias.")
     ap.add_argument("--vpn-interface", default=None, metavar="ALIAS",
                     help="Manually specify the Windows VPN adapter's InterfaceAlias for "
                          "--vless-over-vpn, if auto-detection via Get-VpnConnection fails")
@@ -1801,8 +1963,23 @@ def main():
                          "Auto-selected from the DNS IP when omitted.")
     ap.add_argument("--bypass-ip", action="append", default=[], metavar="HOST_OR_IP",
                     help="Additional IP(s) or hostname(s) to bypass the TUN (repeatable)")
+    ap.add_argument("--proxy2-port", type=int, default=None, metavar="PORT",
+                    help="SOCKS5 port of a SECOND local proxy (e.g. 10809). Presence "
+                         "of this flag enables the second pipe: hosts marked for the "
+                         "second hop (--proxy2-bypass-ip, or dashboard [A] -> proxy2) "
+                         "are routed through it while everything else keeps using the "
+                         "primary tunnel. Omit to disable entirely.")
+    ap.add_argument("--proxy2-server", nargs="+", default=[], metavar="HOST_OR_IP",
+                    help="The second proxy's own upstream server IP(s)/hostname(s) - "
+                         "given direct (physical-NIC) bypass routes so its transport "
+                         "does not loop back into either TUN adapter")
+    ap.add_argument("--proxy2-bypass-ip", action="append", default=[], metavar="HOST_OR_IP",
+                    help="IP(s) or hostname(s) to route through the SECOND proxy "
+                         "(repeatable; requires --proxy2-port)")
     ap.add_argument("--geoip", default=None, metavar="PATH",
-                    help="Path to v2rayN geoip file (.dat OR .json; format auto-detected); "
+                    help="Path to an Xray-format geoip file (.dat OR .json; format "
+                         "auto-detected - the same format is shared by v2rayN, "
+                         "sing-box and Clash); "
                          "install bypass routes for every CIDR of --geoip-code "
                          "(e.g. cn = bypass mainland traffic through the TUN)")
     ap.add_argument("--geoip-code", default="cn", metavar="CC",
@@ -1947,37 +2124,8 @@ def main():
         vpn_v6.extend(x for x in ep6 if x not in vpn_v6)
         print(f"    {name}: {server} -> {', '.join(ep4 + ep6)}")
 
-    print(f"[*] Checking v2rayN SOCKS5 at 127.0.0.1:{args.port}...")
-    if not test_local_socks(args.port):
-        sys.exit(
-            f"[!] 127.0.0.1:{args.port} is not accepting TCP connections. "
-            "Start v2rayN and verify the SOCKS inbound."
-        )
-
-    # Critical: no --interface.
-    # This avoids the Windows UDP bind path that produced WSAEINVAL.
-    cmd = [
-        args.tun2socks,
-        "--device", TUN,
-        "--proxy", f"socks5://127.0.0.1:{args.port}",
-    ]
-    print("[*] Starting tun2socks without --interface:")
-    print("    " + " ".join(cmd))
-
-    try:
-        tun_proc = subprocess.Popen(cmd)
-    except FileNotFoundError:
-        sys.exit(f"[!] tun2socks not found: {args.tun2socks}")
-
-    time.sleep(1)
-    if tun_proc.poll() is not None:
-        sys.exit(f"[!] tun2socks exited immediately: {tun_proc.returncode}")
-
-    if not wait_for_tun():
-        sys.exit("[!] Wintun adapter did not appear.")
-
-    print(f"[*] Configuring Wintun: DNS4={args.dns4}  DNS6={args.dns6}")
-    configure_tun(args.dns4, args.dns6)
+    tun_proc = start_tun2socks_pipe(TUN, TUN4, TUN6, args.port,
+                                    args.tun2socks, args.dns4, args.dns6)
 
     # ── Install bypass routes NOW (before the tun2socks IPv6 restart) ──
     # Resolving the egress and adding the /32 (and /128) bypass routes here
@@ -1985,8 +2133,8 @@ def main():
     # only after the restart. They use the physical/VPN gateway and do not
     # depend on tun2socks, so doing them early is safe and removes the wait.
     # Install the bypass routes BEFORE the default TUN route.
-    # These are more specific than 0/0, so v2rayN's connection to the
-    # VLESS endpoint remains on the physical network instead of entering
+    # These are more specific than 0/0, so your proxy's own outbound
+    # connection remains on the physical network instead of entering
     # tun2socks and recursively returning to 127.0.0.1:10808.
     print("[*] Installing VLESS IPv4 bypass routes...")
     # NOTE: a failed bypass route for ONE server must NOT abort the whole
@@ -2083,6 +2231,10 @@ def main():
         except Exception:
             tun_proc.kill()
     time.sleep(1)
+    # Rebuild the primary pipe's command line (start_tun2socks_pipe owns the
+    # original build; the restart must be byte-identical to what it launched).
+    cmd = [args.tun2socks, "--device", TUN,
+           "--proxy", f"socks5://127.0.0.1:{args.port}"]
     tun_proc = subprocess.Popen(cmd)
     time.sleep(1)
     if tun_proc.poll() is not None:
@@ -2090,6 +2242,92 @@ def main():
     if not wait_for_tun():
         sys.exit("[!] Wintun adapter did not reappear after restart.")
     configure_tun(args.dns4, args.dns6)
+
+    # ── Second proxy pipe (optional, --proxy2-port) ──────────────────────────
+    # A second TUN adapter + tun2socks against a second local SOCKS5 port.
+    # The PRIMARY pipe keeps owning the default route; TUN2 NEVER gets one -
+    # it only ever receives specific-destination /32+/128 host routes (the
+    # ones below, plus live additions from the dashboard's proxy2 targeting).
+    # Nothing in this block runs unless --proxy2-port was given.
+    if args.proxy2_port is not None:
+        if args.proxy2_port == args.port:
+            sys.exit(f"[!] --proxy2-port {args.proxy2_port} equals the primary "
+                     "--port; a second pipe to the same proxy is pointless and "
+                     "only adds a second adapter. Choose a different port.")
+        if not args.proxy2_server:
+            print("[!] --proxy2-port given without --proxy2-server: the second "
+                  "proxy's own upstream connection has NO direct bypass route "
+                  "and may loop into the TUN. Pass its server via "
+                  "--proxy2-server.")
+        print(f"[*] Starting second proxy pipe ({TUN2}) for "
+              f"127.0.0.1:{args.proxy2_port}...")
+        tun2_proc = start_tun2socks_pipe(TUN2, TUN2_IP4, TUN2_IP6,
+                                         args.proxy2_port, args.tun2socks)
+
+        # The second proxy's own upstream server(s) get physical-NIC bypass
+        # routes - same reasoning as the primary --server bypass above: without
+        # them the proxy2 transport is captured by the TUN default route and
+        # loops back into 127.0.0.1.
+        p2_v4, p2_v6 = [], []
+        for entry in (args.proxy2_server or []):
+            ep4, ep6 = resolve_all_safe(entry, label=f"proxy2-server {entry}")
+            if ep4 is None and ep6 is None:
+                continue
+            p2_v4.extend(x for x in (ep4 or []) if x not in p2_v4)
+            p2_v6.extend(x for x in (ep6 or []) if x not in p2_v6)
+            if ep4 or ep6:
+                print(f"    [proxy2-server] {entry} -> "
+                      f"{', '.join((ep4 or []) + (ep6 or []))}")
+        for ip in p2_v4:
+            eg = (get_egress_for(ip, exclude_vpn=not args.vless_over_vpn)
+                  or (vless_iface, vless_gateway))
+            print(f"    proxy2 server {ip} -> via {eg[0]} ({eg[1]})")
+            if not add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
+                print(f"[!] Could not install proxy2-server bypass route for "
+                      f"{ip}; continuing.")
+        d6 = get_ipv6_default()
+        for ip in p2_v6:
+            if d6:
+                add_v6(f"{ip}/128", d6["InterfaceAlias"], d6["NextHop"], 1)
+            else:
+                print(f"[!] No native IPv6 gateway; proxy2-server bypass for "
+                      f"{ip} not installed.")
+
+        # Restart the second pipe so its tun2socks picks up the (now present)
+        # wintun2 IPv6 address - same reason as the primary restart above.
+        if tun2_proc is not None and tun2_proc.poll() is None:
+            tun2_proc.terminate()
+            try:
+                tun2_proc.wait(timeout=5)
+            except Exception:
+                tun2_proc.kill()
+        time.sleep(1)
+        tun2_proc = subprocess.Popen([
+            args.tun2socks, "--device", TUN2,
+            "--proxy", f"socks5://127.0.0.1:{args.proxy2_port}",
+        ])
+        time.sleep(1)
+        if tun2_proc.poll() is not None:
+            sys.exit(f"[!] tun2socks (proxy2) exited after restart: "
+                     f"{tun2_proc.returncode}")
+        if not wait_for_tun(name=TUN2):
+            sys.exit(f"[!] Wintun adapter '{TUN2}' did not reappear after "
+                     "restart.")
+        _set_wintun_addresses_plain(None, None, device=TUN2, ip4=TUN2_IP4,
+                                    ip6=TUN2_IP6, set_dns=False)
+
+        # CLI-provided second-hop hosts get their TUN2 routes right away, so
+        # the feature works headless; the dashboard can add more live.
+        for entry in (args.proxy2_bypass_ip or []):
+            ep4, ep6 = resolve_all_safe(entry, label=f"proxy2-bypass {entry}")
+            if ep4 is None and ep6 is None:
+                continue
+            print(f"    [proxy2-bypass] {entry} -> "
+                  f"{', '.join((ep4 or []) + (ep6 or []))} via {TUN2}")
+            for ip in (ep4 or []):
+                add_v4(f"{ip}/32", TUN2, TUN2_IP4, metric=1)
+            for ip in (ep6 or []):
+                add_v6(f"{ip}/128", TUN2, TUN2_IP6, metric=1)
 
     # (Bypass routes are now installed right after the first Wintun config,
     #  before the tun2socks IPv6 restart, so they take effect instantly.)
@@ -2269,11 +2507,11 @@ def main():
     print(flush=True)
     print("[+] TUNNEL ACTIVE", flush=True)
     if ipv4_ok:
-        print("[+] IPv4: system -> Wintun -> tun2socks -> v2rayN (VPN-proof split default)")
+        print("[+] IPv4: system -> Wintun -> tun2socks -> local proxy (VPN-proof split default)")
     else:
         print("[#] IPv4: default/split routes did NOT all install - IPv4 may be partial or dead")
     if ipv6_ok:
-        print("[+] IPv6: system -> Wintun -> tun2socks -> v2rayN (VPN-proof split default)")
+        print("[+] IPv6: system -> Wintun -> tun2socks -> local proxy (VPN-proof split default)")
     else:
         print("[#] IPv6: split-default routes did NOT install - IPv6 is NOT tunneled (expected if the VLESS server has no IPv6 egress)")
     print(f"[+] VLESS endpoint(s): {'Windows VPN transport' if args.vless_over_vpn else 'physical adapter bypass'}")
@@ -2301,6 +2539,12 @@ def main():
         while tun_proc.poll() is None:
             time.sleep(1)
             now = time.time()
+            # Live-reconfig channel: pick up dashboard-written changes (DNS
+            # etc.) without a tunnel restart. Cheap mtime check inside.
+            try:
+                poll_control_file()
+            except Exception:
+                pass
             if args.vless_over_vpn and vpn_conn_name_for_check and int(now) % 10 == 0:
                 status = get_vpn_connection_names_status().get(vpn_conn_name_for_check)
                 if status != last_vpn_status:
@@ -2327,7 +2571,10 @@ def main():
                             print("[*] Monitor: repeated DNS/egress failures; "
                                   "escalating wintun DNS to DoH.")
                             _ACTIVE_DNS_MODE = "doh"
-                        self_heal_tunnel(args.dns4, args.dns6)
+                        # Self-heal with the LIVE DNS values, not the
+                        # launch-time ones - otherwise a DNS change applied
+                        # via the dashboard's [N] would be reverted here.
+                        self_heal_tunnel(_ACTIVE_DNS4, _ACTIVE_DNS6)
                         fails = 0
     except KeyboardInterrupt:
         pass

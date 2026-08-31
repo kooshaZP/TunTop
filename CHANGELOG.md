@@ -2,6 +2,87 @@
 
 All notable changes to TunTop are documented here.
 
+## [Unreleased]
+
+### Added
+- **Parallel tunnel verification**: `wait_for_tunnel_stable()` now probes ALL
+  verification endpoints (gstatic, cloudflare, ipify) CONCURRENTLY instead of
+  one by one - the first success wins, so a blocked endpoint no longer adds
+  its full 5×(timeout+2 s) retry budget before the working one is even tried.
+  The DoH escalation round uses the same parallel scheme.
+- **`Start_TunTop.bat` launcher** - double-click entry point that fixes the
+  classic "downloaded from GitHub, PowerShell won't run it" errors (strips
+  Mark-of-the-Web via `Unblock-File`, relaunches under
+  `-ExecutionPolicy Bypass`) and styles the console (title, UTF-8, 120x36,
+  Consolas preselected so box glyphs render). `Run_Helper.ps1` also unblocks
+  itself and self-relaunches under Bypass when the machine policy is
+  Restricted.
+- **"vpn" bypass target** - `[A]` now asks "direct or proxy2 or vpn"; entries
+  tagged `vpn` are routed out through a CONNECTED Windows VPN (separate
+  resolver store, [X] picker tags, profile key `vpn_bypass_ip`).
+- **GeoIP egress target** - `[F]` now asks the same "direct / proxy2 / vpn"
+  question for the geoip country ranges, and the choice applies LIVE while the
+  tunnel runs: changing it removes the old country routes and re-points them
+  at the new egress (physical adapter / wintun2 / Windows VPN) without a
+  restart. Persisted as `geoip_target` in profiles.
+- **proxy2 at runtime (`[Z]`)** - the second proxy can now be added, switched
+  or removed while the app is running (transparent background tunnel restart),
+  not only at launch.
+- **Live config channel (helper control file)** - the dashboard writes
+  `tuntop/tunnel/.tuntop_control.json`; the helper's monitor loop picks up
+  changes (currently DNS) within ~1 s and re-applies the Wintun config, so
+  self-heal keeps the new choice instead of reverting to launch values.
+- **Adaptive layout: units shrink FIRST, help removed LAST** - on short
+  windows (16:9 screens) health-check rows shrink first (12 -> 5), then the
+  throughput graph (5 -> 2 rows per direction), then the help footer halves
+  (4 -> 2 rows); removing the footer entirely is now the last resort.
+
+### Changed
+- **DNS changes no longer restart the tunnel (`[N]`)** - applied live on the
+  Wintun adapter + helper rebind; applies to new lookups immediately.
+- **Server changes no longer restart the tunnel (`[U]`)** - old VLESS
+  endpoints' host routes are removed and the new servers' routes installed
+  live; the health check and display update in place.
+- Endpoint-port changes (`[E]`) were already live; behaviour unchanged.
+
+### Fixed
+- **Graph/log flicker at certain window sizes** - the adaptive shrink budget
+  was recomputed from the previous frame's measured panel height every frame,
+  and the panels' height depends on the budget: shrink -> smaller measurement
+  -> un-shrink -> bigger measurement -> shrink ... oscillated at boundary
+  sizes. The budget is now only recomputed when the window size (or a panel
+  toggle) actually changes, and the height measurement is only taken from a
+  frame with no shrink caps applied. Verified stable across 360 size/visibility
+  combinations.
+- Test discovery for `tests/routing`, `tests/recovery`, `tests/network`
+  (missing `__init__.py`) - `python -m unittest discover -s tests` now runs
+  the whole suite cleanly.
+- **Generic SOCKS5 backend naming** (Task 1): TunTop now documents that ANY
+  local SOCKS5 proxy works (v2rayN, Xray, sing-box, Clash Meta, ...) - no
+  protocol code ever depended on v2rayN. Docs/help-text only; zero behavior
+  change. `--proxy-over-vpn` added as the documented alias for the legacy
+  `--vless-over-vpn` flag (both work; the profile schema key is unchanged).
+- **Second proxy hop (proxy2, Task 2)**: route specific hosts through a
+  SECOND local SOCKS5 proxy while the primary tunnel keeps the default route.
+  - `start_tun2socks_pipe()` extracted from `helper.main()` so one TUN +
+    tun2socks bring-up sequence serves both pipes (pure refactor first).
+  - `--proxy2-port` turns the feature on; `--proxy2-server` gives the second
+    proxy's own upstream direct bypass routes (no TUN loop); `--proxy2-bypass-ip`
+    routes hosts through the second hop from the CLI.
+  - `Profile.proxy2_port` / `proxy2_server` / `proxy2_bypass_ip` in the
+    profile schema - old profiles without these keys load unchanged.
+  - Dashboard `[A]` add-bypass now asks "direct or proxy2?" (default direct:
+    pressing Enter keeps existing muscle memory); `[X]` picker tags each
+    entry with its target; status bar shows `PROXY2 up/down` only when the
+    second pipe is configured.
+  - Crash recovery covers the second adapter: startup recovery and the
+    shutdown sweep clean `wintun2` routes/adapter and orphaned tun2socks
+    from a hard-killed proxy2 session.
+  - The second pipe NEVER receives a default route (0/0) - only specific
+    /32+/128 destinations - so two adapters can never fight over the
+    default route. 17 new tests cover schema round-trips, route targeting,
+    rollback, bookkeeping and wintun2 crash recovery.
+
 ## [1.0.1] - 2026-08-30
 
 ### Added

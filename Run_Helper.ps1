@@ -1,5 +1,18 @@
 ﻿$ErrorActionPreference = 'Stop'
 
+# ── "Downloaded from GitHub and it won't run?" fix ──────────────────────────
+# Files downloaded from GitHub (or extracted from a ZIP) carry Windows'
+# Mark-of-the-Web; with a Restricted execution policy PowerShell then refuses
+# with "running scripts is disabled on this system". Strip the mark, and if
+# the effective machine policy is still Restricted, relaunch THIS script under
+# -ExecutionPolicy Bypass (run-scoped only - nothing is changed system-wide).
+try { Unblock-File -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue } catch { }
+if ((Get-ExecutionPolicy) -eq 'Restricted') {
+    Write-Host '[*] Execution policy is Restricted - relaunching with -ExecutionPolicy Bypass ...' -ForegroundColor Yellow
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @args
+    exit $LASTEXITCODE
+}
+
 $ScriptDir  = $PSScriptRoot
 $Helper     = Join-Path $ScriptDir 'tuntop/tunnel/helper.py'
 $Tui        = Join-Path $ScriptDir 'tuntop/ui/dashboard.py'

@@ -37,8 +37,13 @@ def snapshot_from_args(ns) -> dict:
         "dns4": getattr(ns, "dns4", "8.8.8.8"),
         "endpoint_port": getattr(ns, "endpoint_port", 443),
         "bypass_ip": list(getattr(ns, "bypass_ip", []) or []),
+        "vpn_bypass_ip": list(getattr(ns, "vpn_bypass_ip", []) or []),
+        "proxy2_bypass_ip": list(getattr(ns, "proxy2_bypass_ip", []) or []),
+        "proxy2_port": getattr(ns, "proxy2_port", None),
+        "proxy2_server": list(getattr(ns, "proxy2_server", []) or []),
         "geoip": getattr(ns, "geoip", None),
         "geoip_code": getattr(ns, "geoip_code", "cn"),
+        "geoip_target": getattr(ns, "geoip_target", None),
         "vless_over_vpn": bool(getattr(ns, "vless_over_vpn", False)),
         "no_vpn_bypass": bool(getattr(ns, "no_vpn_bypass", False)),
         "vpn_interface": getattr(ns, "vpn_interface", None),
@@ -85,7 +90,7 @@ def apply_to_args(ns, snap: dict, normalise_host=None) -> list:
     route. Returns the list of scalar attributes applied (for logging)."""
     applied = []
     for attr in ("port", "dns4", "endpoint_port", "geoip",
-                 "geoip_code", "vpn_interface"):
+                 "geoip_code", "geoip_target", "vpn_interface"):
         if attr in snap:
             setattr(ns, attr, snap[attr])
             applied.append(attr)
@@ -94,8 +99,22 @@ def apply_to_args(ns, snap: dict, normalise_host=None) -> list:
         ns.bypass_ip = [h for h in (normalise_host(x)
                                     for x in (snap.get("bypass_ip") or []))
                         if h]
+        ns.proxy2_bypass_ip = [h for h in (normalise_host(x)
+                                           for x in (snap.get("proxy2_bypass_ip")
+                                                     or []))
+                               if h]
+        ns.vpn_bypass_ip = [h for h in (normalise_host(x)
+                                        for x in (snap.get("vpn_bypass_ip")
+                                                  or []))
+                            if h]
     else:
         ns.bypass_ip = list(snap.get("bypass_ip") or [])
+        ns.proxy2_bypass_ip = list(snap.get("proxy2_bypass_ip") or [])
+        ns.vpn_bypass_ip = list(snap.get("vpn_bypass_ip") or [])
+    if "proxy2_port" in snap:
+        ns.proxy2_port = snap["proxy2_port"]
+        applied.append("proxy2_port")
+    ns.proxy2_server = list(snap.get("proxy2_server") or [])
     ns.vless_over_vpn = bool(snap.get("vless_over_vpn"))
     ns.no_vpn_bypass = bool(snap.get("no_vpn_bypass"))
     return applied

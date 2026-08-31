@@ -107,16 +107,20 @@ def _count_processes_like(name: str) -> int:
 
 
 def _wintun_route_count() -> int:
-    """Routes currently installed on the wintun adapter (0 = clean)."""
-    ok, out = routing._ps(
-        "Get-NetRoute -InterfaceAlias 'wintun' -ErrorAction SilentlyContinue | "
-        "Measure-Object | Select-Object -ExpandProperty Count")
-    if ok:
-        try:
-            return int(out.strip())
-        except Exception:
-            return 0
-    return 0
+    """Routes currently installed on the tunnel adapters (0 = clean). Counts
+    BOTH the primary 'wintun' and the optional second pipe's 'wintun2' (left
+    behind when a crash hit while --proxy2-port was active)."""
+    total = 0
+    for adapter in ("wintun", "wintun2"):
+        ok, out = routing._ps(
+            f"Get-NetRoute -InterfaceAlias '{adapter}' -ErrorAction SilentlyContinue | "
+            "Measure-Object | Select-Object -ExpandProperty Count")
+        if ok:
+            try:
+                total += int(out.strip())
+            except Exception:
+                pass
+    return total
 
 
 def default_probes() -> Probes:

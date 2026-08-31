@@ -1,7 +1,8 @@
-﻿"""TunTop - route all of Windows through a VLESS proxy, beautifully.
+﻿"""TunTop - route all of Windows through any local SOCKS5 proxy, beautifully.
 
-One-line pitch: TunTop drives every byte your PC sends through a v2rayN
-VLESS proxy over a Wintun TUN adapter, and gives you a live btop-style
+One-line pitch: TunTop drives every byte your PC sends through a local
+SOCKS5 proxy (v2rayN, Xray, sing-box, Clash, ...) over a Wintun TUN
+adapter, and gives you a live btop-style
 terminal dashboard - throughput graphs, health checks, instant bypasses,
 geo-splitting, profiles and leak tests - with zero pip dependencies.
 
