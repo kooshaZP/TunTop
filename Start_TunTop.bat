@@ -40,9 +40,8 @@ reg add "HKCU\Console\TunTop" /v FontWeight /t REG_DWORD /d 400      /f >nul 2>&
 REM A console already open (this one) picks the font up on its next relaunch;
 REM for the current window the PowerShell layer below sizes it explicitly.
 
-REM ── Run the PowerShell launcher with the download-safe settings ─────────────
-%PS% -NoProfile -ExecutionPolicy Bypass -Command ^
-  "& { Get-ChildItem -LiteralPath '%~dp0' -Recurse -Include *.ps1,*.py,*.bat,*.psm1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue; & '%~dp0Run_Helper.ps1' }"
+REM -- Run the PowerShell launcher with the download-safe settings ----------
+%PS% -NoProfile -ExecutionPolicy Bypass -Command "& { Get-ChildItem -LiteralPath '%~dp0' -Recurse -Include *.ps1,*.py,*.bat,*.psm1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue; & '%~dp0Run_Helper.ps1' }"
 
 set "RC=%ERRORLEVEL%"
 
