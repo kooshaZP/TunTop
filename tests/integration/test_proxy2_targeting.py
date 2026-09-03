@@ -164,13 +164,17 @@ class TestWintun2CrashRecovery(unittest.TestCase):
             self.assertEqual(_wintun_route_count(), 5)
 
     def test_dashboard_teardown_also_covers_wintun2(self):
+        # The dashboard no longer carries its own teardown copy - it binds
+        # tuntop.network.routing's _teardown_wintun (asserted by
+        # tests/routing/test_routing_quoting.py), so the Windows edge to
+        # patch is routing._ps, exactly as in the test above.
         seen = []
 
         def fake_ps(script, *a, **k):
             seen.append(script)
             return True, ""
 
-        with mock.patch.object(dash, "_ps", fake_ps):
+        with mock.patch.object(routing, "_ps", fake_ps):
             dash._teardown_wintun()
         joined = " ".join(seen)
         self.assertIn("'wintun'", joined)

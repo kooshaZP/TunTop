@@ -7,6 +7,8 @@ import os
 import subprocess
 import tempfile
 
+from tuntop.psshell import ps_quote
+
 # Windows caps a whole CreateProcess command line at 32767 characters.
 # -EncodedCommand puts the ENTIRE script on the command line (base64 of
 # UTF-16LE ≈ 2.7x the script size), so any batched bulk operation - e.g.
@@ -180,7 +182,7 @@ def _get_egress_for(ip):
     which only knows the system default route. Prefers the most-specific
     non-wintun route, then falls back to the real default route."""
     ps = rf"""
-$r = Find-NetRoute -RemoteIPAddress '{ip}' -ErrorAction SilentlyContinue
+$r = Find-NetRoute -RemoteIPAddress '{ps_quote(ip)}' -ErrorAction SilentlyContinue
 if ($r) {{
     $r = @($r) | Where-Object {{ $_.InterfaceAlias -ne 'wintun' }} |
         Sort-Object {{ ($_.DestinationPrefix -split '/')[1] -as [int] }} -Descending, RouteMetric, InterfaceMetric |
@@ -212,7 +214,7 @@ def _get_vpn_ipv4_default(vpn_interface=None):
     """Connected Windows VPN's IPv4 default route (for --proxy-over-vpn)."""
     if vpn_interface:
         ps = rf"""
-$r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias '{vpn_interface}' -ErrorAction SilentlyContinue |
+$r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias '{ps_quote(vpn_interface)}' -ErrorAction SilentlyContinue |
     Sort-Object RouteMetric, InterfaceMetric |
     Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {{ exit 1 }}
@@ -249,7 +251,7 @@ def _get_vpn_ipv6_default(vpn_interface=None):
     """IPv6 counterpart of _get_vpn_ipv4_default for --proxy-over-vpn."""
     if vpn_interface:
         ps = rf"""
-$r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{vpn_interface}' -ErrorAction SilentlyContinue |
+$r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{ps_quote(vpn_interface)}' -ErrorAction SilentlyContinue |
     Where-Object {{$_.NextHop -ne '::'}} |
     Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {{ exit 1 }}
@@ -390,7 +392,7 @@ def _get_ipv6_default(vpn_interface=None):
     picked as the "safe" native gateway."""
     if vpn_interface:
         ps = rf"""
-$r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{vpn_interface}' -ErrorAction SilentlyContinue |
+$r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{ps_quote(vpn_interface)}' -ErrorAction SilentlyContinue |
     Where-Object {{$_.NextHop -ne '::'}} |
     Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {{ exit 1 }}

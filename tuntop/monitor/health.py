@@ -118,10 +118,23 @@ def format_panel(results: list[tuple], width: int = 60,
             mark = "\u2713" if ok else "\u2717"
         else:
             mark = "OK" if ok else "!!"
-        # Truncate detail to fit
-        max_detail = width - len(name) - 8
+        # Truncate to fit.  Guard the budget: a name longer than the panel
+        # makes max_detail negative, and detail[:negative] would slice from
+        # the END of the string (silently dropping the whole detail and
+        # emitting a bare "..."), so truncate the name itself first and
+        # never let the detail budget go below zero.  The per-row overhead
+        # is the indent + mark + separator ("    X name: detail"), and the
+        # mark is 2 chars in ASCII mode ("OK"/"!!") vs 1 in unicode mode.
+        overhead = 7 + len(mark)
+        name_budget = max(width - overhead, 1)
+        if len(name) > name_budget:
+            name = name[:name_budget - 3] + "..."
+        max_detail = max(width - overhead - len(name), 0)
         if len(detail) > max_detail:
-            detail = detail[:max_detail - 3] + "..."
+            # The ellipsis itself must fit the budget: with no room for it,
+            # drop the detail entirely instead of overflowing by 3 chars.
+            detail = detail[:max(max_detail - 3, 0)] + \
+                ("..." if max_detail >= 3 else "")
         lines.append(f"    {mark} {name}: {detail}")
 
     # Add suggestions for failures

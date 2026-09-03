@@ -60,6 +60,18 @@ import tempfile
 import threading
 import time
 
+# Bootstrap sys.path so shared package leaves resolve when this file runs
+# standalone (python tuntop/tunnel/helper.py), not just as a package module.
+# Everything imported from the package below this point (psshell here,
+# geo.geoip further down) relies on it.
+import os as _os
+import sys as _sys
+_PKG_PARENT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+if _PKG_PARENT not in _sys.path:
+    _sys.path.insert(0, _PKG_PARENT)
+
+from tuntop.psshell import ps_quote  # noqa: E402
+
 TUN = "wintun"
 # tun2socks' Windows/Wintun configuration uses this same interface address
 # as the route next hop (per the project's Windows example).
@@ -280,14 +292,6 @@ def run(cmd, check=False, timeout=15):
         if msg:
             print(f"    {msg}")
     return p.returncode, (out or "").strip(), (err or "").strip()
-
-
-def ps_quote(s):
-    """Escape a string for safe interpolation inside a single-quoted
-    PowerShell literal.  PowerShell escapes an embedded single quote by
-    doubling it, so e.g. "Bob's VPN" -> "Bob''s VPN" and can no longer
-    break out of the surrounding quotes in a generated script."""
-    return str(s).replace("'", "''")
 
 
 def ps_json(script, timeout=15):
@@ -797,12 +801,6 @@ def _clean_err(err):
         return line
     return ""
 
-
-import os as _os
-import sys as _sys
-_PKG_PARENT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-if _PKG_PARENT not in _sys.path:
-    _sys.path.insert(0, _PKG_PARENT)
 
 from tuntop.geo.geoip import parse_geoip  # noqa: E402
 
@@ -2102,188 +2100,36 @@ def _probe_tunnel_multi(timeout=4, urls=None):
 #   direct == tunnel exit -> OK  (all traffic rides the TUN)
 #   direct != tunnel exit -> LEAK (direct traffic escapes via the physical
 #                                  NIC and reveals the real ISP IP)
-# (The old dashboard [L] verdict claimed the opposite, which is why this
-# check never existed in the monitor before.)
-# Self-contained on purpose: helper.py is launched as a standalone script
-# and never imports upward into the Monitor/UI layers (same convention as
-# every other re-implemented primitive in this file).
+# The mechanics (SOCKS5 client, endpoint racing, IP validation, verdicts)
+# live in tuntop/network/leak_probe.py - a neutral stdlib leaf shared with
+# the dashboard's monitor, so the two can never drift apart (a duplicated
+# copy here is exactly how the inverted-verdict bug survived in the first
+# place).  The leaf imports nothing from the UI/Monitor layers; the
+# sys.path bootstrap below only makes the package importable when
+# helper.py is launched as a standalone script (python helper.py puts
+# tuntop/tunnel/ - not the package root - on sys.path).
 
-_LEAK_ECHO_ENDPOINTS = [
-    ("https", "api.ipify.org", "/"),
-    ("https", "ifconfig.me", "/ip"),
-    ("https", "icanhazip.com", "/"),
-    ("https", "api.ip.sb", "/ip"),
-    ("http", "api.ipify.org", "/"),
-    ("http", "icanhazip.com", "/"),
-]
-
-
-def _leak_valid_ip(text):
-    """Bare-IP validation: echo endpoints answer with just an address; a
-    captive portal or interception page answers with HTML. Everything that
-    does not strictly parse as an IP is rejected."""
-    if not text:
-        return None
-    candidate = text.strip().splitlines()[0].strip() if text.strip() else ""
-    if not candidate:
-        return None
-    try:
-        return str(ipaddress.ip_address(candidate))
-    except ValueError:
-        return None
-
-
-def _leak_recv_exact(sock, size):
-    chunks = []
-    remaining = size
-    while remaining:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def _leak_http_get(sock, scheme, host, path, timeout):
-    """One raw HTTP GET over an already-connected socket; returns the body.
-    Non-2xx replies raise (a redirect carries no usable IP)."""
-    if scheme == "https":
-        import ssl
-        sock = ssl.create_default_context().wrap_socket(
-            sock, server_hostname=host)
-    sock.settimeout(timeout)
-    sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
-                  "User-Agent: tuntop-leak/1.0\r\nAccept: */*\r\n"
-                  "Connection: close\r\n\r\n").encode("ascii"))
-    buf = b""
-    while len(buf) < 16384:
-        try:
-            chunk = sock.recv(4096)
-        except socket.timeout:
-            break
-        if not chunk:
-            break
-        buf += chunk
-    head, _, body = buf.partition(b"\r\n\r\n")
-    parts = (head.split(b"\r\n", 1)[0] if head else b"").split(b" ")
-    if len(parts) < 2 or not parts[1].startswith(b"2"):
-        code = parts[1].decode("ascii", "replace") if len(parts) > 1 else "?"
-        raise OSError(f"HTTP {code}")
-    return body.decode("utf-8", "replace")
-
-
-def _leak_fetch_direct(scheme, host, path, timeout):
-    """Direct socket fetch. With the full-tunnel routes installed this is
-    routed through the TUN, so the echoed source IP IS the tunnel exit."""
-    port = 443 if scheme == "https" else 80
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        return _leak_http_get(sock, scheme, host, path, timeout)
-
-
-def _leak_socks5_connect(socks_port, host, dst_port, timeout):
-    """SOCKS5 CONNECT (no-auth, remote DNS) through 127.0.0.1:<socks_port>."""
-    sock = socket.create_connection(("127.0.0.1", socks_port), timeout=timeout)
-    try:
-        sock.settimeout(timeout)
-        sock.sendall(b"\x05\x01\x00")
-        if _leak_recv_exact(sock, 2) != b"\x05\x00":
-            raise OSError("SOCKS5 handshake rejected")
-        dom = host.encode("ascii")
-        sock.sendall(b"\x05\x01\x00\x03" + bytes((len(dom),)) + dom
-                     + dst_port.to_bytes(2, "big"))
-        head = _leak_recv_exact(sock, 4)
-        if len(head) < 4:
-            raise OSError(f"SOCKS5 short reply: {head!r}")
-        if head[1] != 0:
-            raise OSError(f"SOCKS5 CONNECT rejected (code {head[1]})")
-        atyp = head[3]
-        tail_len = {1: 4 + 2, 4: 16 + 2}.get(atyp)
-        if tail_len is None:
-            length = _leak_recv_exact(sock, 1)
-            if len(length) != 1:
-                raise OSError("SOCKS5 malformed reply")
-            tail_len = length[0] + 2
-        tail = _leak_recv_exact(sock, tail_len)
-        if len(tail) != tail_len:
-            raise OSError("SOCKS5 truncated reply")
-        return sock
-    except Exception:
-        try:
-            sock.close()
-        except OSError:
-            pass
-        raise
-
-
-def _leak_fetch_socks(socks_port, scheme, host, path, timeout):
-    """Fetch the echo THROUGH the local SOCKS5 inbound; the echoed source
-    IP is by construction the proxy's exit IP."""
-    port = 443 if scheme == "https" else 80
-    sock = _leak_socks5_connect(socks_port, host, port, timeout)
-    try:
-        return _leak_http_get(sock, scheme, host, path, timeout)
-    finally:
-        try:
-            sock.close()
-        except OSError:
-            pass
-
-
-def _leak_race(fetcher, timeout):
-    """Race every echo endpoint concurrently; first VALIDATED IP wins.
-    Returns (ip | None, first_error | None)."""
-    out = {"ip": None, "err": None}
-
-    def _run(scheme, host, path):
-        if out["ip"]:
-            return
-        try:
-            body = fetcher(scheme, host, path, timeout)
-        except Exception as e:
-            if out["err"] is None:
-                out["err"] = f"{host}: {e}"
-            return
-        ip = _leak_valid_ip(body)
-        if ip and out["ip"] is None:
-            out["ip"] = ip
-
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=len(_LEAK_ECHO_ENDPOINTS)) as ex:
-        futs = [ex.submit(_run, *ep) for ep in _LEAK_ECHO_ENDPOINTS]
-        concurrent.futures.wait(futs, timeout=timeout + 2)
-        for f in futs:
-            f.cancel()
-    return out["ip"], out["err"]
+def _import_leak_probe():
+    """Import the shared leak-probe leaf, bootstrapping sys.path so this
+    works whether helper.py runs as tuntop.tunnel.helper or standalone."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    # tuntop/tunnel/ -> tuntop/ -> <package root> (the dir containing tuntop/)
+    pkg_parent = os.path.dirname(os.path.dirname(here))
+    if pkg_parent not in sys.path:
+        sys.path.insert(0, pkg_parent)
+    from tuntop.network import leak_probe
+    return leak_probe
 
 
 def _leak_probe(socks_port, timeout=5):
     """Compare DIRECT egress vs SOCKS-proxied egress concurrently.
 
     Returns (status, message) with status in
-    {"ok", "leak", "no-proxy", "inconclusive", "no-network"}."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        fd = ex.submit(_leak_race, _leak_fetch_direct, timeout)
-        ft = ex.submit(
-            _leak_race,
-            lambda s, h, p, t: _leak_fetch_socks(socks_port, s, h, p, t),
-            timeout)
-        dip, derr = fd.result()
-        tip, terr = ft.result()
-    if dip is None and tip is None:
-        return "no-network", (f"no probe answered (direct: {derr or 'no answer'}; "
-                              f"tunnel: {terr or 'no answer'})")
-    if tip is None:
-        return "no-proxy", (f"SOCKS inbound 127.0.0.1:{socks_port} did not "
-                            f"answer ({terr or 'no answer'}) - proxy client down?")
-    if dip is None:
-        return "inconclusive", (f"tunnel exit {tip} OK, but the direct probe "
-                                f"got no answer ({derr or 'no answer'})")
-    if dip == tip:
-        return "ok", (f"no leak - direct egress matches the tunnel exit {tip}; "
-                      "all traffic rides the TUN")
-    return "leak", (f"direct egress {dip} != tunnel exit {tip} - direct "
-                    "traffic escapes outside the TUN (real IP is exposed)")
+    {"ok", "leak", "no-proxy", "inconclusive", "no-network"} - see
+    tuntop/network/leak_probe.py for the full verdict table."""
+    status, message, _legs = _import_leak_probe().run_leak_probe(
+        socks_port, timeout=timeout)
+    return status, message
 
 
 # Fast, reliable verification endpoints — tried in order.

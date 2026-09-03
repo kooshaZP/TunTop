@@ -5,7 +5,9 @@ A separate, self-contained TUI inspired by btop/btop+ - panel-based layout,
 Unicode box-drawing borders, block-element progress bars, gradient graphs,
 active/inactive panel styling, and a clean dark theme.
 
-DOES NOT MODIFY ANY EXISTING FILE.  All helper logic is re-implemented locally.
+Routing helpers are imported from tuntop.network.routing - one shared
+implementation, never re-implemented locally (a local shadowing copy once
+kept a real quoting fix from ever reaching this file).
 
 Usage:  python tuntop/ui/dashboard.py --server IP [--port PORT] [--tun2socks PATH] [MODE FLAGS]
 Run via Run_Helper.ps1 for admin elevation.
@@ -60,6 +62,7 @@ from tuntop.routing import (          # noqa: E402
     _get_ipv4_default, _get_ipv6_default,
     _get_egress_for, _get_vpn_ipv4_default, _get_vpn_ipv6_default,
 )
+from tuntop.psshell import ps_quote   # noqa: E402
 from tuntop.netdns import (           # noqa: E402
     _host_from_url, _resolve, _resolve_cached, _resolve_detail,
     _dns_cache_clear, _dns_build_query, _dns_parse_answers,
@@ -879,363 +882,6 @@ def _leak_check(port, timeout=None):
     return _leak_as_check(status, msg)
 
 
-def _teardown_wintun():
-    """Best-effort teardown of stale tunnel state: removes routes from BOTH
-    tunnel adapters ('wintun' + optional 'wintun2' second pipe) and kills
-    orphaned tun2socks processes. Mirrors tuntop.network.routing's version."""
-    try:
-        for _adapter in ("wintun", "wintun2"):
-            _ps(f"Get-NetRoute -InterfaceAlias '{_adapter}' -ErrorAction SilentlyContinue | "
-                "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
-        _ps("Get-Process -ErrorAction SilentlyContinue | Where-Object {$_.ProcessName -like 'tun2socks*'} | "
-            "ForEach-Object { Stop-Process -Force -Id $_.Id -ErrorAction SilentlyContinue }")
-    except Exception:
-        pass
-
-
-# ─── Live route helpers (for in-dashboard bypass-IP editing) ─────────────────
-# Re-implemented locally rather than imported from tuntop/helper.py, same
-# as everything else in this file - these mirror get_ipv4_default() and
-# get_vpn_ipv4_default() there closely enough to pick the same interface.
-
-def _get_ipv4_default():
-    """IPv4 default route used to reach the Internet (interface + gateway).
-
-    Mirrors tuntop.helper get_ipv4_default(): never returns a connected
-    Windows VPN as the "physical" gateway (so geo/bypass traffic is not routed
-    into the VPN), and recovers the physical NIC's configured gateway via CIM
-    when a full-tunnel VPN has deleted the Wi-Fi default route.  The VPN
-    gateway is only used as an absolute last resort."""
-    ps = r"""
-$vpnAliases = @(
-    @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
-    @(Get-VpnConnection -ErrorAction SilentlyContinue) |
-    Where-Object { $_.ConnectionStatus -eq 'Connected' } |
-    Select-Object -ExpandProperty Name -Unique |
-    ForEach-Object {
-        $n = $_
-        $_
-        Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty InterfaceAlias -Unique
-        Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty InterfaceAlias -Unique
-    }
-)
-Get-NetRoute -ErrorAction SilentlyContinue |
-    Where-Object { $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)' } |
-    Select-Object -ExpandProperty InterfaceAlias -Unique | ForEach-Object { $vpnAliases += $_ }
-$vpnAliases = @($vpnAliases | Where-Object { $_ } | Select-Object -Unique)
-$r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -ne 'wintun' -and
-        ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
-    } |
-    Sort-Object RouteMetric, InterfaceMetric |
-    Select-Object -First 1 NextHop, InterfaceAlias
-if ($null -eq $r) {
-    $r = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue |
-        Where-Object { $_.DefaultIPGateway } |
-        ForEach-Object {
-            $gw = @($_.DefaultIPGateway) | Where-Object { $_ -and $_ -ne '0.0.0.0' -and $_ -ne '::' } | Select-Object -First 1
-            if ($gw) {
-                $na = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue
-                [PSCustomObject]@{
-                    NextHop = $gw
-                    InterfaceAlias = if ($na) { $na.InterfaceAlias } else { $_.Description }
-                }
-            }
-        } |
-        Where-Object { $_.InterfaceAlias -ne 'wintun' -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
-        Select-Object -First 1
-}
-if ($null -eq $r) {
-    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object {$_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun'} |
-        Sort-Object RouteMetric, InterfaceMetric |
-        Select-Object -First 1 NextHop, InterfaceAlias
-}
-if ($null -eq $r) { exit 1 }
-$r | ConvertTo-Json -Compress
-"""
-    ok, out = _ps(ps)
-    if not ok:
-        return None
-    try:
-        d = json.loads(out)
-        return d["InterfaceAlias"], d["NextHop"]
-    except Exception:
-        return None
-
-
-def _get_egress_for(ip):
-    """Return (interface, gateway) Windows would actually use to reach `ip`
-    over its real (non-wintun) path. Respects split-tunnel VPNs (a destination
-    reachable only via the VPN gets that gateway), unlike _get_ipv4_default()
-    which only knows the system default route. Prefers the most-specific
-    non-wintun route, then falls back to the real default route."""
-    ps = rf"""
-$r = Find-NetRoute -RemoteIPAddress '{ip}' -ErrorAction SilentlyContinue
-if ($r) {{
-    $r = @($r) | Where-Object {{ $_.InterfaceAlias -ne 'wintun' }} |
-        Sort-Object {{ ($_.DestinationPrefix -split '/')[1] -as [int] }} -Descending, RouteMetric, InterfaceMetric |
-        Select-Object -First 1
-}}
-if (-not $r) {{
-    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object {{ $_.InterfaceAlias -ne 'wintun' -and $_.NextHop -ne '0.0.0.0' }} |
-        Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
-}}
-if ($null -eq $r) {{ exit 1 }}
-$r | Select-Object InterfaceAlias, NextHop | ConvertTo-Json -Compress
-"""
-    ok, out = _ps(ps)
-    if not ok:
-        return None
-    try:
-        d = json.loads(out)
-    except Exception:
-        return None
-    iface = str(d.get("InterfaceAlias", ""))
-    gw = str(d.get("NextHop", "") or "")
-    if not iface:
-        return None
-    return iface, (gw or "0.0.0.0")
-
-
-def _get_vpn_ipv4_default(vpn_interface=None):
-    """Connected Windows VPN's IPv4 default route (for --vless-over-vpn)."""
-    if vpn_interface:
-        ps = rf"""
-$r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias '{vpn_interface}' -ErrorAction SilentlyContinue |
-    Sort-Object RouteMetric, InterfaceMetric |
-    Select-Object -First 1 NextHop, InterfaceAlias
-if ($null -eq $r) {{ exit 1 }}
-$r | ConvertTo-Json -Compress
-"""
-    else:
-        ps = r"""
-$names = @(
-    @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
-    @(Get-VpnConnection -ErrorAction SilentlyContinue) |
-    Where-Object {$_.ConnectionStatus -eq 'Connected'} |
-    Select-Object -ExpandProperty Name -Unique
-)
-$best = $null
-foreach ($n in $names) {
-    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-        Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
-    if ($r) { $best = $r; break }
-}
-if ($null -eq $best) { exit 1 }
-$best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
-"""
-    ok, out = _ps(ps)
-    if not ok:
-        return None
-    try:
-        d = json.loads(out)
-        return d["InterfaceAlias"], d["NextHop"]
-    except Exception:
-        return None
-
-
-def _get_vpn_ipv6_default(vpn_interface=None):
-    """IPv6 counterpart of _get_vpn_ipv4_default for --vless-over-vpn."""
-    if vpn_interface:
-        ps = rf"""
-$r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{vpn_interface}' -ErrorAction SilentlyContinue |
-    Where-Object {{$_.NextHop -ne '::'}} |
-    Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1 NextHop, InterfaceAlias
-if ($null -eq $r) {{ exit 1 }}
-$r | ConvertTo-Json -Compress
-"""
-    else:
-        ps = r"""
-$names = @(
-    @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
-    @(Get-VpnConnection -ErrorAction SilentlyContinue) |
-    Where-Object {$_.ConnectionStatus -eq 'Connected'} |
-    Select-Object -ExpandProperty Name -Unique
-)
-$best = $null
-foreach ($n in $names) {
-    $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-        Where-Object {$_.NextHop -ne '::'} |
-        Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
-    if ($r) { $best = $r; break }
-}
-if ($null -eq $best) { exit 1 }
-$best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
-"""
-    ok, out = _ps(ps)
-    if not ok:
-        return None
-    try:
-        d = json.loads(out)
-        return d["InterfaceAlias"], d["NextHop"]
-    except Exception:
-        return None
-
-
-def _netsh(args_list, timeout=10):
-    try:
-        p = subprocess.run(["netsh"] + args_list, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace", timeout=timeout)
-        return p.returncode == 0, (p.stdout or p.stderr or "").strip()
-    except Exception as e:
-        return False, str(e)
-
-
-def _add_route_v4(dest, iface, gateway, metric=1):
-    ok, msg = _netsh(["interface", "ipv4", "add", "route", dest, iface, gateway, f"metric={metric}", "store=active"])
-    # "The object already exists" just means the bypass route is already
-    # installed (e.g. by the helper at startup, or a previous live add) - that
-    # is a successful bypass, not a failure. Treating it as success is what
-    # lets a live [A] add report correctly without needing a tunnel restart.
-    if ok:
-        return True
-    if "already exists" in msg.lower():
-        # Persistent leftover from an older build (registry) - convert to
-        # active-store-only so it does not survive the next reboot.
-        _netsh(["interface", "ipv4", "delete", "route", dest, iface, gateway])
-        ok2, msg2 = _netsh(["interface", "ipv4", "add", "route", dest, iface, gateway, f"metric={metric}", "store=active"])
-        return ok2 or "already exists" in msg2.lower()
-    return False
-
-
-def _route_exists_v4(dest):
-    """True if any IPv4 route with exactly this prefix is in the live table."""
-    ok, out = _ps(
-        f"if (Get-NetRoute -DestinationPrefix '{dest}' -AddressFamily IPv4 "
-        f"-ErrorAction SilentlyContinue) {{ 'yes' }}")
-    return ok and "yes" in out
-
-
-def _route_exists_v6(dest):
-    ok, out = _ps(
-        f"if (Get-NetRoute -DestinationPrefix '{dest}' -AddressFamily IPv6 "
-        f"-ErrorAction SilentlyContinue) {{ 'yes' }}")
-    return ok and "yes" in out
-
-
-def _del_route_v4(dest, iface, gateway):
-    """Delete an IPv4 route. Robust against parameter drift: netsh only
-    removes the route when iface AND next-hop BOTH match what was recorded at
-    install time. If the egress changed since then (Wi-Fi switch, DHCP renew,
-    on-link <-> gateway form), netsh answers 'element not found' - which looks
-    identical to 'route was never there'. Left alone, that silently KEEPS the
-    /32 route alive and traffic keeps flowing DIRECT after [X] remove."""
-    ok, msg = _netsh(["interface", "ipv4", "delete", "route", dest, iface, gateway])
-    low = msg.lower()
-    if ok:
-        return True
-    claims_gone = "not found" in low or "element" in low
-    # Ambiguous failure: either genuinely absent, or our parameters don't
-    # match the installed route. Check the live table before believing it...
-    if claims_gone and not _route_exists_v4(dest):
-        return True
-    # ...and fall back to a prefix-wide delete that ignores iface/nexthop.
-    _ps(f"Remove-NetRoute -DestinationPrefix '{dest}' -AddressFamily IPv4 "
-        f"-Confirm:$false -ErrorAction SilentlyContinue | Out-Null")
-    return not _route_exists_v4(dest)
-
-
-def _del_route_v6(dest, iface, gateway):
-    cmd = ["interface", "ipv6", "delete", "route", dest, iface]
-    if gateway:
-        cmd.append(gateway)
-    ok, msg = _netsh(cmd)
-    low = msg.lower()
-    if ok:
-        return True
-    claims_gone = "not found" in low or "element" in low
-    if claims_gone and not _route_exists_v6(dest):
-        return True
-    _ps(f"Remove-NetRoute -DestinationPrefix '{dest}' -AddressFamily IPv6 "
-        f"-Confirm:$false -ErrorAction SilentlyContinue | Out-Null")
-    return not _route_exists_v6(dest)
-
-
-def _add_route_v6(dest, iface, gateway, metric=1):
-    cmd = ["interface", "ipv6", "add", "route", dest, iface]
-    if gateway:
-        cmd.append(gateway)
-    cmd.append(f"metric={metric}")
-    cmd.append("store=active")
-    ok, msg = _netsh(cmd)
-    if ok:
-        return True
-    if "already exists" in msg.lower():
-        # Persistent leftover from an older build (registry) - convert to
-        # active-store-only so it does not survive the next reboot.
-        del_cmd = ["interface", "ipv6", "delete", "route", dest, iface]
-        if gateway:
-            del_cmd.append(gateway)
-        _netsh(del_cmd)
-        ok2, msg2 = _netsh(cmd)
-        return ok2 or "already exists" in msg2.lower()
-    return False
-
-
-def _get_ipv6_default(vpn_interface=None):
-    """IPv6 default route (next hop) used to send a bypass entry's IPv6
-    address directly. Mirrors the VPN-exclusion fix in
-    tuntop.helper get_ipv6_default() so a connected Windows VPN is never
-    picked as the "safe" native gateway."""
-    if vpn_interface:
-        ps = rf"""
-$r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{vpn_interface}' -ErrorAction SilentlyContinue |
-    Where-Object {{$_.NextHop -ne '::'}} |
-    Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1 NextHop, InterfaceAlias
-if ($null -eq $r) {{ exit 1 }}
-$r | ConvertTo-Json -Compress
-"""
-    else:
-        ps = r"""
-$vpnAliases = @(
-    @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
-    @(Get-VpnConnection -ErrorAction SilentlyContinue) |
-    Where-Object { $_.ConnectionStatus -eq 'Connected' } |
-    Select-Object -ExpandProperty Name -Unique |
-    ForEach-Object {
-        $n = $_
-        $_
-        Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty InterfaceAlias -Unique
-    }
-)
-Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-    Where-Object { $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)' } |
-    Select-Object -ExpandProperty InterfaceAlias -Unique | ForEach-Object { $vpnAliases += $_ }
-$vpnAliases = @($vpnAliases | Where-Object { $_ } | Select-Object -Unique)
-$r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -ne 'wintun' -and
-        ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
-    } |
-    Sort-Object RouteMetric, InterfaceMetric |
-    Select-Object -First 1 NextHop, InterfaceAlias
-if ($null -eq $r) {
-    $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun' } |
-        Sort-Object RouteMetric, InterfaceMetric |
-        Select-Object -First 1 NextHop, InterfaceAlias
-}
-if ($null -eq $r) { exit 1 }
-$r | ConvertTo-Json -Compress
-"""
-    ok, out = _ps(ps)
-    if not ok:
-        return None
-    try:
-        d = json.loads(out)
-        return d["InterfaceAlias"], d["NextHop"]
-    except Exception:
-        return None
-
-
 def _get_active_connections(limit=15):
     """Established TCP connections (excluding loopback) joined with owning
     process name, for the event log's [net] entries. Best-effort: returns []
@@ -1332,9 +978,9 @@ def build_checks(ns):
         # socket stack queues packets. It is deliberately labelled as such;
         # the REAL UDP-relay test is "SOCKS5 UDP ASSOCIATE" above.
         ("Local UDP send (stack sanity)",
-         lambda: _ps(f"$u=New-Object Net.Sockets.UdpClient; $u.Connect('{dns}',53); "
+         lambda: _ps(f"$u=New-Object Net.Sockets.UdpClient; $u.Connect('{ps_quote(dns)}',53); "
                      f"[void]$u.Send([byte[]](0),1); $u.Close(); "
-                     f"'UDP packet queued locally to {dns}:53 (no ack possible)'")),
+                     f"'UDP packet queued locally to {ps_quote(dns)}:53 (no ack possible)'")),
         ("DNS (via SOCKS tunnel)", lambda: _dns_tunnel_verdict(dns, p)),
         ("IPv4 HTTPS end-to-end (via Wintun)", lambda: _https(False, False, p)),
         # IPv6 rows use _ipv6_tun_verdict so a missing Wintun IPv6 route
@@ -1367,10 +1013,10 @@ def build_checks(ns):
         # INCONCLUSIVE (pass-with-info), not a red cross. Tunnel health is
         # proven by the HTTPS-over-wintun rows above, not by ping.
         q("MTU / fragmentation probe",
-          f"$l = ping.exe -n 1 -f -l 1200 {dns} 2>$null | Select-String 'Reply from'; "
+          f"$l = ping.exe -n 1 -f -l 1200 '{ps_quote(dns)}' 2>$null | Select-String 'Reply from'; "
           f"if ($l) {{$l.Line}} else {{'No ICMP reply (filtered?) - inconclusive'}}; exit 0"),
         q("ICMP loss to resolver (info)",
-          f"$p = ping.exe -n 4 {dns} 2>$null; $t = $p -join ' '; "
+          f"$p = ping.exe -n 4 '{ps_quote(dns)}' 2>$null; $t = $p -join ' '; "
           f"if ($t -match 'Lost = (\\d+)') {{'ICMP loss ' + $Matches[1] + ' of 4'}} "
           f"else {{'No ICMP replies (filtered?) - inconclusive'}}; exit 0"),
         # VALIDITY NOTE: retransmit RATE alone can't pass/fail (it depends on
@@ -1427,7 +1073,7 @@ def build_checks(ns):
             ep4, ep6 = _resolve_cached(host)
             if not ep4 and not ep6:
                 checks.append(q(f"Bypass {host}",
-                    f"throw 'not resolved yet: {host} (the resolver keeps retrying)'"))
+                    f"throw 'not resolved yet: {ps_quote(host)} (the resolver keeps retrying)'"))
                 continue
             for ip in ep4 + ep6:
                 prefix = f"{ip}/32" if ":" not in ip else f"{ip}/128"
@@ -1441,9 +1087,9 @@ def build_checks(ns):
         checks.append((f"Configured endpoint TCP/{ep} ({_s})",
                        lambda _s=_s, ep=ep: _tcp(_s, ep, 8)))
         checks.append(q(f"VLESS server route ({_s})",
-                        f"$r = Find-NetRoute -RemoteIPAddress '{_s}' -ErrorAction SilentlyContinue | select -First 1; if ($r) {{'via ' + $r.InterfaceAlias}} else {{Write-Output 'no route found'; exit 1}}"))
+                        f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; if ($r) {{'via ' + $r.InterfaceAlias}} else {{Write-Output 'no route found'; exit 1}}"))
         checks.append(q(f"Proxy loop detection ({_s})",
-                        f"$r = Find-NetRoute -RemoteIPAddress '{_s}' -ErrorAction SilentlyContinue | select -First 1; if ($r -and $r.InterfaceAlias -ne 'wintun') {{'VLESS endpoint bypassed through ' + $r.InterfaceAlias}} else {{Write-Output 'VLESS endpoint NOT bypassed (loops into tunnel!)'; exit 1}}"))
+                        f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; if ($r -and $r.InterfaceAlias -ne 'wintun') {{'VLESS endpoint bypassed through ' + $r.InterfaceAlias}} else {{Write-Output 'VLESS endpoint NOT bypassed (loops into tunnel!)'; exit 1}}"))
 
     return checks
 

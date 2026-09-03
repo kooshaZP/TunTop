@@ -67,6 +67,31 @@ class TestFormatPanel(unittest.TestCase):
         # Should not crash, detail should be truncated
         self.assertTrue(len(lines) > 0)
 
+    def test_long_name_row_fits_width(self):
+        # Regression: a check label longer than the panel made
+        # max_detail negative, and detail[:negative] sliced from the END of
+        # the detail string (silently dropping it behind a bare "...") while
+        # the row overflowed the panel width. Every result row must fit.
+        name = "Bypass " + "x" * 80
+        lines = format_panel([_fail(name, "no route found")], width=60,
+                             use_unicode=False)
+        rows = [l for l in lines if l.startswith("    !!")
+                or l.startswith("    OK")]
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertLessEqual(len(row), 60)
+
+    def test_long_name_detail_prefix_preserved(self):
+        # When only the DETAIL overflows (name still fits), the detail is
+        # truncated from the end by the budget - never by an accidental
+        # negative slice of the whole row.
+        name = "VLESS server route"
+        lines = format_panel(
+            [_fail(name, "d" * 200)], width=60, use_unicode=False)
+        row = next(l for l in lines if name in l and l.startswith("    !!"))
+        self.assertIn("ddd", row)          # keeps the detail's PREFIX
+        self.assertLessEqual(len(row), 60)
+
 
 class TestFormatCompact(unittest.TestCase):
     def test_empty(self):

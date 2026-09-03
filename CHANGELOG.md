@@ -5,6 +5,67 @@ All notable changes to TunTop are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **Health-panel rows can no longer overflow the panel or silently lose
+  their detail**: `format_panel()` computed the detail budget as
+  `width - len(name) - 8` with NO guard - a check label longer than the
+  panel (e.g. a long bypass hostname) made the budget negative, and
+  `detail[:negative]` sliced from the END of the string, silently dropping
+  the whole detail behind a bare "..." while the row overflowed the panel.
+  The name is now truncated first, the detail budget can never go below
+  zero, the ellipsis itself must fit the budget, and the per-row overhead
+  is computed from the actual mark width (the old constant 8 was already
+  off by one for the ASCII marks "OK"/"!!"). Regression tests pin the
+  row-fits-width invariant in both unicode and ASCII modes.
+- **Health-check scripts no longer break on user input containing apostrophes**
+  (same "Bob's VPN" quoting class as the routing fix): `build_checks()`
+  interpolated raw user-typed values - `--server` entries, `[A]` bypass
+  entries, `--dns4` - directly into PowerShell single-quoted literals
+  (`Find-NetRoute -RemoteIPAddress '{_s}'`, the bypass "not resolved yet"
+  message, the UDP probe's `Connect('{dns}',53)` and the ping targets). A
+  value containing `'` closed the literal, the script failed to parse and
+  the check row reported a nonsense parse error instead of its verdict.
+  All free-text interpolations now go through the shared `ps_quote()`
+  (regression tests capture every generated script and assert no raw
+  apostrophe survives).
+- **The dashboard's routing helpers are no longer shadowed by dead local
+  redefinitions** (the "theater import" bug): `tuntop/ui/dashboard.py`
+  imported 14 routing helpers from `tuntop.network.routing` and then
+  re-defined 13 of them at module scope, so the imports never ran and every
+  fix in `network/routing.py` silently missed the dashboard. The copies had
+  already drifted: `ps_quote()` (added to the helper so a VPN connection
+  named e.g. "Bob's VPN" cannot close the PowerShell string literal) never
+  reached the dashboard's live `_get_vpn_ipv4_default` /
+  `_get_vpn_ipv6_default` / `_get_ipv6_default` / `_get_egress_for`, so any
+  bypass entry routed through a VPN whose name contains an apostrophe failed
+  to install with no error pointing at the real cause. The 13 local
+  redefinitions are deleted - the dashboard now runs the shared versions -
+  and `ps_quote()` moved to a new stdlib leaf `tuntop/psshell.py` imported
+  by BOTH `network/routing.py` and `tunnel/helper.py`, so a quoting fix can
+  only ever land in one place. Regression tests pin both the escaping and
+  that the dashboard binds the shared objects.
+- **Leak-probe timeout is now actually bounded.** `_race_leg()` used to
+  wait on its futures and then let the executor's context-manager join
+  collect the workers - but `socket.create_connection()` resolves DNS via
+  `getaddrinfo()` BEFORE any socket exists, and that call is an unbounded
+  blocking OS operation the socket timeout does not cover (and
+  `Future.cancel()` cannot stop an already-running thread). On networks
+  that blackhole individual hostnames - exactly where this probe fires -
+  a hung lookup stalled the caller with no ceiling: on the helper side the
+  single-threaded monitor loop (which also drives self-heal), on the
+  dashboard side the `[C]` scan's `checking` gate. The executor is now
+  shut down WITHOUT joining once the wait budget expires; abandoned
+  stragglers are harmless. Covered by a regression test that hangs an
+  endpoint past the budget and asserts the race returns on time.
+- **One shared leak-probe implementation** instead of two diverging copies:
+  the stdlib-only mechanics (SOCKS5 client, endpoint racing, IP
+  validation, verdict matrix) moved to `tuntop/network/leak_probe.py`, a
+  neutral leaf with zero tuntop imports, and `tuntop/tunnel/helper.py`
+  now imports it (with a small sys.path bootstrap so the helper still runs
+  standalone) instead of carrying its own ~150-line duplicate. Previously
+  only the dashboard copy had tests - the exact shape that let the
+  inverted-verdict bug survive. Both entry points are covered now, and a
+  unit test pins the re-export/delegation chain so the semantics cannot
+  silently drift again.
 - **Leak-test verdict was INVERTED** (the "fix any bug" find of this change):
   the old `[L]` test claimed `direct == proxied -> LEAK`, which is backwards.
   With the full-tunnel routes healthy, a *direct* (non-proxied) fetch
@@ -32,8 +93,9 @@ All notable changes to TunTop are documented here.
 - **"Tunnel leak test (direct vs tunnel egress)" health-check row** - the
   `[C]` scan now includes the same probe, so the leak state is visible in
   the health panel and exported with `[D]` diagnostics.
-- **Monitor-layer leak probe** (`tuntop/monitor/leak.py`, pure stdlib - the
-  module now owns the real logic instead of re-exporting the dashboard):
+- **Monitor-layer leak probe** (mechanics in `tuntop/network/leak_probe.py`,
+  exposed through `tuntop/monitor/leak.py` - pure stdlib, shared with the
+  helper):
   both legs (direct + SOCKS5-proxied) race SEVERAL IP-echo endpoints
   concurrently and the first strictly-validated IP wins, so a single
   blocked/lying endpoint (captive portal, interception page) can never

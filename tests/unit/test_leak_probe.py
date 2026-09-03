@@ -1,19 +1,39 @@
 """Offline leak-probe tests (no network, no admin, no Windows calls).
 
-Covers the Monitor-layer leak probe (tuntop/monitor/leak.py): IP
-validation, the corrected verdict matrix, endpoint racing, and the
-health-check result mapping.
+Covers the leak-probe mechanics (tuntop/network/leak_probe.py): IP
+validation, the corrected verdict matrix, endpoint racing (including the
+straggler timeout bound), the health-check result mapping, and the
+re-export chain that keeps the dashboard's monitor and the standalone
+helper on ONE implementation.
 """
 import sys
 import os
 import time
+import threading
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
-from tuntop.monitor import leak as L
+from tuntop.network import leak_probe as L
+from tuntop.monitor import leak as ML
+
+
+class TestSingleImplementation(unittest.TestCase):
+    """The dashboard monitor must re-export - never re-implement - the
+    shared probe, and the helper must delegate to it."""
+
+    def test_monitor_reexports_shared_probe(self):
+        self.assertIs(ML.run_leak_probe, L.run_leak_probe)
+        self.assertIs(ML.LEAK_TIMEOUT, L.LEAK_TIMEOUT)
+
+    def test_helper_delegates_to_shared_probe(self):
+        from tuntop.tunnel import helper as H
+        with mock.patch.object(L, "run_leak_probe",
+                               return_value=("leak", "msg-x", {})) as probe:
+            self.assertEqual(H._leak_probe(10808), ("leak", "msg-x"))
+        probe.assert_called_once_with(10808, timeout=5)
 
 
 class TestValidIp(unittest.TestCase):
@@ -77,19 +97,19 @@ class TestVerdictMatrix(unittest.TestCase):
 
 class TestAsCheckResult(unittest.TestCase):
     def test_ok_passes(self):
-        self.assertEqual(L.as_check_result("ok", "m"), (True, "m"))
+        self.assertEqual(ML.as_check_result("ok", "m"), (True, "m"))
 
     def test_leak_fails(self):
-        self.assertEqual(L.as_check_result("leak", "m"), (False, "m"))
+        self.assertEqual(ML.as_check_result("leak", "m"), (False, "m"))
 
     def test_no_proxy_and_no_network_fail(self):
-        self.assertFalse(L.as_check_result("no-proxy", "m")[0])
-        self.assertFalse(L.as_check_result("no-network", "m")[0])
+        self.assertFalse(ML.as_check_result("no-proxy", "m")[0])
+        self.assertFalse(ML.as_check_result("no-network", "m")[0])
 
     def test_inconclusive_passes_with_detail(self):
         # The tunnel leg was proven fine; a mute direct probe is not a
         # tunnel fault.
-        self.assertEqual(L.as_check_result("inconclusive", "m"), (True, "m"))
+        self.assertEqual(ML.as_check_result("inconclusive", "m"), (True, "m"))
 
 
 class TestRaceLeg(unittest.TestCase):
@@ -146,6 +166,37 @@ class TestRunLeakProbe(unittest.TestCase):
             status, _, _ = L.run_leak_probe(10808)
         self.assertEqual(status, "ok")
         self.assertLess(time.time() - t0, 1.0, "legs were not concurrent")
+
+
+class TestRaceStragglerBound(unittest.TestCase):
+    def test_race_leg_returns_despite_hung_endpoint(self):
+        """Simulates the DNS-blackhole case: getaddrinfo() hangs beyond any
+        socket timeout, so the worker thread is still running when the wait
+        budget expires. _race_leg must return on budget anyway (it must
+        NEVER join the executor) - otherwise the helper's monitor/self-heal
+        loop stalls with no ceiling."""
+        release = threading.Event()
+
+        def hang(scheme, host, path, timeout):
+            # Stands in for an unbounded getaddrinfo(): ignores its
+            # timeout, blocked until released (5 s cap so a forgotten
+            # release can never hang the suite at interpreter exit).
+            release.wait(5)
+            return "1.2.3.4"
+
+        with mock.patch.object(L, "_ECHO_ENDPOINTS",
+                               [("https", "hang.example", "/")]):
+            t0 = time.time()
+            out = L._race_leg(hang, timeout=0.5)
+            dt = time.time() - t0
+            ip_snapshot = out["ip"]
+        # Only now let the abandoned worker finish (it may still write into
+        # the returned dict afterwards - that is expected and harmless).
+        release.set()
+        self.assertIsNone(ip_snapshot)
+        # The wait budget is timeout + 2; assert we returned close to it
+        # instead of blocking for the (unbounded) hang duration.
+        self.assertLess(dt, 4.0, f"race leg joined the hung thread ({dt:.1f}s)")
 
 
 if __name__ == "__main__":
