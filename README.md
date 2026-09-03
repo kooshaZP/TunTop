@@ -99,7 +99,7 @@ TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into your proxy
 | `[Z]`                         | Add/change/remove the second proxy (proxy2) at runtime |
 | `[P]` `[N]` `[E]`             | SOCKS port / DNS (live, no restart) / endpoint port (live) |
 | `[R]`                         | Re-apply geoip country bypass live                    |
-| `[G]` `[M]` `[H]`             | Graph mode / theme / hide help                        |
+| `[G]` `[M]` `[H]`             | Graph mode / theme / help show-hide                   |
 | `1-6`, `0`                    | Hide/show panels                                      |
 
 On short windows (16:9 screens) the panels shrink first — health-check rows,

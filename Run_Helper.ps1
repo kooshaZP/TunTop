@@ -200,28 +200,68 @@ if (-not (Test-Path $GeoIpFile)) {
     $yn = Read-Host 'Download geoip.dat now? (Y/n)'
     if ($yn.Trim() -ne 'n') {
         $geoUrl = 'https://github.com/v2fly/geoip/releases/latest/download/geoip.dat'
+        $geoShaUrl = "$geoUrl.sha256sum"
         Write-Host "[*] Downloading geoip.dat from $geoUrl ..." -ForegroundColor Cyan
         $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+        # Download to a TEMP file first, verify, then move into place. The old
+        # in-place download left a TRUNCATED geoip.dat behind on any mid-transfer
+        # failure - which Test-Path then trusted forever after, silently
+        # "enabling" geo bypass with garbage/empty ranges.
+        $geoTemp = Join-Path $env:TEMP 'geoip.dat.download'
+        if (Test-Path $geoTemp) { Remove-Item $geoTemp -Force -ErrorAction SilentlyContinue }
         $downloaded = $false
         if (Test-Path $curl) {
-            & $curl -L --fail --silent --show-error --ssl-no-revoke --output $GeoIpFile $geoUrl
+            & $curl -L --fail --silent --show-error --ssl-no-revoke --output $geoTemp $geoUrl
             if ($LASTEXITCODE -eq 0) { $downloaded = $true }
         }
         if (-not $downloaded) {
             try {
                 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                Invoke-WebRequest -Uri $geoUrl -OutFile $GeoIpFile -UseBasicParsing
+                Invoke-WebRequest -Uri $geoUrl -OutFile $geoTemp -UseBasicParsing
                 $downloaded = $true
             } catch {
                 Write-Host "[!] Download failed: $($_.Exception.Message)" -ForegroundColor Yellow
             }
         }
-        if ($downloaded -and (Test-Path $GeoIpFile)) {
-            Write-Host '[+] geoip.dat downloaded successfully.' -ForegroundColor Green
+        $verified = $false
+        if ($downloaded) {
+            # Verify against the release's .sha256sum (same policy as the
+            # Python-side downloader: mismatch = bad file never installed;
+            # unreachable checksum endpoint = best-effort accept).
+            try {
+                $expected = $null
+                if (Test-Path $curl) {
+                    $expected = (& $curl -L --fail --silent --show-error --ssl-no-revoke $geoShaUrl 2>$null)
+                    if ($LASTEXITCODE -ne 0) { $expected = $null }
+                }
+                if (-not $expected) {
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                    $expected = (Invoke-WebRequest -Uri $geoShaUrl -UseBasicParsing).Content
+                }
+                if ($expected) {
+                    $expected = ($expected -split '\s+')[0].Trim().ToLower()
+                    $actual = (Get-FileHash -LiteralPath $geoTemp -Algorithm SHA256).Hash.ToLower()
+                    if ($actual -ne $expected) { throw "SHA-256 mismatch (file may be corrupt or tampered)" }
+                    $verified = $true
+                }
+            } catch {
+                Write-Host "[!] geoip.dat checksum verification failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                Write-Host '    The download was discarded - please retry.' -ForegroundColor Yellow
+                $downloaded = $false
+            }
+        }
+        if ($downloaded -and (Test-Path $geoTemp) -and (Get-Item $geoTemp -ErrorAction SilentlyContinue).Length -gt 1MB) {
+            Move-Item -LiteralPath $geoTemp -Destination $GeoIpFile -Force
+            if ($verified) {
+                Write-Host '[+] geoip.dat downloaded and checksum-verified.' -ForegroundColor Green
+            } else {
+                Write-Host '[+] geoip.dat downloaded (checksum endpoint unreachable - unverified).' -ForegroundColor Green
+            }
         } else {
             Write-Host '[!] Could not download geoip.dat. Geo bypass will be unavailable.' -ForegroundColor Yellow
             $GeoIpFile = ''
         }
+        if (Test-Path $geoTemp) { Remove-Item $geoTemp -Force -ErrorAction SilentlyContinue }
     } else {
         Write-Host '[*] Skipping geoip.dat download. Geo bypass will be unavailable.' -ForegroundColor Yellow
         $GeoIpFile = ''

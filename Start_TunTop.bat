@@ -41,7 +41,12 @@ REM A console already open (this one) picks the font up on its next relaunch;
 REM for the current window the PowerShell layer below sizes it explicitly.
 
 REM -- Run the PowerShell launcher with the download-safe settings ----------
-%PS% -NoProfile -ExecutionPolicy Bypass -Command "& { Get-ChildItem -LiteralPath '%~dp0' -Recurse -Include *.ps1,*.py,*.bat,*.psm1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue; & '%~dp0Run_Helper.ps1' }"
+REM The folder travels via an ENVIRONMENT VARIABLE, not string interpolation:
+REM a path containing an apostrophe (legal on Windows, e.g. C:\Users\O'Brien\)
+REM used to close the single-quoted PS literals below and break the parse.
+set "TUNTOP_DIR=%~dp0"
+%PS% -NoProfile -ExecutionPolicy Bypass -Command "& { Get-ChildItem -LiteralPath $env:TUNTOP_DIR -Recurse -Include *.ps1,*.py,*.bat,*.psm1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue; & (Join-Path $env:TUNTOP_DIR 'Run_Helper.ps1') }"
+set "TUNTOP_DIR="
 
 set "RC=%ERRORLEVEL%"
 

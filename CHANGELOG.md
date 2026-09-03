@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to TunTop are documented here.
 
@@ -82,6 +82,40 @@ All notable changes to TunTop are documented here.
   looked exactly like "the log has a delay". Results are now published by
   atomic rebinding, and the main loop wakes instantly when a background
   thread queues a new log line instead of waiting out the rest of the frame.
+- **Release zips can no longer ship your private runtime files**: the
+  build's exclusion matcher only understood `endswith`/exact names, so the
+  mid-name wildcards `diagnostics_*.txt` / `crash_*.txt` matched nothing -
+  and since a diagnostics export ([D]) writes into `tuntop/ui/` (inside the
+  zipped tree), building a release after exporting diagnostics would have
+  packed the config snapshot (contains server address) and event log into
+  the public zip. Matching is now `fnmatch`-based (regression-checked).
+- **A failed geoip.dat download no longer poisons future runs**:
+  `Run_Helper.ps1` wrote curl/Invoke-WebRequest output straight to the
+  final path, so a mid-transfer failure left a truncated `geoip.dat` that
+  `Test-Path` then trusted forever - geo bypass silently "enabled" with
+  garbage/empty ranges. The download now lands in TEMP, is verified
+  against the release's `.sha256sum` (same policy as the Python-side
+  downloader; unreachable checksum endpoint = best-effort accept) plus a
+  minimum size, and only then moves into `geofil/`.
+- **`Start_TunTop.bat` survives install paths containing apostrophes**
+  (the "Bob's VPN" quoting class again): `%~dp0` was interpolated directly
+  into single-quoted PowerShell literals, so a path like
+  `C:\Users\O'Brien\...` closed the literal and the Unblock-File +
+  launcher chain never ran. The folder now travels through the
+  `TUNTOP_DIR` environment variable instead of string interpolation.
+
+### Changed
+- **Dashboard UX polish (keyboard + mouse parity)**: the mouse wheel now
+  scrolls list overlays (Remove Bypass / Load Profile) and every overlay
+  row is CLICKABLE - first click selects, clicking the selected row
+  confirms (double-click-style confirm), so long lists no longer force
+  keyboard-only navigation; the overlay footer shows its real verb
+  ("load" for profiles, was "remove" for everything) and a Click hint;
+  the status-bar title reads "TUNTOP" instead of the internal codename
+  "V2RAY TUN"; hiding the help footer with the mouse no longer strands
+  mouse users (the status bar grows a dim "click here to show help"
+  hotspot while hidden); and [S] while the tunnel is already up logs why
+  it's a no-op instead of silence.
 
 ### Added
 - **Leak test is now part of the regular check while the tunnel runs**:

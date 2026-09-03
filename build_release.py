@@ -15,6 +15,7 @@ the --with-exe step).
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import os
 import re
@@ -80,14 +81,11 @@ def sha256_file(path: str) -> str:
 
 
 def should_exclude(name: str) -> bool:
-    """Check if a filename matches any top-level exclusion pattern."""
-    for pattern in EXCLUDE_PATTERNS:
-        if pattern.startswith("*"):
-            if name.endswith(pattern[1:]):
-                return True
-        elif name == pattern:
-            return True
-    return False
+    """Check if a filename matches any exclusion pattern (fnmatch, so
+    mid-name wildcards like diagnostics_*.txt actually match - the old
+    endswith/exact-match logic could never match them and a diagnostics
+    export would silently ship inside the release zip)."""
+    return any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_PATTERNS)
 
 
 def build_exe() -> str | None:

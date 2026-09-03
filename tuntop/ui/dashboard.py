@@ -1560,8 +1560,10 @@ class BTopTui:
 
         # Click-map / mouse support (populated each draw(), consumed by
         # _poll_input()). See _init_mouse() for the console-mode setup.
-        self._click_map = []
+        self._click_map = []     # (row, x0, x1, action) regions drawn THIS frame
         self._mouse_queue = []   # buffered actionable input events (keys/clicks)
+        self._overlay_wheel = False  # True while a list overlay is up: the
+                                     # mouse wheel then scrolls that overlay
         self._mouse_ok = False
         self._kbd_ok = True     # flips False if msvcrt polling proves unusable
         self._stdin_handle = None
@@ -1966,6 +1968,19 @@ class BTopTui:
                                 self._mouse_queue.append(
                                     ('click', self._resolve_action(action)))
                                 break
+                    elif (me.dwEventFlags & 0x0004) and self._overlay_wheel:
+                        # Mouse wheel (WHEEL_DELTA flag 0x0004): scroll the
+                        # ACTIVE OVERLAY one row per notch. Queued as plain
+                        # navigation keys so every picker loop handles it
+                        # without knowing about the mouse. The main dashboard
+                        # ignores the wheel - its log already auto-follows
+                        # unless scrolled, and there the arrows remain king.
+                        delta = ctypes.c_short(
+                            (me.dwButtonState >> 16) & 0xFFFF).value
+                        if delta > 0:
+                            self._mouse_queue.append(('key', 'up'))
+                        elif delta < 0:
+                            self._mouse_queue.append(('key', 'down'))
             if not self._mouse_queue:
                 return None
             kind, val = self._mouse_queue.pop(0)
@@ -2088,6 +2103,32 @@ class BTopTui:
                         return None
                     if read.value == 0:
                         time.sleep(0.02)
+                        continue
+                    if rec.EventType == MOUSE_EVENT:
+                        # Mouse support for the blocking overlay picker:
+                        # wheel scrolls, click on a mapped row returns its
+                        # raw 'sel:<idx>' action (the loop interprets it).
+                        # Non-matching mouse records are DISCARDED so they
+                        # cannot queue up and leak into the main dashboard
+                        # as phantom scrolls after the overlay closes.
+                        me = rec.Event.MouseEvent
+                        if me.dwEventFlags & 0x0004:      # wheel (WHEEL_DELTA)
+                            delta = ctypes.c_short(
+                                (me.dwButtonState >> 16) & 0xFFFF).value
+                            if delta > 0:
+                                return "up"
+                            if delta < 0:
+                                return "down"
+                            continue
+                        if (me.dwEventFlags == 0 and
+                                (me.dwButtonState & FROM_LEFT_1ST_BUTTON)):
+                            y = me.dwMousePosition.Y
+                            x = me.dwMousePosition.X
+                            for (row, x0, x1, action) in self._click_map:
+                                if row == y and x0 <= x < x1:
+                                    self._flash = (row, x0, x1,
+                                                   time.time() + 0.4)
+                                    return action
                         continue
                     if rec.EventType != KEY_EVENT:
                         continue
@@ -2877,15 +2918,21 @@ class BTopTui:
                     f"(reload the site's tabs - open connections stay direct until closed).")
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _draw_list_overlay(self, title, labels, sel, top, avail):
+    def _draw_list_overlay(self, title, labels, sel, top, avail, verb="remove"):
         """Full-screen list picker (its own 'page', so it never fights with the
         main dashboard). Rendered as a styled centred BOX: accent title bar
         with an entry counter, numbered rows, the highlighted row filled with
-        a background chip, and a key-chip footer."""
+        a background chip, and a key-chip footer. Rows are CLICKABLE: a click
+        selects, a second click on the selected row confirms (same as Enter)
+        - and the mouse wheel scrolls when an overlay is up."""
         size = _get_window_size() or (80, 24)
         w = max(56, min(size[0] - 6, 92))
         pal = theme()
         acc = pal["active"]
+        # The overlay OWNS the input mapping while it is up: drop the main
+        # dashboard's stale hotspots (footer chips, badge) or they would
+        # shadow the overlay's own row regions and cause phantom actions.
+        self._click_map = []
 
         def _center(text, width, fill=BOX_MID):
             vis = len(re.sub(r"\x1b\[[^m]*m", "", text))
@@ -2915,6 +2962,12 @@ class BTopTui:
                     f"{' ' * 2}\033[49m"))
             else:
                 lines.append(_row(f"{GRAY}{num}{RESET}  {lab}"))
+            # Clickable row: the three header lines above are fixed, so the
+            # screen row of entry i is 3 + i. A click resolves to 'sel:<idx>'
+            # (the picker loop selects; clicking the already-selected row
+            # confirms). Full-width hotspot, with the click flash like the
+            # footer chips.
+            self._click_map.append((3 + i, 0, w, f"sel:{idx}"))
         for _ in range(max(0, avail - len(visible))):
             lines.append(_row(""))
         lines.append(_row(BOX_MID * (w - 5)))
@@ -2922,7 +2975,8 @@ class BTopTui:
             f"{GREEN}[{k}]{RESET} {GRAY}{v}{RESET}"
             for k, v in (("\u2191/\u2193 PgUp/PgDn", "move"),
                          ("Home/End", "first/last"),
-                         ("Enter", "remove"),
+                         ("Enter", verb),
+                         ("Click", "select / confirm"),
                          ("Esc", "cancel")))
         lines.append(_row(f"  {chips}"))
         lines.append(f"{pal['inact']}{BOX_BL}{BOX_BS * (w - 2)}{BOX_BR}{RESET}")
@@ -2955,14 +3009,24 @@ class BTopTui:
         size = _get_window_size() or (80, 24)
         avail = max(5, min(20, size[1] - 6))
         sel = 0
+        self._overlay_wheel = True   # wheel scrolls this overlay
         try:
             while True:
                 top = max(0, min(sel - avail // 2, max(0, len(items) - avail)))
                 self._draw_list_overlay(
-                    "REMOVE BYPASS", labels, sel, top, avail)
+                    "REMOVE BYPASS", labels, sel, top, avail, verb="remove")
                 k = self._read_nav_key()
                 if k is None:
                     return
+                if isinstance(k, str) and k.startswith("sel:"):
+                    # Mouse click on a row: first click selects, clicking the
+                    # already-selected row confirms (same as Enter).
+                    idx = int(k.split(":", 1)[1])
+                    if idx == sel:
+                        k = "enter"
+                    else:
+                        sel = max(0, min(idx, len(items) - 1))
+                        continue
                 if k == "esc":
                     self.log_lines.append("[*] Remove cancelled.")
                     return
@@ -2985,6 +3049,7 @@ class BTopTui:
         finally:
             # Force the dashboard to fully repaint on the next frame (the overlay
             # cleared the screen, so a per-line diff would leave stale rows).
+            self._overlay_wheel = False
             self._last_frame = ""
             self._prev_lines = []
             self._full_repaint = True
@@ -3277,14 +3342,25 @@ class BTopTui:
         size = _get_window_size() or (80, 24)
         avail = max(5, min(20, size[1] - 6))
         sel, top = 0, 0
+        self._overlay_wheel = True   # wheel scrolls this overlay
         try:
             while True:
                 top = max(0, min(sel - avail // 2, max(0, len(names) - avail)))
-                self._draw_list_overlay("LOAD PROFILE", labels, sel, top, avail)
+                self._draw_list_overlay("LOAD PROFILE", labels, sel, top, avail,
+                                        verb="load")
                 k = self._read_nav_key()
                 if k is None or k == "esc":
                     self.log_lines.append("[*] Load cancelled.")
                     return
+                if isinstance(k, str) and k.startswith("sel:"):
+                    # Mouse click on a row: first click selects, clicking the
+                    # already-selected row confirms (same as Enter).
+                    idx = int(k.split(":", 1)[1])
+                    if idx == sel:
+                        k = "enter"
+                    else:
+                        sel = max(0, min(idx, len(names) - 1))
+                        continue
                 if k == "enter":
                     break
                 if k == "up":
@@ -3302,6 +3378,7 @@ class BTopTui:
         finally:
             # Force the dashboard to fully repaint on the next frame (the overlay
             # cleared the screen, so a per-line diff would leave stale rows).
+            self._overlay_wheel = False
             self._last_frame = ""
             self._prev_lines = []
             self._full_repaint = True
@@ -3972,6 +4049,12 @@ class BTopTui:
         elif key == 's':
             if not self.proc or self.proc.poll() is not None:
                 self.launch()
+            else:
+                # Pressing [S] while the tunnel is up used to be a silent
+                # no-op - say why, and point at the key that DOES something.
+                self.log_lines.append(
+                    f"[*] Tunnel already {self.state} - nothing to start. "
+                    "Press [T] to stop it first.")
             return True
         elif key == 't':
             if self.proc and self.proc.poll() is None:
@@ -4484,7 +4567,7 @@ class BTopTui:
             pairs.append(("VPN", (GREEN if vpn_ok else YELLOW)
                                  + self._vpn_status + RESET))
 
-        L.append(_top("V2RAY TUN - NETWORK MONITOR"))
+        L.append(_top("TUNTOP  -  NETWORK MONITOR"))
         status_row = len(L)
         # Clickable [ RUNNING ]/[ STOPPED ] badge - toggles start/stop.
         # Content starts 2 columns in (border + one space); the badge is the
@@ -4494,6 +4577,14 @@ class BTopTui:
         sep = f"{GRAY} \u00b7 {RESET}"
         status_text = badge_disp + sep + sep.join(
             f"{GRAY}{k}{RESET} {v}" for k, v in pairs)
+        if not self._show_help:
+            # Help is hidden: the rest of the status bar becomes a click
+            # hotspot that re-shows the footer (the mouse path back - the
+            # badge hotspot is mapped FIRST, so it still wins its region),
+            # and the dim hint makes the affordance discoverable.
+            status_text += sep + (f"{DIM}help hidden - click here "
+                                  f"or press [H] to show it{RESET}")
+            self._click_map.append((status_row, 2 + len(badge), w, "h"))
         L.append(_row(status_text))
         self._click_map.append((status_row, 2, 2 + len(badge), "toggle"))
         L.append(_bot())
@@ -5247,7 +5338,7 @@ class BTopTui:
         if footer_h:
             _help_rows = [
                 [
-                    ('h', "[H] Hide help"), ('c', "[C] Scan"), ('s', "[S] Start"),
+                    ('h', "[H] Help: hide/show"), ('c', "[C] Scan"), ('s', "[S] Start"),
                     ('t', "[T] Stop"), ('q', "[Q] Quit"), ('l', "[L] Leak Test"),
                     ('d', "[D] Diagnostics"), ('m', "[M] Color"), ('g', "[G] Graph"),
                 ],
