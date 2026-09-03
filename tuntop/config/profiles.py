@@ -35,6 +35,7 @@ def snapshot_from_args(ns) -> dict:
         "server": list(getattr(ns, "server", []) or []),
         "port": getattr(ns, "port", 10808),
         "dns4": getattr(ns, "dns4", "8.8.8.8"),
+        "dns6": getattr(ns, "dns6", None),
         "endpoint_port": getattr(ns, "endpoint_port", 443),
         "bypass_ip": list(getattr(ns, "bypass_ip", []) or []),
         "vpn_bypass_ip": list(getattr(ns, "vpn_bypass_ip", []) or []),
@@ -89,7 +90,7 @@ def apply_to_args(ns, snap: dict, normalise_host=None) -> list:
     dashboard passes its _host_from_url so URLs/ports never sneak into a
     route. Returns the list of scalar attributes applied (for logging)."""
     applied = []
-    for attr in ("port", "dns4", "endpoint_port", "geoip",
+    for attr in ("port", "dns4", "dns6", "endpoint_port", "geoip",
                  "geoip_code", "geoip_target", "vpn_interface"):
         if attr in snap:
             setattr(ns, attr, snap[attr])

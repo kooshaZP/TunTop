@@ -16,6 +16,7 @@ import atexit
 import base64
 import concurrent.futures
 import ctypes
+import ipaddress
 import json
 import os
 import queue
@@ -64,6 +65,7 @@ from tuntop.netdns import (           # noqa: E402
     _dns_cache_clear, _dns_build_query, _dns_parse_answers,
     _dns_query_udp, _dns_query_doh,
 )
+from tuntop.config import defaults as _cfgdef   # noqa: E402
 from tuntop.state import (            # noqa: E402
     TunnelState, TunnelStateMachine,
 )
@@ -82,6 +84,11 @@ from tuntop.structured_log import (              # noqa: E402
 from tuntop.health_report import (              # noqa: E402
     format_panel as _health_format_panel,
     format_compact as _health_compact,
+)
+from tuntop.monitor.leak import (               # noqa: E402
+    run_leak_probe as _run_leak_probe,
+    as_check_result as _leak_as_check,
+    LEAK_TIMEOUT as _LEAK_TIMEOUT,
 )
 
 
@@ -858,6 +865,20 @@ def _ipv6_tun_verdict(port, url="https://www.cloudflare.com/cdn-cgi/trace"):
                    f"(curl -6 -> {code}); IPv6 tunnel is broken")
 
 
+def _leak_check(port, timeout=None):
+    """Health-check wrapper around the Monitor-layer leak probe.
+
+    Verdict mapping (see tuntop/monitor/leak.py):
+      ok           -> PASS (direct egress == tunnel exit: nothing escapes)
+      leak         -> FAIL (direct traffic escapes the TUN)
+      no-proxy     -> FAIL (the SOCKS inbound is down - tunnel not usable)
+      no-network   -> FAIL (neither leg answered)
+      inconclusive -> PASS with detail (tunnel leg proven, direct leg mute)
+    """
+    status, msg, _legs = _run_leak_probe(port, timeout=timeout or 4.0)
+    return _leak_as_check(status, msg)
+
+
 def _teardown_wintun():
     """Best-effort teardown of stale tunnel state: removes routes from BOTH
     tunnel adapters ('wintun' + optional 'wintun2' second pipe) and kills
@@ -1253,7 +1274,7 @@ def build_checks(ns):
     """Return list of (label, check_fn) - health-check suite."""
     p = ns.port
     servers = ns.server
-    dns = ns.dns4
+    dns = getattr(ns, "dns4", None) or _cfgdef.DNS4   # probe/display fallback
     ep = getattr(ns, "endpoint_port", 443)
 
     def q(label, code):
@@ -1363,6 +1384,11 @@ def build_checks(ns):
         q("Wintun traffic counters",
           "$s = Get-NetAdapterStatistics -Name wintun -ErrorAction SilentlyContinue; if ($s) {'RX ' + $s.ReceivedBytes + ', TX ' + $s.SentBytes} else {Write-Output 'wintun statistics unavailable'; exit 1}"),
         ("IPv4 HTTPS through SOCKS5", lambda: _https(True, False, p)),
+        # Monitor-layer leak proof (also run automatically by the helper's
+        # monitor loop): when the full tunnel is healthy, a DIRECT fetch
+        # traverses the TUN and exits at the SAME IP as the SOCKS-proxied
+        # fetch. A differing direct IP means traffic escapes the TUN.
+        ("Tunnel leak test (direct vs tunnel egress)", lambda: _leak_check(p)),
         q("v2rayN core process",
           "Get-Process -ErrorAction SilentlyContinue | ? {$_.ProcessName -match '^(xray|v2ray|sing-box|mihomo|clash)'} | select -First 1 | % {$_.ProcessName + ' PID ' + $_.Id}"),
     ]
@@ -1701,15 +1727,30 @@ class _GeoLogSink:
     def __init__(self, tui):
         self._tui = tui
         self._buf = ""
+        # THREAD-SCOPED: sys.stdout is a PROCESS-GLOBAL attribute. While the
+        # geo worker has this sink installed, the UI thread's own draw() /
+        # ANSI writes would also land here and be logged as garbage lines -
+        # flooding the event queue until the dashboard visually froze (the
+        # "geo -> proxy2 stops the UI" bug). Only writes from the thread that
+        # installed the sink are intercepted; every other thread passes
+        # through to the real stdout untouched.
+        self._owner = threading.get_ident()
+        self._real = sys.stdout
 
     def write(self, data):
+        if threading.get_ident() != self._owner:
+            return self._real.write(data)
         self._buf += (data or "")
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             self._tui._route_geo_helper_line(line)
+        return len(data or "")
 
     def flush(self):
-        pass
+        try:
+            self._real.flush()
+        except Exception:
+            pass
 
 
 class BTopTui:
@@ -1717,6 +1758,9 @@ class BTopTui:
     # chunks so quitting after a geoip load takes seconds, not tens of seconds.
     _SWEEP_CHUNK = 250
     _SWEEP_WORKERS = 6
+    # [net] connection-log rate limit: one line per remote "ip:port" per window
+    # (repeats inside the window are counted and summarized, not logged).
+    _NET_RATE_WINDOW = 60.0
 
     def __init__(self, args):
         self.ns = args
@@ -1913,6 +1957,12 @@ class BTopTui:
         # to the end so they survive), so the dedup actually holds.
         self._seen_conns = {}
         self._conn_poll_ts = 0
+        # Per-destination rate limit for [net] lines: an app that opens a new
+        # short-lived connection every couple of seconds (torrent/uTP, download
+        # managers, telemetry) used to put one log line per 5s poll into the
+        # event log and evict everything else (the "log full of TCP 192.168.
+        # 123.1:xxxxx -> 185.x.x.x:41144" flood). dest -> [last_log_ts, count].
+        self._net_rate = {}
 
         # Geo bypass load progress. Two phases feed it:
         #   * geo_parse  - the helper decoding the geoip file (fed by [GEO-PARSE]
@@ -1982,7 +2032,7 @@ class BTopTui:
         # Ping - every 3 s
         if now - self._ping_ts >= 2.5:
             self._ping_ts = now
-            ms = get_ping(self.ns.port, self.ns.dns4)
+            ms = get_ping(self.ns.port, self.ns.dns4 or _cfgdef.DNS4)
             if ms is not None:
                 with self._tel_lock:
                     self.ping_samples.append(round(ms))
@@ -2658,6 +2708,41 @@ class BTopTui:
         helper = importlib.import_module("tuntop.tunnel.helper")
         return helper.TUN2, helper.TUN2_IP4, helper.TUN2_IP6
 
+    def _protected_geo_prefixes(self):
+        """Every prefix geoip must never own (install OR remove).
+
+        Geoip country lists routinely contain the tunnel's own endpoints - the
+        VLESS server (hosted in the bypassed country, or on a CDN range the
+        file lists) and the Windows VPN server - and can even ship an exact
+        /32 equal to a bypass route.  Without protection, the geo install's
+        conflict sweep DELETES such a route (exact-prefix match) and re-adds
+        it pointing at the geo egress: the proxy transport loops into its own
+        tunnel (endless failing connects to the server IP - the "[U] changed
+        the server and it broke" bug), and a user bypass gets moved onto the
+        geo egress instead of the one its entry names.  Includes:
+          * every live-installed bypass/endpoint route (any target),
+          * the resolved --server endpoints (/32 + /128),
+          * every IP a bypass resolver currently has routed (direct, proxy2
+            and vpn stores)."""
+        prot = []
+
+        def _reg(prefix):
+            if prefix and prefix not in prot:
+                prot.append(prefix)
+
+        for _fam, dest, _if, _gw in (self._live_bypass_added or []):
+            _reg(dest)
+        for ip in (self.endpoint_v4 or []):
+            _reg(f"{ip}/32")
+        for ip in (self.endpoint_v6 or []):
+            _reg(f"{ip}/128")
+        for target in ("direct", "proxy2", "vpn"):
+            state, _cache = self._bypass_stores(target)
+            for st in (state or {}).values():
+                for ip in (st.get("ips") or []):
+                    _reg(f"{ip}/32" if ":" not in str(ip) else f"{ip}/128")
+        return prot
+
     def _install_bypass_routes(self, entry, ep4, ep6, log=True, target="direct"):
         """Install /32 + /128 routes for one entry. Returns the list of IPs
         that are now routed. Safe to call from any thread: it only shells out
@@ -2731,6 +2816,21 @@ class BTopTui:
                             (ip, ("v6", f"{ip}/128", v6iface, v6gateway)))
         if not planned:
             return []
+        # ── PRE-CLEAN (bypass egress must outrank geoip / stale routes) ──
+        # An exact-prefix route installed by an earlier actor - most commonly
+        # a geoip country CIDR identical to this entry's /32//128, or a stale
+        # bypass from a previous run on a different egress - would make the
+        # add below a silent no-op ("already exists" with the OLD egress still
+        # winning) or leave two same-prefix routes fighting over the traffic.
+        # The user (or the endpoint) explicitly chose THIS egress, so it must
+        # win: remove any same-prefix route first.  netsh delete needs the
+        # exact iface+next-hop, so use the robust prefix-wide deletes (they
+        # fall back to Remove-NetRoute, which ignores both).
+        for _ip, (fam_pc, dest_pc, _if_pc, _gw_pc) in planned:
+            if fam_pc == "v4":
+                _del_route_v4(dest_pc, "", "")
+            else:
+                _del_route_v6(dest_pc, "", "")
         # ── Apply (all-or-nothing) ──────────────────────────────────────
         txn = RouteTransaction(log=self._blog if log else None)
         for _ip, (fam, dest, iface, gw) in planned:
@@ -3190,11 +3290,15 @@ class BTopTui:
         is no guessing or spelling of long hostnames."""
         items = list(getattr(self.ns, "bypass_ip", []) or [])
         # Combined picker: direct entries first, then proxy2/vpn ones (tagged).
+        # proxy2 entries are ALWAYS listed (even when proxy2 is currently off)
+        # so leftovers can still be removed after [Z] -> OFF; the labels come
+        # from _bypass_labels() which lists every target unconditionally - the
+        # item/label indexes must stay 1:1 for the Enter-removes-what-is-
+        # highlighted contract to hold.
         targets = ["direct"] * len(items)
-        if getattr(self.ns, "proxy2_port", None):
-            p2 = list(getattr(self.ns, "proxy2_bypass_ip", []) or [])
-            items = items + p2
-            targets = targets + ["proxy2"] * len(p2)
+        p2 = list(getattr(self.ns, "proxy2_bypass_ip", []) or [])
+        items = items + p2
+        targets = targets + ["proxy2"] * len(p2)
         vp = list(getattr(self.ns, "vpn_bypass_ip", []) or [])
         items = items + vp
         targets = targets + ["vpn"] * len(vp)
@@ -3251,6 +3355,11 @@ class BTopTui:
         state, _cache = self._bypass_stores(target)
         if target == "proxy2":
             entries = list(getattr(self.ns, "proxy2_bypass_ip", []) or [])
+        elif target == "vpn":
+            # Read the VPN list - the old code fell through to bypass_ip here,
+            # which made vpn entries render as direct entries (and desynced the
+            # [X] picker's labels from its selectable items).
+            entries = list(getattr(self.ns, "vpn_bypass_ip", []) or [])
         else:
             entries = list(getattr(self.ns, "bypass_ip", []) or [])
         with self._bypass_res_lock:
@@ -3367,7 +3476,27 @@ class BTopTui:
         """Live server change: delete the old VLESS endpoints' /32-/128 host
         routes and install fresh ones for the new servers - all off the UI
         thread. Only a display/health refresh happens on the main thread."""
+        def _geo_covering_dest(ip):
+            """First live-installed geo prefix that contains `ip`, if any."""
+            try:
+                a = ipaddress.ip_address(ip)
+            except ValueError:
+                return None
+            for t in (self._live_geo_added or []):
+                try:
+                    net = ipaddress.ip_network(str(t[1]), strict=False)
+                except (ValueError, IndexError):
+                    continue
+                if a.version == net.version and a in net:
+                    return str(t[1])
+            return None
+
         def _worker():
+            # Re-detect the egress: a cached (interface, gateway) captured
+            # before a Wi-Fi/VPN change is a classic reason a fresh [U] route
+            # lands on the wrong interface and the new server is unreachable
+            # even though requests to it keep appearing in the log.
+            self._iface_cache = None
             gone = []
             for ip in old_ips:
                 ok = (_del_route_v4(f"{ip}/32", "", "") if ":" not in ip
@@ -3380,13 +3509,30 @@ class BTopTui:
                 v4, v6 = _resolve(srv)
                 if not v4 and not v6:
                     self._blog(f"[!] Could not resolve new server '{srv}' - "
-                               "its host route will be retried automatically.")
+                               "its host route will be retried automatically. "
+                               "NOTE: until it is installed, a geoip range "
+                               "covering the server's IP would loop its "
+                               "transport into the tunnel.")
                     continue
                 applied = self._install_bypass_routes(srv, v4, v6,
                                                       log=True, target="direct")
                 if applied:
                     self._blog(f"[+] Server '{srv}' now bypassed direct "
                                f"({', '.join(applied)}) - no TUN restart needed.")
+                    covered = sorted({_geo_covering_dest(ip) for ip in applied
+                                      if _geo_covering_dest(ip)})
+                    if covered:
+                        self._blog(
+                            "[i] geoip bypass covers " + ", ".join(covered) +
+                            " - this server's /32//128 host route outranks it, "
+                            "so the transport stays on the direct egress.")
+                else:
+                    self._blog(
+                        f"[!] Could not install the bypass route for '{srv}' - "
+                        "if a geoip bypass range covers its IP the transport "
+                        "will LOOP (every request to the server fails). Check "
+                        "the egress, then press [R] to re-apply or restart the "
+                        "tunnel.")
         threading.Thread(target=_worker, daemon=True).start()
 
     def _edit_geo(self):
@@ -3533,46 +3679,36 @@ class BTopTui:
 
     # ── Leak test ([L]) ─────────────────────────────────────────────────────
     # One-key proof of what the tunnel actually does: compares the DIRECT
-    # egress IP with the SOCKS-proxied egress IP and measures both latencies.
-    #   direct == proxied -> traffic LEAKS outside the tunnel
-    #   direct != proxied -> OK, the tunnel carries your traffic
+    # egress IP with the SOCKS-proxied (tunnel) egress IP and measures both
+    # latencies.  Verdict (fixed - the old logic had it backwards):
+    #   direct == tunnel exit -> NO LEAK: even "direct" traffic rides the TUN
+    #   direct != tunnel exit -> LEAK: direct traffic escapes via the NIC
+    # The same probe runs automatically in the helper's monitor loop every
+    # cycle ([MONITOR] leak check lines in this log).
 
     def _leak_test(self):
         port = getattr(self.ns, "port", 10808)
-
-        def _curl(args):
-            try:
-                p = subprocess.run(
-                    ["curl.exe", "-4", "--silent", "--max-time", "8"] + args,
-                    capture_output=True, text=True, timeout=12)
-                return p.stdout.strip()
-            except Exception:
-                return ""
+        if getattr(self, "_leak_running", False):
+            self._blog("[*] Leak test already running - one moment...")
+            return
+        self._leak_running = True
 
         def _worker():
-            self._blog("[*] Leak test running (direct vs proxied exit)...")
-            t0 = time.time()
-            direct = _curl(["https://api.ipify.org"])
-            t_direct = time.time() - t0
-            t0 = time.time()
-            proxied = _curl(["--socks5-hostname", f"127.0.0.1:{port}",
-                             "https://api.ipify.org"])
-            t_proxy = time.time() - t0
-            if not direct and not proxied:
-                self._blog("[!] Leak test failed: no network answer at all.")
-                return
-            if not proxied:
-                self._blog("[!] Leak test: the SOCKS proxy did not answer - "
-                           "is v2rayN running on port " + str(port) + "?")
-                return
-            if direct == proxied:
-                self._blog(f"[!] LEAK: direct and proxied exits are BOTH "
-                           f"{proxied} - your real IP leaves outside the TUN!")
-            else:
-                self._blog(f"[+] NO LEAK: direct exit {direct or '?'}, "
-                           f"tunnel exit {proxied}.")
-            self._blog(f"[*] Latency: direct {t_direct * 1000:.0f} ms, "
-                       f"via tunnel {t_proxy * 1000:.0f} ms.")
+            try:
+                self._blog("[*] Leak test running (direct vs tunnel egress)...")
+                status, msg, legs = _run_leak_probe(port, timeout=_LEAK_TIMEOUT)
+                d = (legs or {}).get("direct") or {}
+                t = (legs or {}).get("tunnel") or {}
+                self._blog("[*] Latency: direct "
+                           f"{d.get('ms', '?')} ms, via tunnel {t.get('ms', '?')} ms.")
+                prefix = {"leak": "[!]", "no-proxy": "[!]",
+                          "no-network": "[!]"}.get(status, "[+]"
+                                                   if status == "ok" else "[i]")
+                self._blog(f"{prefix} Leak test: {msg}")
+            except Exception as e:
+                self._blog(f"[!] Leak test crashed: {e.__class__.__name__}: {e}")
+            finally:
+                self._leak_running = False
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -3672,24 +3808,35 @@ class BTopTui:
             self.log_lines.append(f"[!] Could not write control file: {e}")
 
     def _change_dns(self, new_dns):
+        """[N] - change the DNS server(s) LIVE, no tunnel restart. Accepts an
+        IPv4 OR an IPv6 address: v4 updates ns.dns4, v6 updates ns.dns6 (the
+        dashboard used to have no way to change DNS6 at all, so it silently
+        stayed on the helper's Cloudflare default). Both values go into the
+        helper's control file, so a running helper rebinds and later
+        self-heals keep the NEW choice."""
         import ipaddress
         ip = new_dns.strip()
         try:
-            ipaddress.IPv4Address(ip)
-        except Exception:
-            self.log_lines.append(f"[!] Invalid IPv4 DNS address: {new_dns!r}")
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            self.log_lines.append(
+                f"[!] Invalid DNS address: {new_dns!r} "
+                "(an IPv4 like 8.8.8.8 or an IPv6 like 2001:4860:4860::8888)")
             return
-        old_dns = self.ns.dns4
+        is_v6 = addr.version == 6
+        attr = "dns6" if is_v6 else "dns4"
+        label = "DNS6" if is_v6 else "DNS4"
+        old_dns = getattr(self.ns, attr, None)
         if ip == old_dns:
-            self.log_lines.append(f"[i] Already using DNS4 {old_dns}.")
+            self.log_lines.append(f"[i] Already using {label} {old_dns}.")
             return
-        self.ns.dns4 = ip
+        setattr(self.ns, attr, ip)
         try:
             self.checks = build_checks(self.ns)
         except Exception as e:
             self.log_lines.append(f"[!] Health-check rebuild failed: {e}")
         self.log_lines.append(
-            f"[*] Changing DNS4 {old_dns} -> {ip} LIVE - no tunnel restart needed.")
+            f"[*] Changing {label} {old_dns} -> {ip} LIVE - no tunnel restart needed.")
         # 1) Tell the RUNNING helper via the control file: it rebinds its
         #    active DNS and re-applies the Wintun config, so a later self-heal
         #    keeps the NEW choice instead of reverting to the launch value.
@@ -3698,10 +3845,18 @@ class BTopTui:
         #    there within ~1 s; doing it now makes [N] instant).
         def _apply():
             try:
+                # Set the FULL chosen list (not just the new IP): a v4-only
+                # choice must remove the v6 resolver, and adding a v6 must
+                # not wipe the v4 one. The helper's poll_control_file
+                # re-applies the same list within ~1 s.
+                _servers = [s for s in (getattr(self.ns, "dns4", None),
+                                        getattr(self.ns, "dns6", None)) if s]
+                _lst = ",".join("'" + s + "'" for s in _servers)
                 _ps("Set-DnsClientServerAddress -InterfaceAlias 'wintun' "
-                    f"-ServerAddresses '{ip}' -ErrorAction SilentlyContinue; "
-                    "Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null")
-                self._blog(f"[+] Wintun DNS set to {ip} (live).")
+                    f"-ServerAddresses @({_lst}) -ErrorAction SilentlyContinue; "
+                    "Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null; "
+                    "ipconfig /flushdns | Out-Null")
+                self._blog(f"[+] Wintun {label} set to {ip} (live).")
             except Exception as e:
                 self._blog(f"[!] Live DNS apply failed ({e}) - the helper's "
                            "monitor loop will re-apply it within seconds.")
@@ -3730,6 +3885,63 @@ class BTopTui:
         self.log_lines.append(
             f"[+] Endpoint (VLESS server) port set to {new_port}; "
             "health check now targets this port.")
+
+    def _edit_proxies(self):
+        """[Z] - PROXY EDITOR: view and edit the IP:port of EVERY proxy
+        TunTop knows about, in one place - the primary local SOCKS5
+        (v2rayN/xray) and the second hop (proxy2) - plus the upstream
+        servers each proxy connects to."""
+        while True:
+            p2 = getattr(self.ns, "proxy2_port", None)
+            p2srv = (", ".join(getattr(self.ns, "proxy2_server", []) or [])
+                     or "(none)")
+            val = self._read_line(
+                "Which proxy to edit? (1-4, Enter = done):",
+                title="PROXY EDITOR",
+                examples=[
+                    f"1 = PRIMARY port    : 127.0.0.1:{self.ns.port} socks5",
+                    f"2 = PRIMARY servers : {', '.join(self.ns.server)}"
+                    f"   endpoint TCP/{getattr(self.ns, 'endpoint_port', 443)}",
+                    "3 = proxy2 port     : "
+                    + (f"127.0.0.1:{p2} socks5" if p2 else "OFF"),
+                    f"4 = proxy2 servers  : {p2srv}",
+                    "Enter = done",
+                ])
+            if not val:
+                return
+            v = val.strip()
+            if v == "1":
+                port = self._read_line(
+                    f"New primary SOCKS5 port (current {self.ns.port}):",
+                    title="PRIMARY PROXY PORT",
+                    examples=["v2rayN/xray inbound SOCKS port, e.g. 10808",
+                              "tun2socks restarts (brief traffic drop)"])
+                if port:
+                    self._change_port(port)
+            elif v == "2":
+                self._edit_servers()
+            elif v == "3":
+                self._edit_proxy2()
+                # proxy2 may have just been enabled: refresh the loop so the
+                # menu shows the new state.
+            elif v == "4":
+                srv = self._read_line(
+                    "proxy2's upstream server(s) (comma/space separated, "
+                    "empty = none):",
+                    title="PROXY2 SERVERS",
+                    examples=[f"current: {p2srv}",
+                              "IP/hostname(s) of the 2nd proxy's server",
+                              "kept direct so the second hop can connect"])
+                if srv is None:
+                    continue
+                hosts = self._set_proxy2_servers(srv)
+                self.log_lines.append(
+                    "[*] proxy2 upstream servers set to: "
+                    + (", ".join(hosts) or "(none)") + ".")
+                self._apply_launch_change("proxy2 servers changed")
+            else:
+                self.log_lines.append(
+                    f"[!] Unknown choice {val!r} - pick 1-4 (Enter = done).")
 
     def _edit_proxy2(self):
         """[Z] - add / change / remove the SECOND proxy (proxy2) while the app
@@ -3764,6 +3976,22 @@ class BTopTui:
                           "empty = cancel"])
             self._proxy2_set_port(val)
 
+    def _set_proxy2_servers(self, srv):
+        """Parse + store proxy2's upstream server list from a free-text line.
+        Returns the parsed host list (empty = none)."""
+        hosts = []
+        if srv:
+            for part in re.split(r"[,\s]+", srv.strip()):
+                h = _host_from_url(part)
+                if h and h not in hosts:
+                    hosts.append(h)
+        self.ns.proxy2_server = hosts
+        try:
+            self.checks = build_checks(self.ns)
+        except Exception as e:
+            self.log_lines.append(f"[!] Health-check rebuild failed: {e}")
+        return hosts
+
     def _proxy2_set_port(self, val):
         try:
             port = int(val)
@@ -3779,17 +4007,7 @@ class BTopTui:
             title="PROXY2 SERVERS",
             examples=["IP/hostname(s) of the 2nd proxy's server",
                       "kept direct so the second hop can connect"])
-        hosts = []
-        if srv:
-            for part in re.split(r"[,\s]+", srv.strip()):
-                h = _host_from_url(part)
-                if h and h not in hosts:
-                    hosts.append(h)
-        self.ns.proxy2_server = hosts
-        try:
-            self.checks = build_checks(self.ns)
-        except Exception as e:
-            self.log_lines.append(f"[!] Health-check rebuild failed: {e}")
+        hosts = self._set_proxy2_servers(srv)
         self.log_lines.append(
             f"[*] proxy2 set to 127.0.0.1:{port}"
             + (f" (upstream: {', '.join(hosts)})" if hosts else "")
@@ -3877,16 +4095,24 @@ class BTopTui:
         # Egress target changed live? Remove the routes that still point at
         # the OLD egress first, so no country CIDR ends up with two routes
         # (one via the old egress, one via the new).
-        if (self._live_geo_added and self._geo_applied_target
-                and self._geo_applied_target != target):
+        #
+        # REMOVE-BEFORE-INSTALL, batched and CIDR-based: we sweep EVERY live
+        # route whose prefix belongs to this country (on ANY interface -
+        # physical NIC, wintun2, Windows VPN, ...) before installing the new
+        # egress. The old code only removed routes it had itself tracked in
+        # _live_geo_added, one PowerShell call per route, and only when the
+        # target had changed - so helper-installed routes from an earlier run
+        # stayed behind, every re-apply re-added the full set, and the
+        # "thousands of already-exists errors / geo upload takes forever"
+        # mess followed. One route-table dump + parallel netsh -f batches is
+        # seconds even for a full country.
+        if self._live_geo_added and self._geo_applied_target \
+                and self._geo_applied_target != target:
             self._blog(f"[*] Geo egress changed {self._geo_applied_target} -> "
                        f"{target}; removing the old country routes first...")
-            for fam, dest, iface, gw in list(self._live_geo_added):
-                if fam == "v4":
-                    _del_route_v4(dest, iface, gw)
-                else:
-                    _del_route_v6(dest, iface, gw)
-            self._live_geo_added = []
+        self._remove_geo_routes_for(cidrs)
+        self._live_geo_added = []
+        self._geo_applied_target = None
         if target == "proxy2":
             # Route the country ranges through the SECOND proxy hop (wintun2),
             # exactly how proxy2-tagged bypass entries are routed.
@@ -3950,16 +4176,46 @@ class BTopTui:
         # [S] subprocess reader: [GEO-...] markers feed the live progress panel,
         # repeated geoip diagnostics are deduplicated, and everything else is
         # surfaced to the event log via _blog (the thread-safe queue).
+        # The redirect is restored in a FINALLY - an install crash must never
+        # leave sys.stdout pointing at the sink (that would blind the UI).
+        # Endpoints + user bypass entries OUTRANK the country ranges: geoip
+        # can contain the VLESS/VPN server's own IP (even an exact /32 equal
+        # to its host route), and without this the geo pass would delete and
+        # re-point such a route at the geo egress - the transport then loops
+        # into its own tunnel ("changed the server with [U] and it broke").
+        protected = self._protected_geo_prefixes()
+        # Host routes this dashboard installed live (/32//128 only): re-install
+        # them AFTER the geo pass so every endpoint/bypass route is provably
+        # back on its own egress, whatever the geo sweep did to the table.
+        reassert = [(fam, dest, iface, gw)
+                    for fam, dest, iface, gw in (self._live_bypass_added or [])
+                    if iface and gw is not None
+                    and str(dest).endswith(("/32", "/128"))]
+        # --server endpoints installed by the HELPER subprocess at startup are
+        # not tracked in _live_bypass_added; re-assert them with the same
+        # egress selection the dashboard uses for live bypass adds.
+        _eg4 = self._get_vless_iface_gateway()
+        if _eg4:
+            for _ip in (self.endpoint_v4 or []):
+                reassert.append(("v4", f"{_ip}/32", _eg4[0], _eg4[1]))
+        _eg6 = self._get_vless_iface_gateway_v6()
+        if _eg6:
+            for _ip in (self.endpoint_v6 or []):
+                reassert.append(("v6", f"{_ip}/128", _eg6[0], _eg6[1]))
         before = len(helper.geoip_added)
         _old_stdout = sys.stdout
         sys.stdout = _GeoLogSink(self)
+        _apply_err = None
         try:
-            helper.add_geoip_bypass(code, cidrs, g_iface, g_gw, v6iface, v6gw)
+            helper.add_geoip_bypass(code, cidrs, g_iface, g_gw, v6iface, v6gw,
+                                    protected=protected, reassert=reassert)
         except Exception as e:
+            _apply_err = e
+        finally:
             sys.stdout = _old_stdout
-            self._blog(f"[!] geoip live apply failed: {e}")
+        if _apply_err is not None:
+            self._blog(f"[!] geoip live apply failed: {_apply_err}")
             return
-        sys.stdout = _old_stdout
         # The "[*] Installing geoip:code bypass (...)" and any deduplicated
         # geoip diagnostics were already routed through the sink; here we just
         # account for the routes we installed live. Dedup against what we already
@@ -4012,8 +4268,31 @@ class BTopTui:
                 excess = len(self._seen_conns) - 300
                 for _ in range(excess):
                     self._seen_conns.pop(next(iter(self._seen_conns)))
-            self._blog(
-                f"[net] {r.get('Proc')} (PID {r.get('Pid')}) -> {r.get('Remote')}:{r.get('Port')}")
+            # Per-DESTINATION rate limit: log the first connection to a given
+            # remote:port, then stay quiet for a window while the app keeps
+            # opening more of them; the next allowed line carries a "+N similar
+            # suppressed" summary instead of N separate lines. This keeps the
+            # event log readable when a single app (torrent client, downloader,
+            # telemetry) opens dozens of connections per minute through the TUN.
+            dest = f"{r.get('Remote')}:{r.get('Port')}"
+            st = self._net_rate.get(dest)
+            if st is not None and now - st[0] < self._NET_RATE_WINDOW:
+                st[1] += 1
+                continue
+            msg = (f"[net] {r.get('Proc')} (PID {r.get('Pid')}) "
+                   f"-> {r.get('Remote')}:{r.get('Port')}")
+            if st is not None and st[1]:
+                msg += (f"  (+{st[1]} similar suppressed in the last "
+                        f"{self._NET_RATE_WINDOW:.0f}s)")
+            self._blog(msg)
+            self._net_rate[dest] = [now, 0]
+            # Keep the rate-limit map bounded: drop destinations we have not
+            # logged (or suppressed) for a full window.
+            if len(self._net_rate) > 300:
+                cutoff = now - self._NET_RATE_WINDOW
+                for d in [d for d, s in self._net_rate.items()
+                          if s[0] < cutoff]:
+                    self._net_rate.pop(d, None)
 
     def _handle_key(self, key):
         """Handle one logical key press, from either the keyboard or a mouse
@@ -4050,8 +4329,17 @@ class BTopTui:
             return True
         elif key == 't':
             if self.proc and self.proc.poll() is None:
+                if self.tunnel.current is TunnelState.STOPPING:
+                    self.log_lines.append("[*] Stop already in progress - "
+                                          "wait for the tunnel to go STOPPED.")
+                    return True
                 self.log_lines.append("[*] Stopping tunnel (press [S] to restart)...")
-                self.stop()
+                # Teardown runs OFF the UI thread: stop() waits out the helper
+                # (up to ~13s) then sweeps routes / tears down Wintun via
+                # batched PowerShell - doing that inline froze the dashboard
+                # for tens of seconds after every [T] ("program becomes
+                # unresponsive after stop").
+                threading.Thread(target=self._stop_async, daemon=True).start()
             return True
         elif key == 'v':
             self._toggle_vless_over_vpn()
@@ -4066,7 +4354,7 @@ class BTopTui:
             self._edit_geo()
             return True
         elif key == 'z':
-            self._edit_proxy2()
+            self._edit_proxies()
             return True
         elif key == 'o':
             self._save_profile()
@@ -4116,39 +4404,52 @@ class BTopTui:
             self._hscroll = max(0, self._hscroll + (step if key == 'right' else -step))
             return True
         elif key == 'a':
-            # Target choice: direct by default (existing muscle memory - just
-            # press Enter and type a host); pick proxy2 only when the second
+            # STEP 1: paste the IP/hostname FIRST. STEP 2: pick the route.
+            # (Users paste, then confirm - the old order asked for the route
+            # before there was anything to route, which read backwards.)
+            val = self._read_line(
+                "IP, hostname or URL to bypass:",
+                title="ADD BYPASS  -  STEP 1: HOST / IP",
+                examples=["https://whatismyip.com/   (a full URL is fine)",
+                          "example.com   or   sub.example.com:443",
+                          "1.2.3.4   or   2606:4700::1111",
+                          "Esc = cancel"])
+            if not val:
+                self.log_lines.append("[*] Add bypass cancelled.")
+                return True
+            # STEP 2: target choice - direct by default (existing muscle
+            # memory - just press Enter); pick proxy2 only when the second
             # pipe is actually configured.
             target = "direct"
             examples = ["Enter -> direct (bypass the TUN entirely)",
                         "2     -> through the second proxy (if configured)",
-                        "3     -> out through a connected Windows VPN"]
+                        "3     -> out through a connected Windows VPN",
+                        "Esc   -> cancel"]
+            entry = _host_from_url(val) or val
             if getattr(self.ns, "proxy2_port", None):
                 t = self._read_line(
-                    "Route via: [Enter]=direct, 2=proxy2 "
+                    f"Route '{entry}' via: [Enter]=direct, 2=proxy2 "
                     f"(127.0.0.1:{self.ns.proxy2_port}), 3=vpn:",
-                    title="ADD BYPASS  -  CHOOSE TARGET",
+                    title="ADD BYPASS  -  STEP 2: ROUTE",
                     examples=examples)
-                if t and t.strip() == "2":
+                if t is None:
+                    self.log_lines.append("[*] Add bypass cancelled.")
+                    return True
+                if t.strip() == "2":
                     target = "proxy2"
-                elif t and t.strip() == "3":
+                elif t.strip() == "3":
                     target = "vpn"
             else:
                 t = self._read_line(
-                    "Route via: [Enter]=direct, 3=vpn (Windows VPN):",
-                    title="ADD BYPASS  -  CHOOSE TARGET",
+                    f"Route '{entry}' via: [Enter]=direct, 3=vpn (Windows VPN):",
+                    title="ADD BYPASS  -  STEP 2: ROUTE",
                     examples=examples)
-                if t and t.strip() == "3":
+                if t is None:
+                    self.log_lines.append("[*] Add bypass cancelled.")
+                    return True
+                if t.strip() == "3":
                     target = "vpn"
-            val = self._read_line(
-                "IP, hostname or URL to route via "
-                f"{target.upper() if target == 'proxy2' else 'DIRECT (not through the TUN)'}:",
-                title="ADD BYPASS  -  INSTANT, NO RESTART",
-                examples=["https://whatismyip.com/   (a full URL is fine)",
-                          "example.com   or   sub.example.com:443",
-                          "1.2.3.4   or   2606:4700::1111"])
-            if val:
-                self._add_bypass_ip(val, target=target)
+            self._add_bypass_ip(val, target=target)
             return True
         elif key == 'x':
             self._select_bypass()
@@ -4170,7 +4471,11 @@ class BTopTui:
                 self._change_port(val)
             return True
         elif key == 'n':
-            val = self._read_line(f"New DNS4 server (current {self.ns.dns4}):")
+            _cur4 = getattr(self.ns, "dns4", None) or (_cfgdef.DNS4 + " (default)")
+            _cur6 = getattr(self.ns, "dns6", None) or "(not set)"
+            val = self._read_line(
+                f"New DNS server, IPv4 or IPv6 "
+                f"(current DNS4 {_cur4}, DNS6 {_cur6}):")
             if val:
                 self._change_dns(val)
             return True
@@ -4234,15 +4539,26 @@ class BTopTui:
         self.results = []
 
         def _work():
-            for i, (name, fn) in enumerate(self.checks, 1):
-                try:
-                    ok, detail = fn()
-                    detail = str(detail).replace("\n", " ")[:80]
-                    self.results.append((i, name, bool(ok), detail))
-                except Exception as e:
-                    self.results.append((i, name, False, str(e)[:80]))
-            self.checking = False
-            self.last_checked = time.strftime("%H:%M:%S")
+            # Collect locally and PUBLISH by rebinding (never append to the
+            # shared list): draw() iterates self.results on the UI thread
+            # while this worker appends. The old in-place appends raced the
+            # iterator and aborted draw() mid-frame with "list changed size
+            # during iteration" - a frozen dashboard (event log included)
+            # until the identical draw error was re-logged, which looked
+            # exactly like "the log has a delay".
+            results = []
+            try:
+                for i, (name, fn) in enumerate(self.checks, 1):
+                    try:
+                        ok, detail = fn()
+                        detail = str(detail).replace("\n", " ")[:80]
+                        results.append((i, name, bool(ok), detail))
+                    except Exception as e:
+                        results.append((i, name, False, str(e)[:80]))
+                    self.results = list(results)   # atomic publish per check
+            finally:
+                self.checking = False
+                self.last_checked = time.strftime("%H:%M:%S")
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -4267,6 +4583,10 @@ class BTopTui:
         _geo_lock - draw() snapshots these same dicts under that lock, which is
         what eliminates the "dictionary changed size during iteration" race."""
         with self._geo_lock:
+            # Watchdog heartbeat: any geo marker proves the helper is alive
+            # and (slowly) working through the geo install - see the startup
+            # watchdog's geo-aware grace below.
+            self._geo_last_marker_ts = time.time()
             m = re.match(r'^\[GEO-PARSE\]\s+code=(\S+)\s+loaded=(\d+)\s+total=(\d+)', line)
             if m:
                 code = m.group(1)
@@ -4603,7 +4923,18 @@ class BTopTui:
             tun.append(_kv("RESOLVED", f"{GRAY}-{RESET}"))
         tun.append(_kv("PROXY", f"{CYAN}127.0.0.1:{self.ns.port}{RESET}"
                                 f"{GRAY} socks5{RESET}"))
-        tun.append(_kv("DNS", f"{CYAN}{self.ns.dns4}{RESET}"
+        _d4 = getattr(self.ns, "dns4", None)
+        _d6 = getattr(self.ns, "dns6", None)
+        if _d4 and _d6:
+            _dns_txt = f"{CYAN}{_d4}{RESET}{GRAY} / {RESET}{CYAN}{_d6}{RESET}"
+        elif _d4:
+            _dns_txt = f"{CYAN}{_d4}{RESET}{GRAY} (v4 only){RESET}"
+        elif _d6:
+            _dns_txt = f"{GRAY}(default {_cfgdef.DNS4}){RESET} / {CYAN}{_d6}{RESET}"
+        else:
+            _dns_txt = (f"{CYAN}{_cfgdef.DNS4} / {_cfgdef.DNS6}{RESET}"
+                        f"{GRAY} (defaults){RESET}")
+        tun.append(_kv("DNS", f"{_dns_txt}"
                               f"{GRAY} · endpoint TCP/{getattr(self.ns, 'endpoint_port', 443)}{RESET}"))
         tun.append(_kv("EDIT", f"{GREEN}[A]{RESET} add "
                                f"{GREEN}[X]{RESET} remove "
@@ -4643,7 +4974,12 @@ class BTopTui:
             bl.append(" " + DOT_IDLE + " " +
                       _kv("GEO", f"{GRAY}none configured{RESET}"))
 
-        extras = self._bypass_resolved_list()
+        # ALL bypass targets - direct, proxy2 and vpn - so the second proxy's
+        # entries are visible in the panel (they used to silently disappear
+        # unless they happened to be in the direct list).
+        extras = (self._bypass_resolved_list("direct")
+                  + self._bypass_resolved_list("proxy2")
+                  + self._bypass_resolved_list("vpn"))
         rule = BOX_MID * 3
         bl.append(f" {GRAY}{rule} added live {rule}"
                   f"{RESET} {GRAY}([A]/[X]){RESET}")
@@ -5272,7 +5608,7 @@ class BTopTui:
                 [
                     ('a', "[A] +Bypass (instant)"), ('x', "[X] -Bypass (instant)"),
                     ('b', "[B] Bypass List"),
-                    ('r', "[R] Re-apply Geo"), ('z', "[Z] Proxy2"), ('p', "[P] Port"), ('n', "[N] DNS"),
+                    ('r', "[R] Re-apply Geo"), ('z', "[Z] Proxies"), ('p', "[P] Port"), ('n', "[N] DNS"),
                     ('e', "[E] Endpoint"),
                 ],
                 [
@@ -5433,6 +5769,12 @@ class BTopTui:
                 while time.time() < deadline and not redraw_now:
                     key = self._next_key()
                     if key is None:
+                        # A background thread queued a new log line? Wake up
+                        # immediately instead of waiting out the rest of the
+                        # frame, so the event log never lags more than a few
+                        # milliseconds behind what happened.
+                        if not self.logs.empty():
+                            break
                         time.sleep(0.005)
                         continue
                     redraw_now = self._handle_key(key)
@@ -5463,7 +5805,16 @@ class BTopTui:
         # ui module, not alongside dashboard.py.
         cmd = [_sys.executable, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tunnel", "helper.py"),
                "--server", *self.ns.server, "--port", str(self.ns.port),
-               "--tun2socks", self.ns.tun2socks, "--dns4", self.ns.dns4]
+               "--tun2socks", self.ns.tun2socks]
+        # DNS selection: pass ONLY what the user actually chose. Nothing
+        # chosen -> the helper applies both of its defaults (v4 + v6); a
+        # v4-only choice -> the helper sets IPv4 DNS only, without injecting
+        # its default v6 resolver (and vice versa).
+        if self.ns.dns4:
+            cmd += ["--dns4", self.ns.dns4]
+        _dns6 = getattr(self.ns, "dns6", None)
+        if _dns6:
+            cmd += ["--dns6", _dns6]
         if getattr(self.ns, "no_vpn_bypass", False):
             cmd.append("--no-vpn-bypass")
         if getattr(self.ns, "vless_over_vpn", False):
@@ -5523,7 +5874,8 @@ class BTopTui:
                                        f"helper launched (PID {self.proc.pid})")
             self.logs.put(f"[+] Helper launched (PID {self.proc.pid}) - "
                           f"bringing up the Wintun adapter, routes follow...")
-            self.logs.put(f"[dns] configured resolver: {self.ns.dns4}")
+            self.logs.put(f"[dns] configured resolver: "
+                          f"{self.ns.dns4 or _cfgdef.DNS4 + ' (default)'}")
             # Fresh tunnel: fresh dedup for [net] lines (ordered dict; see
             # _poll_connections for why a set is no longer used).
             self._seen_conns = {}
@@ -5537,6 +5889,7 @@ class BTopTui:
                 self._geo_disp_loaded = 0.0
                 self._geo_load_started_ts = None  # re-time this run's geo load
             self._geo_done_announced = False     # re-announce geo load per start
+            self._geo_last_marker_ts = 0.0       # fresh geo heartbeat per start
             # Startup watchdog: if the helper doesn't emit "[+] TUNNEL ACTIVE"
             # within STARTUP_TIMEOUT seconds it's almost certainly hung on a
             # PowerShell/netsh call.  Kill it and report FAILED instead of
@@ -5559,6 +5912,16 @@ class BTopTui:
                             self._geo_done_announced = True
                             self.logs.put("[+] Geo bypass loaded - country routes installed.")
                         continue
+                    # Geo SETUP lines ("loading geo bypass ranges", "Installing
+                    # geoip:ir bypass ...") are emitted BEFORE the first
+                    # [GEO-PARSE]/[GEO-LOAD] marker and the pre-install passes
+                    # between them (metric fix, conflict sweep) can take a
+                    # while - feed the startup watchdog's geo-aware grace here
+                    # too, or a legitimate slow install is killed as "hung".
+                    if (s.startswith("[*] Loading geo bypass ranges")
+                            or s.startswith("[*] Installing geoip")):
+                        with self._geo_lock:
+                            self._geo_last_marker_ts = time.time()
                     # The helper's geoip diagnostics (the "skipped N non-routable"
                     # note and its siblings) are otherwise emitted on every tunnel
                     # restart; deduplicate them to ONE event-log line per session.
@@ -5625,6 +5988,26 @@ class BTopTui:
                         self.tunnel.try_transition(
                             TunnelState.RUNNING, "monitor probe OK")
                         continue
+                    if s.startswith("[MONITOR] leak check OK") and \
+                            self.tunnel.current is TunnelState.DEGRADED:
+                        # The leak probe only runs after the regular probe
+                        # passed, so a passing leak check re-proves that ALL
+                        # egress (direct traffic included) rides the TUN -
+                        # it can safely clear a leak-caused DEGRADED state.
+                        self.tunnel.try_transition(
+                            TunnelState.RUNNING,
+                            "leak check OK - all egress via the tunnel")
+                        # fall through: still log the line (it is printed
+                        # only when the leak verdict CHANGES, never as spam)
+                    if s.startswith("[MONITOR] LEAK DETECTED"):
+                        # Direct egress != tunnel exit: traffic is escaping
+                        # the TUN. Mark DEGRADED so the UI shows it instead
+                        # of a green RUNNING badge, then log the details.
+                        self.tunnel.try_transition(
+                            TunnelState.DEGRADED,
+                            s.split(": ", 1)[-1].strip()
+                            or "traffic leaks outside the TUN")
+                        # fall through: the line itself is logged below
                     self.logs.put(s)
                 # Helper stdout closed: the process has exited (clean stop,
                 # crash or external kill). Drive the machine down so neither
@@ -5648,6 +6031,16 @@ class BTopTui:
                         return  # moved past STARTING - all good
                     elapsed = time.time() - self._start_ts
                     if elapsed > self._start_timeout:
+                        # GEO-AWARE GRACE: while [GEO-PARSE]/[GEO-LOAD] markers
+                        # keep arriving the helper is NOT hung - it is installing
+                        # thousands of country routes, which can legitimately
+                        # outlast the plain startup timeout. Each fresh marker
+                        # buys another 30s window; only true silence kills.
+                        geo_beat = getattr(self, "_geo_last_marker_ts", 0.0)
+                        if time.time() - geo_beat < 45:
+                            self._start_ts = (time.time()
+                                              - self._start_timeout + 30)
+                            continue
                         self.logs.put(
                             f"[!] Helper hung for {elapsed:.0f}s without "
                             f"completing startup (no '[+] TUNNEL ACTIVE' "
@@ -5717,19 +6110,33 @@ class BTopTui:
         bypass ranges (self._live_geo_added) and the [A]-added bypass-IP routes
         (self._live_bypass_added). The helper child cleans up its own startup
         routes on exit; this clears what the dashboard added on top, so nothing
-        lingers after the tunnel is turned off. Safe to call repeatedly."""
-        for fam, dest, iface, gw in self._live_geo_added:
-            if fam == "v4":
-                _del_route_v4(dest, iface, gw)
-            else:
-                _del_route_v6(dest, iface, gw)
+        lingers after the tunnel is turned off. Safe to call repeatedly.
+
+        Routes are deleted in BATCHED netsh -f scripts (see
+        _batch_delete_routes) - the old one-PowerShell-call-per-route loop
+        made quitting after a geo re-apply take many minutes, which is exactly
+        what the [X]-close/accidental-exit path hit too."""
+        rows = []
+        for lst in (self._live_geo_added, self._live_bypass_added):
+            for _fam, dest, iface, gw in lst:
+                nh = gw if gw and gw not in ("0.0.0.0", "::") else ""
+                rows.append((dest, iface, nh))
         self._live_geo_added = []
-        for fam, dest, iface, gw in self._live_bypass_added:
-            if fam == "v4":
-                _del_route_v4(dest, iface, gw)
-            else:
-                _del_route_v6(dest, iface, gw)
         self._live_bypass_added = []
+        if rows:
+            try:
+                self._batch_delete_routes(rows)
+            except Exception:
+                # Fall back to the per-route path if the batch machinery is
+                # unavailable for any reason.
+                for dest, iface, nh in rows:
+                    try:
+                        if ":" in dest:
+                            _del_route_v6(dest, iface, nh)
+                        else:
+                            _del_route_v4(dest, iface, nh)
+                    except Exception:
+                        pass
 
     def _dump_route_table(self):
         """One-shot dump of the live routing table as dicts
@@ -5808,7 +6215,20 @@ class BTopTui:
             leftovers.append((dp, alias, nh))
         if not leftovers:
             return 0
-        removed = 0
+        self._batch_delete_routes(leftovers, progress=progress)
+        return len(leftovers)
+
+    def _batch_delete_routes(self, leftovers, progress=None):
+        """Delete route tuples [(dest_prefix, iface_alias, next_hop), ...] in
+        CONCURRENT netsh -f batches - the SAME fast path the installer uses.
+        The old cleanup deleted one route per PowerShell call (~50-100ms each,
+        sequential): quitting after a geo re-apply of a few thousand routes
+        took many minutes. Batched scripts run hundreds of deletes per netsh
+        process, in parallel, finishing in seconds. Disjoint prefixes cannot
+        collide, and each script runs from a temp file (no command-line
+        length limit)."""
+        if not leftovers:
+            return 0
         # Concurrent netsh -f batches - the SAME fast path the installer uses.
         # The old Remove-NetRoute-per-prefix scripts cost ~50-100ms per route
         # (minutes for a few thousand leftovers even in parallel); plain
@@ -5865,6 +6285,31 @@ class BTopTui:
             for _f in concurrent.futures.as_completed(futs):
                 pass
         return len(leftovers)
+
+    def _remove_geo_routes_for(self, cidrs):
+        """Batch-remove every live route whose DestinationPrefix is in `cidrs`
+        (a geoip country's CIDR set), on ANY interface. Used before a live geo
+        re-apply (remove-before-install) and reusable anywhere else. Never
+        raises; returns how many matching routes were found."""
+        if not cidrs:
+            return 0
+        try:
+            rows = []
+            for r in self._dump_route_table():
+                dp = str(r.get("DestinationPrefix")).replace("'", "")
+                if dp not in cidrs:
+                    continue
+                alias = str(r.get("InterfaceAlias", "") or "").replace("'", "")
+                nh = str(r.get("NextHop", "") or "").replace("'", "")
+                if nh in ("0.0.0.0", "::"):
+                    nh = ""
+                rows.append((dp, alias, nh))
+            if rows:
+                self._batch_delete_routes(rows)
+            return len(rows)
+        except Exception as e:
+            self._blog(f"[!] Could not pre-clean old geo routes: {e}")
+            return 0
 
     def _exit_route_sweep(self):
         """Run all last-resort sweeps idempotently; never raises."""
@@ -6045,18 +6490,28 @@ class BTopTui:
         # Ordered, weighted cleanup tasks. Each becomes a CHECKLIST row in the
         # redesigned shutdown panel: ✔ done / ▸ running / ◦ pending, plus a
         # cyan->mint gradient bar and a step counter.
+        #
+        # NOTE: live routes are removed in ONE batched task per list (netsh -f
+        # chunks) - the old loop created one checklist task PER ROUTE and ran
+        # them sequentially (~50-100ms each), so quitting after a geo re-apply
+        # of a few thousand routes took many minutes. Batched, it is seconds.
         tasks = []
         if self.proc is not None and self.proc.poll() is None:
             tasks.append(("Stopping tunnel helper (clears its own routes)",
                           self._shutdown_stop_helper))
-        for fam, dest, iface, gw in list(self._live_geo_added):
-            tasks.append((f"Removing geo route {dest}",
-                          lambda f=fam, d=dest, i=iface, g=gw:
-                              self._shutdown_del_route(f, d, i, g)))
-        for fam, dest, iface, gw in list(self._live_bypass_added):
-            tasks.append((f"Removing bypass route {dest}",
-                          lambda f=fam, d=dest, i=iface, g=gw:
-                              self._shutdown_del_route(f, d, i, g)))
+        for label, lst in (("Removing live geo routes (batched)",
+                            self._live_geo_added),
+                           ("Removing live bypass routes (batched)",
+                            self._live_bypass_added)):
+            if not lst:
+                continue
+            rows = []
+            for _fam, dest, iface, gw in list(lst):
+                nh = gw if gw and gw not in ("0.0.0.0", "::") else ""
+                rows.append((dest, iface, nh))
+            del lst[:]
+            tasks.append((label,
+                          lambda r=rows: self._batch_delete_routes(r)))
         tasks.append(("Tearing down wintun routes + tun2socks",
                       self._shutdown_teardown_wintun))
         tasks.append(("Sweeping leftover geoip country routes",
@@ -6203,6 +6658,18 @@ class BTopTui:
         sys.stdout.write("\033[2J\033[H" + "\n".join(lines) + "\n")
         sys.stdout.flush()
 
+    def _stop_async(self):
+        """[T] teardown on a worker thread (see the key handler). Runs the
+        same stop() the internal callers use, but never touches the UI thread,
+        so the dashboard keeps redrawing while routes are swept."""
+        try:
+            self.stop()
+        except Exception as e:
+            self._blog(f"[!] Stop failed: {e.__class__.__name__}: {e}")
+        else:
+            self._blog("[+] Tunnel stopped - traffic now leaves via the "
+                       "physical NIC until you press [S] again.")
+
     def stop(self):
         # The [Q] path runs the full route-clearing sequence itself (with a
         # progress bar) and sets `_cleanup_done`; don't repeat that work here.
@@ -6310,7 +6777,14 @@ def main():
                     help="IP/hostname to route through the SECOND proxy (repeatable)")
     ap.add_argument("--vpn-interface", default=None)
     ap.add_argument("--endpoint-port", type=int, default=443)
-    ap.add_argument("--dns4", default="8.8.8.8")
+    ap.add_argument("--dns4", default=None, metavar="IP",
+                    help="User-chosen IPv4 DNS server. When neither --dns4 nor "
+                         "--dns6 is given, the helper applies both of its defaults "
+                         "(8.8.8.8 + 2606:4700:4700::1111); a v4-only choice sets "
+                         "IPv4 DNS only (no default v6 injected)")
+    ap.add_argument("--dns6", default=None, metavar="IP",
+                    help="IPv6 DNS server for the Wintun adapter "
+                         "(default: none, unless no DNS was chosen at all)")
     ap.add_argument("--unicode", action="store_true",
                     help="Force Unicode box/block glyphs even if auto-detection is unsure")
     ap.add_argument("--ascii", action="store_true",
@@ -6427,6 +6901,19 @@ def main():
     app = None
     try:
         app = BTopTui(args)
+        # Leftover GEO routes from an accidental exit (the [X] close, a crash,
+        # a power loss) live on the PHYSICAL adapter, not on wintun - so the
+        # startup recovery above (which tears down the wintun adapter) never
+        # touches them. The next tunnel start then fights thousands of stale
+        # "already exists" routes and the geo install takes forever with a
+        # wall of errors. Sweep them NOW, batched, before the helper launches.
+        try:
+            _n = app._sweep_geo_leftovers()
+            if _n:
+                print(f"[*] Removed {_n} leftover geoip route(s) from a "
+                      "previous run - the fresh start is clean.")
+        except Exception as _e:
+            print(f"[!] Leftover geo route sweep skipped: {_e}")
         app.launch()
         app.loop()
     except SystemExit:

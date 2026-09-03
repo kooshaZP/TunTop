@@ -4,6 +4,70 @@ All notable changes to TunTop are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Leak-test verdict was INVERTED** (the "fix any bug" find of this change):
+  the old `[L]` test claimed `direct == proxied -> LEAK`, which is backwards.
+  With the full-tunnel routes healthy, a *direct* (non-proxied) fetch
+  traverses the TUN and exits at the SAME IP as the SOCKS-proxied fetch -
+  that equality is the proof the tunnel carries everything (the startup
+  verification probe has always relied on exactly this behaviour). The real
+  leak signature is the opposite: the direct probe showing a DIFFERENT IP
+  (the real ISP IP) than the tunnel exit. Dashboard `[L]`, the FAQ, and the
+  new monitor check all use the corrected semantics now.
+- **Health-scan results no longer race the UI thread** (`run_checks` used to
+  append to `self.results` from its worker while `draw()` iterated the same
+  list): the race aborted draw() mid-frame with "list changed size during
+  iteration", freezing the whole dashboard - event log included - which
+  looked exactly like "the log has a delay". Results are now published by
+  atomic rebinding, and the main loop wakes instantly when a background
+  thread queues a new log line instead of waiting out the rest of the frame.
+
+### Added
+- **Leak test is now part of the regular check while the tunnel runs**:
+  the helper's monitor loop (every `--monitor-interval` cycle, default 30 s)
+  runs a direct-vs-tunnel-egress probe after the tunnel verifies and logs
+  `[MONITOR] leak check OK` / `[MONITOR] LEAK DETECTED` / inconclusive lines
+  when the verdict CHANGES. A `LEAK DETECTED` marks the tunnel DEGRADED in
+  the dashboard's state machine; a later `leak check OK` restores RUNNING.
+- **"Tunnel leak test (direct vs tunnel egress)" health-check row** - the
+  `[C]` scan now includes the same probe, so the leak state is visible in
+  the health panel and exported with `[D]` diagnostics.
+- **Monitor-layer leak probe** (`tuntop/monitor/leak.py`, pure stdlib - the
+  module now owns the real logic instead of re-exporting the dashboard):
+  both legs (direct + SOCKS5-proxied) race SEVERAL IP-echo endpoints
+  concurrently and the first strictly-validated IP wins, so a single
+  blocked/lying endpoint (captive portal, interception page) can never
+  produce a false verdict; the manual `[L]` test no longer depends on
+  `curl.exe` and reports per-leg latency plus a clear verdict for every
+  outcome (ok / leak / no-proxy / inconclusive / no-network).
+
+## Previous
+
+### Fixed
+- **geoip no longer hijacks the tunnel's own endpoints or user bypass routes**
+  (the "[U] server change broke it" + "bypass must outrank geoip" bugs):
+  a geoip country list routinely contains the VLESS/VPN server's own IP - and
+  can even ship an exact /32 IDENTICAL to the server's host route - so the geo
+  install's conflict sweep deleted that /32 and re-added it pointing at the
+  GEO egress (wintun2 / Windows VPN / wintun), looping the proxy transport
+  into its own tunnel: endless failing connects to the server IP in the log
+  after changing the server live with `[U]`. Now `add_geoip_bypass()` takes a
+  `protected` prefix list (VLESS/proxy2/VPN endpoints, bypass entries) and
+  skips any geo CIDR equal to or INSIDE a protected prefix from both the
+  removal sweep and the install, and re-asserts endpoint host routes after
+  the geo pass (`reassert=`). Same protection on the live `[R]` geo re-apply
+  (dashboard builds the list from every live-installed route + resolved
+  endpoints) and at helper startup (all resolved endpoint IPs are protected).
+  User bypass entries keep the egress their entry names even when a geo
+  subnet falls inside the bypassed range. The live bypass install also
+  pre-cleans any same-prefix route on another egress first, so `[A]`/`[U]`
+  can no longer silently "succeed" while the old geo route keeps winning.
+- **`[U]` server change now re-detects the egress** (the stale cached
+  interface/gateway made a fresh host route land on the wrong interface) and
+  logs explicit diagnostics: which geo ranges cover the new server IP, and a
+  hard warning if the bypass route could not be installed (the loop
+  condition).
+
 ### Added
 - **Parallel tunnel verification**: `wait_for_tunnel_stable()` now probes ALL
   verification endpoints (gstatic, cloudflare, ipify) CONCURRENTLY instead of
@@ -38,6 +102,14 @@ All notable changes to TunTop are documented here.
   (4 -> 2 rows); removing the footer entirely is now the last resort.
 
 ### Changed
+- **DNS selection is now exact** - pass `--dns4` (and/or `--dns6`) and the
+  tunnel uses EXACTLY the resolver(s) you gave: a v4-only choice no longer
+  gets the default IPv6 resolver injected (and vice versa). With no DNS input
+  at all, both defaults (8.8.8.8 + 2606:4700:4700::1111) still apply, and the
+  legacy "pass 8.8.8.8 alone" case keeps the old dual-stack behavior. The
+  `[N]` live editor and the helper control-file channel follow the same rule
+  (a v4-only pick also clears the v6 resolver off the adapter), profiles can
+  now store `dns6`, and `Run_Helper.ps1` gained a `$DnsServerV6` knob.
 - **DNS changes no longer restart the tunnel (`[N]`)** - applied live on the
   Wintun adapter + helper rebind; applies to new lookups immediately.
 - **Server changes no longer restart the tunnel (`[U]`)** - old VLESS
@@ -46,6 +118,12 @@ All notable changes to TunTop are documented here.
 - Endpoint-port changes (`[E]`) were already live; behaviour unchanged.
 
 ### Fixed
+- **Stale helper control file no longer overrides a fresh run's DNS** - a
+  `.tuntop_control.json` left over from a previous session (e.g. an old `[N]`
+  DNS change) was applied by the new run's first monitor tick, silently
+  replacing the launch-time `--dns4/--dns6` choice. The helper now baselines
+  the control file's mtime at startup (only writes made while the run is up
+  count as live changes) and removes the file on exit.
 - **Graph/log flicker at certain window sizes** - the adaptive shrink budget
   was recomputed from the previous frame's measured panel height every frame,
   and the panels' height depends on the budget: shrink -> smaller measurement

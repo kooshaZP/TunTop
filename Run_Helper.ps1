@@ -21,10 +21,14 @@ $Tun2socks  = Join-Path $ScriptDir 'tun2socks-windows-amd64-v3.exe'
 $VlessEndpointPort = '443'
 $SocksPort         = '10808'
 $VpnInterface      = ''        # set to your exact VPN connection name to override auto-detect
-$DnsServer         = '8.8.8.8'
+# DNS rules: leave BOTH empty to use TunTop's built-in defaults (8.8.8.8 +
+# 2606:4700:4700::1111). Set $DnsServer only -> IPv4 DNS only (no default v6
+# resolver is injected). Set both -> exactly those two are used.
+$DnsServer         = ''            # empty = built-in defaults (8.8.8.8 + 2606:4700:4700::1111)
+$DnsServerV6       = ''
 
 # VLESS server address(es) - IP or hostname, as many as you like.
-$Servers           = @('188.114.97.6')
+$Servers           = @('45.142.120.16')
 
 # geoip.dat bypass (route-level "bypass a country").
 # The script looks for geoip.dat inside a 'geofil' sub-folder next to this script.
@@ -352,9 +356,12 @@ $pyArgs = @(
     '--server', $Servers,
     '--endpoint-port', $VlessEndpointPort,
     '--port', $SocksPort,
-    '--tun2socks', $Tun2socks,
-    '--dns4', $DnsServer
+    '--tun2socks', $Tun2socks
 )
+# Pass ONLY the DNS servers actually configured (see the rules above):
+# nothing set -> the helper applies both of its defaults.
+if ($DnsServer)   { $pyArgs += @('--dns4', $DnsServer) }
+if ($DnsServerV6) { $pyArgs += @('--dns6', $DnsServerV6) }
 if ($VpnMode)     { $pyArgs += $VpnMode }
 if ($VpnIfaceArg) { $pyArgs += $VpnIfaceArg }
 if ($GlyphArg)    { $pyArgs += $GlyphArg }

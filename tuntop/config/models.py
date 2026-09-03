@@ -18,6 +18,7 @@ class Profile:
     server: list = field(default_factory=list)
     port: int = 10808
     dns4: str = "8.8.8.8"
+    dns6: Optional[str] = None   # None = not chosen (v4-only or defaults apply)
     endpoint_port: int = 443
     bypass_ip: list = field(default_factory=list)
     vpn_bypass_ip: list = field(default_factory=list)   # targets via Windows VPN
@@ -45,6 +46,7 @@ class Profile:
             "server": list(self.server),
             "port": self.port,
             "dns4": self.dns4,
+            "dns6": self.dns6,
             "endpoint_port": self.endpoint_port,
             "bypass_ip": list(self.bypass_ip),
             "vpn_bypass_ip": list(self.vpn_bypass_ip),

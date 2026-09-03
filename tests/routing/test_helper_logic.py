@@ -9,8 +9,8 @@ Run:  python -m unittest discover -s tests -t . -v
 import unittest
 
 from tuntop.tunnel.helper import (
-    VPN_IFACE_RE, _is_routable_bypass_cidr, _read_bytes, _read_varint,
-    ps_quote,
+    VPN_IFACE_RE, _geo_overlaps_protected, _is_routable_bypass_cidr,
+    _read_bytes, _read_varint, collect_protected_geo_prefixes, ps_quote,
 )
 
 
@@ -95,6 +95,77 @@ class TestRoutableBypassCidr(unittest.TestCase):
         self.assertFalse(_is_routable_bypass_cidr("not a cidr"))
         self.assertFalse(_is_routable_bypass_cidr("300.300.300.0/24"))
         self.assertFalse(_is_routable_bypass_cidr(""))
+
+
+class TestGeoOverlapsProtected(unittest.TestCase):
+    """geoip must never own (install OR remove) a prefix that already has its
+    own egress: the tunnel's endpoint /32s and the user's bypass entries."""
+
+    def test_exact_match_is_protected(self):
+        # A geoip.dat that ships the VLESS server's own /32 (the exact route
+        # the helper installed) would otherwise be swept + re-pointed.
+        self.assertTrue(_geo_overlaps_protected("1.2.3.4/32", ["1.2.3.4/32"]))
+
+    def test_geo_inside_protected_range_is_protected(self):
+        # User bypasses 5.0.0.0/16; a more-specific geo /24 inside it must be
+        # skipped so the bypass range keeps the egress its entry names.
+        self.assertTrue(_geo_overlaps_protected("5.5.10.0/24", ["5.5.0.0/16"]))
+        self.assertTrue(_geo_overlaps_protected("5.5.0.0/17", ["5.5.0.0/16"]))
+
+    def test_geo_covering_protected_host_is_kept(self):
+        # The common case: the server IP sits INSIDE a broad geo range.  The
+        # geo route stays (it is still useful for the rest of the range) and
+        # the endpoint's /32 wins by longest-prefix - so a broader geo CIDR
+        # is NOT a conflict.
+        self.assertFalse(_geo_overlaps_protected("5.5.0.0/16", ["5.5.10.7/32"]))
+
+    def test_unrelated_and_version_mismatch(self):
+        self.assertFalse(_geo_overlaps_protected("9.9.9.0/24", ["1.2.3.4/32"]))
+        self.assertFalse(_geo_overlaps_protected("2001:db8::/32", ["1.2.3.4/32"]))
+        self.assertFalse(_geo_overlaps_protected("1.2.3.0/24", ["2001:db8::/32"]))
+
+    def test_bad_input_never_raises(self):
+        self.assertFalse(_geo_overlaps_protected("garbage", ["1.2.3.4/32"]))
+        self.assertFalse(_geo_overlaps_protected("1.2.3.0/24", ["garbage", ""]))
+
+    def test_bare_host_cidr_normalizes_to_32(self):
+        # ip_network("1.2.3.4") == 1.2.3.4/32, so a bare host geo entry still
+        # matches the endpoint's explicit /32.
+        self.assertTrue(_geo_overlaps_protected("1.2.3.4", ["1.2.3.4/32"]))
+
+    def test_empty_protected_never_conflicts(self):
+        self.assertFalse(_geo_overlaps_protected("1.2.3.0/24", ()))
+
+
+class TestCollectProtectedGeoPrefixes(unittest.TestCase):
+    def test_endpoint_ips_become_host_routes(self):
+        prot = collect_protected_geo_prefixes(
+            server_v4=["1.2.3.4"], server_v6=["2001:db8::1"],
+            bypass_v4=["5.6.7.8"], vpn_v4=["9.9.9.9"],
+            proxy2_v4=["10.20.30.40"], proxy2_v6=["fd00::2"],
+        )
+        for want in ("1.2.3.4/32", "5.6.7.8/32", "9.9.9.9/32",
+                     "10.20.30.40/32", "2001:db8::1/128", "fd00::2/128"):
+            self.assertIn(want, prot)
+
+    def test_deduplicates(self):
+        prot = collect_protected_geo_prefixes(
+            server_v4=["1.2.3.4", "1.2.3.4"], bypass_v4=["1.2.3.4"])
+        self.assertEqual(prot, ["1.2.3.4/32"])
+
+    def test_cidr_entries_pass_through(self):
+        prot = collect_protected_geo_prefixes(cidr_entries=["5.5.0.0/16"])
+        self.assertEqual(prot, ["5.5.0.0/16"])
+
+    def test_bad_cidr_entries_are_dropped(self):
+        # Bare hosts are NOT cidr_entries (they are resolved upstream into
+        # /32s) and garbage must never reach the route layer.
+        prot = collect_protected_geo_prefixes(
+            cidr_entries=["example.com", "not a cidr", "300.1.2.3/24"])
+        self.assertEqual(prot, [])
+
+    def test_empty_inputs(self):
+        self.assertEqual(collect_protected_geo_prefixes(), [])
 
 
 class TestVpnIfaceDetection(unittest.TestCase):

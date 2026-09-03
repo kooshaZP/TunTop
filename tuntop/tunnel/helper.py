@@ -69,6 +69,29 @@ TUN6 = "fd00:dead:beef::1"
 DNS4 = "8.8.8.8"
 DNS6 = "2606:4700:4700::1111"
 
+
+def _resolve_dns_choice(d4, d6):
+    """Resolve the user's --dns4/--dns6 input into the DNS servers to set on
+    the Wintun adapter. A None result for one family means "do not set (and
+    remove any stale) DNS for that family".
+
+      * no input at all              -> both defaults (DNS4 + DNS6)
+      * a real choice (v4 and/or v6) -> EXACTLY what was chosen: a v4-only
+                                        choice gets NO default v6 injected,
+                                        and vice versa
+      * the legacy pass of --dns4 8.8.8.8 alone (what old dashboards,
+                                        profiles and launchers always sent)
+                                        still means "both defaults", so
+                                        existing setups keep their behavior
+    """
+    d4 = str(d4).strip() if d4 else None
+    d6 = str(d6).strip() if d6 else None
+    if not d4 and not d6:
+        return DNS4, DNS6
+    if d4 == DNS4 and not d6:
+        return DNS4, DNS6
+    return d4, d6
+
 # Second proxy pipe (optional, behind --proxy2-port).  A second TUN adapter +
 # tun2socks process against a second local SOCKS5 port; specific destinations
 # can then be routed through it while the PRIMARY pipe keeps owning the default
@@ -128,14 +151,19 @@ def poll_control_file():
     if not isinstance(data, dict):
         return False
     changed = []
-    d4 = data.get("dns4")
-    d6 = data.get("dns6")
-    if d4 and d4 != _ACTIVE_DNS4:
-        _ACTIVE_DNS4 = str(d4)
-        changed.append(f"DNS4 -> {_ACTIVE_DNS4}")
-    if d6 and d6 != _ACTIVE_DNS6:
-        _ACTIVE_DNS6 = str(d6)
-        changed.append(f"DNS6 -> {_ACTIVE_DNS6}")
+    # Key-aware: the dashboard writes BOTH keys on every [N] change, so a
+    # present-but-empty value means "clear this family" (e.g. the user picked
+    # an IPv4-only DNS), not "leave it alone". A missing key = no change.
+    if "dns4" in data:
+        d4 = str(data["dns4"]).strip() if data["dns4"] else None
+        if d4 != _ACTIVE_DNS4:
+            _ACTIVE_DNS4 = d4
+            changed.append(f"DNS4 -> {d4 or '(cleared - IPv4 DNS unset)'}")
+    if "dns6" in data:
+        d6 = str(data["dns6"]).strip() if data["dns6"] else None
+        if d6 != _ACTIVE_DNS6:
+            _ACTIVE_DNS6 = d6
+            changed.append(f"DNS6 -> {d6 or '(cleared - IPv6 DNS unset)'}")
     if not changed:
         return False
     print(f"[*] Live config change applied: {'; '.join(changed)}", flush=True)
@@ -144,6 +172,24 @@ def poll_control_file():
     except Exception as e:
         print(f"[!] Live DNS re-apply failed: {e}", flush=True)
     return True
+
+
+def _baseline_control_file():
+    """Baseline the live-reconfig channel to the control file's CURRENT mtime.
+
+    The monitor loop treats any mtime DIFFERENT from _control_mtime as a live
+    change - and _control_mtime starts at 0.0, so a control file left over
+    from a PREVIOUS session (e.g. a [N] DNS change from a run that has since
+    exited) used to be applied to a fresh run, silently overriding the
+    --dns4/--dns6 choices that run was launched with. Calling this at helper
+    startup makes only writes made while THIS run is up count as live
+    changes; a fresh run always starts with exactly the DNS its launch flags
+    chose."""
+    global _control_mtime
+    try:
+        _control_mtime = os.path.getmtime(CONTROL_FILE)
+    except OSError:
+        _control_mtime = 0.0
 
 # When a connected Windows VPN injects its own default + /32 routes (often at a
 # very low metric), those /32s are MORE specific than Wintun's /1 split routes
@@ -794,6 +840,14 @@ _DOH_TEMPLATES = {
     "1.0.0.1": "https://cloudflare-dns.com/dns-query",
     "9.9.9.9": "https://dns.quad9.net/dns-query",
     "149.112.112.112": "https://dns.quad9.net/dns-query",
+    # IPv6 resolvers too: without a v6 DoH mapping, DoH mode still leaves the
+    # v6 resolver on raw UDP/53 - and on SOCKS setups whose UDP relay is
+    # broken ("client handshake: EOF"), every v6 DNS query dies in the TUN.
+    "2606:4700:4700::1111": "https://cloudflare-dns.com/dns-query",
+    "2606:4700:4700::1001": "https://cloudflare-dns.com/dns-query",
+    "2001:4860:4860::8888": "https://dns.google/dns-query",
+    "2001:4860:4860::8844": "https://dns.google/dns-query",
+    "2620:fe::fe": "https://dns.quad9.net/dns-query",
 }
 
 
@@ -807,7 +861,9 @@ def _set_wintun_addresses_plain(dns4, dns6, device=None, ip4=None, ip6=None,
                                  set_dns=True):
     """Assign the Wintun IPv4/IPv6 addresses and set the DNS servers the plain
     (UDP/53) way. Shared by configure_tun() and the DoH path (which layers DoH
-    on top of the addresses).
+    on top of the addresses). A dns4/dns6 of None means "no DNS for that
+    family" - the stale static entry is removed instead of re-adding a
+    hardcoded default.
 
     `device`/`ip4`/`ip6` default to the PRIMARY pipe's adapter; the second
     proxy pipe (TUN2) passes its own. `set_dns=False` assigns addresses only -
@@ -820,27 +876,39 @@ def _set_wintun_addresses_plain(dns4, dns6, device=None, ip4=None, ip6=None,
         f"name={device}", "source=static", f"addr={ip4}", f"mask={TUN4_MASK}"
     ], check=True)
     if set_dns:
-        run([
-            "netsh", "interface", "ipv4", "set", "dnsservers",
-            f"name={device}", "source=static", f"address={dns4}",
-            "register=none", "validate=no"
-        ])
+        if dns4:
+            run([
+                "netsh", "interface", "ipv4", "set", "dnsservers",
+                f"name={device}", "source=static", f"address={dns4}",
+                "register=none", "validate=no"
+            ])
+        else:
+            # dns4=None means "no IPv4 DNS by choice": remove any stale
+            # static entries so the adapter never keeps an old resolver.
+            run(["netsh", "interface", "ipv4", "delete", "dnsservers",
+                 f"name={device}"])
     run([
         "netsh", "interface", "ipv6", "add", "address",
         device, f"{ip6}/64"
     ])
     if set_dns:
-        run([
-            "netsh", "interface", "ipv6", "add", "dnsserver",
-            device, dns6, "index=1"
-        ])
+        if dns6:
+            run([
+                "netsh", "interface", "ipv6", "add", "dnsserver",
+                device, dns6, "index=1"
+            ])
+        else:
+            # Same as above for the IPv6 stack (e.g. a v4-only DNS choice).
+            run(["netsh", "interface", "ipv6", "delete", "dnsservers",
+                 f"name={device}"])
 
 
-def _enable_doh_on_wintun(ip, template):
-    """Best-effort: register + enable DNS-over-HTTPS for `ip` on wintun so DNS
-    rides over TCP/443 (which proxies reliably) instead of raw UDP/53 (which
-    many SOCKS/VLESS setups do not relay). Returns True if the cmdlets reported
-    success. Failures are non-fatal - caller falls back to plain UDP DNS."""
+def _register_doh_server(ip, template):
+    """Register/refresh ONE DoH mapping (Add-/Set-DnsClientDohServer). Does
+    NOT touch the adapter's ServerAddresses list - that is done separately by
+    _set_wintun_dns_servers, so DNS4 and DNS6 can both be registered without
+    the second call wiping the first (Set-DnsClientServerAddress REPLACES the
+    whole list, which is exactly what the old two-step enable did)."""
     if not ip or not template:
         return False
     ps = (
@@ -850,13 +918,44 @@ def _enable_doh_on_wintun(ip, template):
         "-AllowFallbackToUdp $false -ErrorAction SilentlyContinue; "
         "Set-DnsClientDohServer -ServerAddress $ip -DohTemplate $tpl "
         "-AllowFallbackToUdp $false -ErrorAction SilentlyContinue; "
-        "Set-DnsClientServerAddress -InterfaceAlias '" + TUN + "' "
-        "-ServerAddresses @($ip) -ErrorAction Stop; "
         "Write-Output 'DOH_OK' "
         "} catch { Write-Output ('DOH_FAIL:' + $_.Exception.Message) }"
     )
     _, out, _ = run_ps(ps)
     return "DOH_OK" in out
+
+
+def _set_wintun_dns_servers(servers):
+    """Point the wintun adapter at the FULL DNS server list in one cmdlet
+    (plus a resolver-cache flush, so the very next lookup uses the new
+    servers instead of the stale/failing ones)."""
+    addrs = ",".join("'" + ps_quote(s) + "'" for s in (servers or []) if s)
+    if not addrs:
+        return False
+    ps = (
+        "try { "
+        f"Set-DnsClientServerAddress -InterfaceAlias '{TUN}' "
+        f"-ServerAddresses @({addrs}) -ErrorAction Stop; "
+        "Clear-DnsClientCache -ErrorAction SilentlyContinue; "
+        "ipconfig /flushdns | Out-Null; "
+        "Write-Output 'DNS_SET' "
+        "} catch { Write-Output ('DNS_FAIL:' + $_.Exception.Message) }"
+    )
+    _, out, _ = run_ps(ps)
+    return "DNS_SET" in out
+
+
+def _enable_doh_on_wintun(ip, template):
+    """Best-effort: register + enable DNS-over-HTTPS for `ip` on wintun so DNS
+    rides over TCP/443 (which proxies reliably) instead of raw UDP/53 (which
+    many SOCKS/VLESS setups do not relay). Sets the adapter's DNS list to
+    exactly [ip]. Returns True if the cmdlets reported success. Failures are
+    non-fatal - caller falls back to plain UDP DNS."""
+    if not ip or not template:
+        return False
+    if not _register_doh_server(ip, template):
+        return False
+    return _set_wintun_dns_servers([ip])
 
 
 def _disable_netbios_on_wintun():
@@ -913,8 +1012,11 @@ def _add_lan_bypass(iface, gateway):
 
 
 def configure_tun(dns4=None, dns6=None):
-    dns4 = dns4 or DNS4
-    dns6 = dns6 or DNS6
+    """Apply the Wintun address/DNS configuration. A dns4/dns6 of None means
+    "the user did not choose a DNS server for that family": that family's DNS
+    is left unset (and any stale entry removed), NOT silently replaced with
+    the hardcoded DNS4/DNS6 defaults - the old `dns6 = dns6 or DNS6` fallback
+    made a v4-only DNS choice impossible."""
     mode = _ACTIVE_DNS_MODE
     template = _ACTIVE_DOH_TEMPLATE or _doh_template_for(dns4)
 
@@ -927,11 +1029,20 @@ def configure_tun(dns4=None, dns6=None):
     else:
         print("[*] NetBIOS disable on wintun skipped/unavailable (non-fatal).")
 
-    if mode == "doh" and template:
-        if _enable_doh_on_wintun(dns4, template):
+    if mode == "doh" and dns4 and template:
+        # Only the DNS families the user actually chose land on the adapter.
+        if _register_doh_server(dns4, template) \
+                and _set_wintun_dns_servers([s for s in (dns4, dns6) if s]):
             print(f"[*] Wintun DNS set to DoH: {dns4} -> {template} (TCP/443)")
         else:
             print(f"[!] DoH enable failed for {dns4}; falling back to plain UDP DNS.")
+        # Put the IPv6 resolver on DoH too when we know its template - with
+        # the old code DNS6 stayed on raw UDP/53 even in DoH mode, and on
+        # SOCKS setups whose UDP relay is broken ("client handshake: EOF")
+        # every v6 lookup died inside the TUN.
+        t6 = _ACTIVE_DOH_TEMPLATE or _doh_template_for(dns6)
+        if dns6 and t6 and _register_doh_server(dns6, t6):
+            print(f"[*] Wintun DNS6 set to DoH: {dns6} -> {t6} (TCP/443)")
     elif mode == "auto":
         # Start plain; the monitor/verify loop escalates to DoH if plain DNS
         # through the TUN proves unreliable.
@@ -1141,9 +1252,10 @@ if ($r) {{ $r | ConvertTo-Json -Compress }} else {{ exit 1 }}
         if family == "IPv4":
             run(["netsh", "interface", "ipv4", "set", "address",
                  f"name={TUN}", "source=static", f"addr={addr}", f"mask={suffix}"])
-            run(["netsh", "interface", "ipv4", "set", "dnsservers",
-                 f"name={TUN}", "source=static", f"address={_ACTIVE_DNS4}",
-                 "register=none", "validate=no"])
+            if _ACTIVE_DNS4:      # None = the user chose no IPv4 DNS
+                run(["netsh", "interface", "ipv4", "set", "dnsservers",
+                     f"name={TUN}", "source=static", f"address={_ACTIVE_DNS4}",
+                     "register=none", "validate=no"])
             # If we're in DoH mode, re-enable DoH on the recreated adapter so
             # DNS keeps riding over TCP/443 instead of broken UDP/53.
             if _ACTIVE_DNS_MODE == "doh":
@@ -1151,7 +1263,9 @@ if ($r) {{ $r | ConvertTo-Json -Compress }} else {{ exit 1 }}
                 _enable_doh_on_wintun(addr, tmpl)
         else:
             run(["netsh", "interface", "ipv6", "add", "address", TUN, f"{addr}/{suffix}"])
-            run(["netsh", "interface", "ipv6", "add", "dnsserver", TUN, _ACTIVE_DNS6, "index=1"])
+            if _ACTIVE_DNS6:  # None = the user chose no IPv6 DNS
+                run(["netsh", "interface", "ipv6", "add", "dnsserver",
+                     TUN, _ACTIVE_DNS6, "index=1"])
         time.sleep(1)
     print(f"[!] Could not ensure Wintun {family} address {addr}; route installs may fail.")
     return False
@@ -1376,6 +1490,71 @@ def _is_routable_bypass_cidr(cidr):
     return True
 
 
+def _geo_overlaps_protected(cidr, protected):
+    """True if geo CIDR `cidr` IS, or is INSIDE, one of `protected`'s prefixes.
+
+    Protected prefixes are routes that must keep the egress THEY were given:
+    the tunnel's own endpoint host routes (VLESS, proxy2 upstream, Windows VPN)
+    and the user's explicit bypass entries.  A geoip country list routinely
+    contains such addresses - a VLESS server hosted in the bypassed country, a
+    CDN range the file lists, even an exact /32 identical to a bypass route.
+    Installing the geo route for those - or worse, letting the pre-install
+    conflict sweep delete the existing route with the same exact prefix and
+    re-add it pointing at the geo egress - hijacks the transport into its own
+    tunnel (the classic "changed the server with [U] and now every request to
+    the server IP loops and fails") or silently moves user-bypassed traffic
+    onto the geo egress instead of the egress the bypass entry names."""
+    try:
+        g = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+    for p in protected or ():
+        try:
+            net = ipaddress.ip_network(str(p), strict=False)
+        except ValueError:
+            continue
+        if g.version == net.version and g.subnet_of(net):
+            return True
+    return False
+
+
+def collect_protected_geo_prefixes(server_v4=(), server_v6=(),
+                                   bypass_v4=(), bypass_v6=(),
+                                   vpn_v4=(), vpn_v6=(),
+                                   proxy2_v4=(), proxy2_v6=(),
+                                   cidr_entries=()):
+    """Every prefix geoip must never own (install OR remove).
+
+    Plain endpoint IPs become /32 (v4) / /128 (v6) host routes; `cidr_entries`
+    (raw --bypass-ip / --proxy2-bypass-ip values that are already CIDRs) are
+    taken as-is so even more-specific geo subnets INSIDE a user bypass range
+    are skipped and the range keeps the egress the user chose for it."""
+    prot = []
+
+    def _reg(prefix):
+        if prefix and prefix not in prot:
+            prot.append(prefix)
+
+    v4_all = list(server_v4 or ()) + list(bypass_v4 or ()) \
+        + list(vpn_v4 or ()) + list(proxy2_v4 or ())
+    v6_all = list(server_v6 or ()) + list(bypass_v6 or ()) \
+        + list(vpn_v6 or ()) + list(proxy2_v6 or ())
+    for ip in v4_all:
+        _reg(f"{ip}/32")
+    for ip in v6_all:
+        _reg(f"{ip}/128")
+    for entry in (cidr_entries or ()):
+        e = str(entry).strip()
+        if "/" not in e:
+            continue
+        try:
+            ipaddress.ip_network(e, strict=False)
+        except ValueError:
+            continue
+        _reg(e)
+    return prot
+
+
 # Geo install tuning.  Sub-batch size (routes per `netsh -f` invocation), worker
 # cap (concurrent netsh writers against the Windows route store), and the hard
 # per-sub-batch timeout that lets a hung `netsh add route` be killed instead of
@@ -1386,39 +1565,74 @@ GEO_SUB_TIMEOUT = 90
 
 
 def _geo_remove_conflicts(cidrs, iface, fam):
-    """Single batched removal of any pre-existing route for our geo prefixes
-    (on any real interface except wintun).
+    """Fast batched removal of any pre-existing route for our geo prefixes
+    (on any real interface except wintun/wintun2).
 
-    This drops BOTH routes a self-healing Windows VPN re-injected on a different
-    interface AND stale routes left behind by a previous run on the SAME physical
-    interface.  The latter matters because earlier builds installed the geoip
-    bypass with `netsh ... add route`, which is PERSISTENT by default - those
-    entries lived in the registry and survived reboots, so a plain re-install
-    would just hit "already exists" and leave the persistent copy in place.  By
-    removing them here (a `Remove-NetRoute` clears the persistent store too) the
-    following `add route ... store=active` re-creates them as active-only, so
-    they no longer outlive a reboot.
+    Two phases:
+      1. ONE read-only Get-NetRoute scan that LISTS the matching
+         (prefix, interface) pairs - no mutation happens in PowerShell.
+      2. The actual deletes go through _remove_routes_bulk (concurrent
+         `netsh -f` scripts) - the same fast path the installer and the exit
+         cleanup use, milliseconds per route instead of ~50-100ms.
 
-    This is ONE Get-NetRoute scan over the whole table plus one Remove-NetRoute
-    per matching route - O(n), cheap even when the table is bloated with
-    thousands of leftover geo routes.  That bloat is exactly what made the old
-    per-route Get-NetRoute loop O(n^2) and appear to hang on repeat runs, so the
-    removal is done here once instead of inside the per-route add loop."""
+    Why not the old one-pipeline Remove-NetRoute sweep: the cmdlet costs
+    ~50-100ms PER ROUTE, so after a hard close (Alt+F4 - the console dies,
+    no cleanup runs) left ~3000 stale geo routes behind, the sweep needed
+    MINUTES inside a run_ps(timeout=120) call. It was killed mid-sweep on
+    every start, the table stayed half-cleaned, and the install that follows
+    fought the leftovers - "opening the tun again takes forever to add geo".
+
+    This drops BOTH routes a self-healing Windows VPN re-injected on a
+    different interface AND stale routes left behind by a previous run on the
+    SAME physical interface (the latter matters because pre-store=active
+    builds installed geoip routes PERSISTENTLY; netsh delete clears BOTH
+    stores, so those leftovers are caught too)."""
     if not cidrs:
         return
     af = "IPv4" if fam == "v4" else "IPv6"
     routes_lit = ",".join("'%s'" % ps_quote(r) for r in cidrs)
-    iface_dq = ps_quote(iface)
+    # Read-only scan only: list "prefix|iface" for every route whose prefix is
+    # one of ours and which does NOT live on a tunnel adapter (wintun/wintun2).
+    # (geo-via-wintun mode installs ON the tunnel adapters - those must stay.)
     ps = (
         "$hs = [System.Collections.Generic.HashSet[string]]::new(); "
         "%s | ForEach-Object { $null = $hs.Add($_) }; "
         "Get-NetRoute -AddressFamily '%s' -ErrorAction SilentlyContinue | "
         "Where-Object { $hs.Contains($_.DestinationPrefix) -and "
-        "$_.InterfaceAlias -ne 'wintun' } | "
-        "ForEach-Object { Remove-NetRoute -DestinationPrefix $_.DestinationPrefix "
-        "-InterfaceAlias $_.InterfaceAlias -Confirm:$false -ErrorAction SilentlyContinue }"
+        "$_.InterfaceAlias -ne 'wintun' -and $_.InterfaceAlias -ne 'wintun2' } | "
+        "ForEach-Object { \"$($_.DestinationPrefix)|$($_.InterfaceAlias)\" }"
     ) % (routes_lit, af)
-    run_ps(ps, timeout=120)
+    _code, out, _err = run_ps(ps, timeout=90)
+    hits = _geo_sweep_hits(out, fam)
+    if not hits:
+        return
+    print(f"[*] geo sweep ({fam}): {len(hits)} stale/conflicting route(s) "
+          f"from an earlier run - bulk-removing before install...",
+          flush=True)
+    _remove_routes_bulk(hits)
+
+
+def _geo_sweep_hits(out, fam):
+    """Parse the conflict scan's "prefix|iface" lines into deduplicated
+    (fam, dest, iface, "") tuples for _remove_routes_bulk.
+
+    netsh delete route prefix + interface removes EVERY route for that prefix
+    on that interface (any next-hop), so duplicate (prefix, iface) pairs
+    collapse. Junk lines (blank, no '|', empty halves) are skipped. Pure
+    string handling - unit-testable without Windows."""
+    hits = []
+    seen = set()
+    for ln in (out or "").splitlines():
+        ln = ln.strip()
+        if "|" not in ln:
+            continue
+        dest, _sep, alias = ln.partition("|")
+        dest, alias = dest.strip(), alias.strip()
+        if not dest or not alias or (dest, alias) in seen:
+            continue
+        seen.add((dest, alias))
+        hits.append((fam, dest, alias, ""))
+    return hits
 
 
 # Per-process deduplication for repeated geoip diagnostics. A given country's
@@ -1442,9 +1656,21 @@ def _geo_diag(key, msg):
     return True
 
 
-def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None):
+def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
+                     protected=(), reassert=()):
     """Install every CIDR in `cidrs` as a bypass route via the real (non-TUN)
     interface, so that country's traffic never enters the tunnel.
+
+    protected: prefixes (strings like "1.2.3.4/32" or "5.0.0.0/16") that must
+    keep their OWN egress - endpoint host routes and user bypass entries.  Any
+    geo CIDR equal to or inside one of them is dropped from BOTH the conflict
+    sweep and the install (without this, a geo range covering the VLESS server
+    deletes + re-points the server's /32 and the transport loops; a user
+    bypass range gets carved up by more-specific geo routes).
+
+    reassert: (fam, dest, iface, gw) host routes re-installed idempotently
+    AFTER the geo pass, so endpoint/bypass routes are provably back on their
+    intended egress no matter what touched the table before.
 
     A full country list (e.g. geoip:ir ~ 2900 CIDRs) is too many to add one
     route at a time. We split the list into chunks and run the chunks
@@ -1476,7 +1702,40 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None):
         _geo_diag(("skip_noroutable", code),
                   f"[!] geoip:{code} bypass skipped (no routable CIDRs remain after filtering).")
         return
+    # PROTECTED PREFIXES OUTRANK GEOIP (endpoints + user bypass).  A geoip
+    # country list can contain the VLESS/VPN server's own IP - even as an
+    # exact /32 equal to the server's host route.  Without this guard the
+    # conflict sweep below DELETES that /32 (exact-prefix match) and the geo
+    # route for the same prefix is re-added pointing at the GEO egress, so
+    # the proxy transport loops into its own tunnel: endless failing
+    # connects to the server IP in the log (the classic "[U] server change
+    # broke it" report).  The same guard keeps a user bypass entry on the
+    # egress its entry names: geo CIDRs equal to or inside a bypass prefix
+    # (host /32 or a whole range) are dropped here, so the more-specific-or-
+    # equal bypass route always wins the lookup.
+    if protected:
+        _pre_prot = len(v4) + len(v6)
+        v4 = [c for c in v4 if not _geo_overlaps_protected(c, protected)]
+        v6 = [c for c in v6 if not _geo_overlaps_protected(c, protected)]
+        _dropped = _pre_prot - (len(v4) + len(v6))
+        if _dropped:
+            _geo_diag(("skip_protected", code),
+                      f"[!] geoip:{code} bypass: skipped {_dropped} CIDR(s) equal to or "
+                      f"inside protected endpoint/bypass prefixes (those keep their own "
+                      f"egress - geoip must never own them).")
+        if not v4 and not v6:
+            _geo_diag(("skip_allprotected", code),
+                      f"[!] geoip:{code} bypass skipped (every CIDR overlaps a "
+                      f"protected endpoint/bypass prefix).")
+            return
     print(f"[*] Installing geoip:{code} bypass ({len(v4)} IPv4, {len(v6)} IPv6) via {iface}...")
+    # Heartbeat BEFORE the slow pre-install passes below.  The dashboard's
+    # startup watchdog extends its grace window while [GEO-LOAD] markers keep
+    # arriving; without this early marker the metric fix + conflict sweep
+    # (both PowerShell) run in total marker silence and a legitimate-but-slow
+    # install gets killed at the plain startup timeout ("helper hung for 90s"
+    # right after "Installing geoip..." - the exact report from the field).
+    print(f"[GEO-LOAD] code={code} loaded=0 total={len(v4) + len(v6)}", flush=True)
     # Direct (physical) geo case: a self-healing Windows VPN re-injects its own
     # routes for these exact CIDRs, so beating it requires the physical
     # interface metric to sit below the VPN's.  No-op when geo is routed via
@@ -1499,6 +1758,10 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None):
                                  ("v6", v6, v6iface, v6gw)):
         if subset and ifa and gw is not None:
             _geo_remove_conflicts(subset, ifa, fam)
+    # Heartbeat: the sweep above can take a while on a bloated route table -
+    # tell the dashboard it is still alive before the sub-batch installs start
+    # emitting their own markers.
+    print(f"[GEO-LOAD] code={code} loaded=0 total={len(v4) + len(v6)}", flush=True)
 
     # Install the routes in sub-batches of GEO_SUB_BATCH entries.  Each sub-batch
     # is a single `netsh -f` script (one netsh process for the whole batch, not
@@ -1603,6 +1866,23 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None):
             if diag:
                 msg += f"  first error: {diag}"
             _geo_diag(("routefail", code, fam), msg)
+    # Belt-and-braces: re-install the protected host routes the caller handed
+    # us.  add_v4/add_v6 are idempotent (an identical route is kept, a drifted
+    # one is replaced), so this is a cheap no-op when the table is already
+    # right - and a self-repair when anything above (or another actor) left an
+    # endpoint / user-bypass host route missing or on the wrong egress.
+    # Without it, the moment a covering geo range outlives the /32, the
+    # transport silently rides the country ranges and loops.
+    for fam_r, dest_r, iface_r, gw_r in (reassert or ()):
+        if not iface_r or gw_r is None:
+            continue
+        try:
+            if fam_r == "v4":
+                add_v4(dest_r, iface_r, gw_r, metric=1)
+            else:
+                add_v6(dest_r, iface_r, gw_r, 1)
+        except Exception:
+            pass
     # Signal the dashboard that this category's install pass is finished - even
     # if some routes failed (loaded < total).  Without this, the dashboard's
     # progress panel would stay on screen forever once any route failed, since
@@ -1666,9 +1946,18 @@ def _remove_routes_bulk(routes):
 def cleanup():
     global cleaned
     global wintun_saved_metric
+    global _control_mtime
     if cleaned:
         return
     cleaned = True
+    # Drop the live-reconfig control file so a DNS choice made via [N] in
+    # THIS session can never leak into a future run (the next helper run
+    # also baselines the file's mtime - this just removes the stale state).
+    try:
+        os.remove(CONTROL_FILE)
+        _control_mtime = 0.0
+    except OSError:
+        pass
     # Restore the physical (geo) interface metric we may have lowered to beat a
     # self-healing Windows VPN, before touching any other state.
     restore_physical_metric()
@@ -1750,12 +2039,264 @@ def _probe_tunnel_once(url="https://api.ipify.org/", timeout=5):
         return False, f"{host} resolved ({', '.join(addrs)}) but fetch failed: {e}"
 
 
+def _probe_tunnel_multi(timeout=4, urls=None):
+    """Probe the tunnel against SEVERAL fast endpoints (see _VERIFY_URLS) and
+    return (ok, message) on the FIRST success.
+
+    All endpoints are probed CONCURRENTLY (one thread each, first success
+    wins) - the same strategy wait_for_tunnel_stable() uses at startup. The
+    monitor loop used to try the URLs ONE BY ONE, so a single slow/blocked
+    endpoint (api.ipify.org's TLS handshake timing out through a congested
+    tunnel) delayed the verdict by its full timeout AND could be the only
+    message reported even though the faster endpoints also matter. Racing
+    them all at once means a healthy tunnel is confirmed in <=timeout no
+    matter how many endpoints are blocked, and a genuine outage collects
+    every endpoint's error for the failure report.
+
+    On total failure the message lists each endpoint's last error, so the
+    operator can see WHICH endpoints disagreed rather than only the last
+    one tried."""
+    urls = list(urls or _VERIFY_URLS)
+    if len(urls) == 1:
+        return _probe_tunnel_once(urls[0], timeout=timeout)
+
+    results: dict[str, str] = {}
+
+    def _run(url):
+        ok, msg = _probe_tunnel_once(url, timeout=timeout)
+        host = _host_from_url(url) or url
+        if ok:
+            results[host] = ""          # success marker
+        else:
+            detail = msg.split(": ", 1)[-1] if ": " in msg else msg
+            results[host] = detail
+
+    # Every probe has its own `timeout`, so waiting for ALL of them costs at
+    # most ~timeout seconds - exactly what ONE sequential failing probe used
+    # to cost - while a healthy tunnel is confirmed by whichever endpoint
+    # answers first. Bounded beyond that so a wedged getaddrinfo/urlopen
+    # (they honour the socket timeout only loosely during DNS) cannot stall
+    # the monitor loop.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(urls)) as ex:
+        futs = [ex.submit(_run, u) for u in urls]
+        concurrent.futures.wait(futs, timeout=timeout + 5)
+        for f in futs:
+            f.cancel()
+
+    # First success wins.
+    winner = next((h for h, v in results.items() if v == ""), None)
+    if winner is not None:
+        return True, winner
+
+    failures = [f"{h}: {d}" for h, d in results.items() if d]
+    if not failures:
+        return False, "no probe endpoint answered"
+    return False, " | ".join(failures)
+
+
+# ── Leak probe (monitor loop) ────────────────────────────────────────────────
+# Proves that NO egress escapes the TUN, not just the verification probe's
+# own HTTP: compares the DIRECT egress IP with the SOCKS-proxied egress IP.
+# With the full-tunnel routes healthy, even a "direct" socket traverses
+# wintun and exits at the SAME IP as the proxied request - so
+#   direct == tunnel exit -> OK  (all traffic rides the TUN)
+#   direct != tunnel exit -> LEAK (direct traffic escapes via the physical
+#                                  NIC and reveals the real ISP IP)
+# (The old dashboard [L] verdict claimed the opposite, which is why this
+# check never existed in the monitor before.)
+# Self-contained on purpose: helper.py is launched as a standalone script
+# and never imports upward into the Monitor/UI layers (same convention as
+# every other re-implemented primitive in this file).
+
+_LEAK_ECHO_ENDPOINTS = [
+    ("https", "api.ipify.org", "/"),
+    ("https", "ifconfig.me", "/ip"),
+    ("https", "icanhazip.com", "/"),
+    ("https", "api.ip.sb", "/ip"),
+    ("http", "api.ipify.org", "/"),
+    ("http", "icanhazip.com", "/"),
+]
+
+
+def _leak_valid_ip(text):
+    """Bare-IP validation: echo endpoints answer with just an address; a
+    captive portal or interception page answers with HTML. Everything that
+    does not strictly parse as an IP is rejected."""
+    if not text:
+        return None
+    candidate = text.strip().splitlines()[0].strip() if text.strip() else ""
+    if not candidate:
+        return None
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def _leak_recv_exact(sock, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _leak_http_get(sock, scheme, host, path, timeout):
+    """One raw HTTP GET over an already-connected socket; returns the body.
+    Non-2xx replies raise (a redirect carries no usable IP)."""
+    if scheme == "https":
+        import ssl
+        sock = ssl.create_default_context().wrap_socket(
+            sock, server_hostname=host)
+    sock.settimeout(timeout)
+    sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+                  "User-Agent: tuntop-leak/1.0\r\nAccept: */*\r\n"
+                  "Connection: close\r\n\r\n").encode("ascii"))
+    buf = b""
+    while len(buf) < 16384:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    parts = (head.split(b"\r\n", 1)[0] if head else b"").split(b" ")
+    if len(parts) < 2 or not parts[1].startswith(b"2"):
+        code = parts[1].decode("ascii", "replace") if len(parts) > 1 else "?"
+        raise OSError(f"HTTP {code}")
+    return body.decode("utf-8", "replace")
+
+
+def _leak_fetch_direct(scheme, host, path, timeout):
+    """Direct socket fetch. With the full-tunnel routes installed this is
+    routed through the TUN, so the echoed source IP IS the tunnel exit."""
+    port = 443 if scheme == "https" else 80
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        return _leak_http_get(sock, scheme, host, path, timeout)
+
+
+def _leak_socks5_connect(socks_port, host, dst_port, timeout):
+    """SOCKS5 CONNECT (no-auth, remote DNS) through 127.0.0.1:<socks_port>."""
+    sock = socket.create_connection(("127.0.0.1", socks_port), timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(b"\x05\x01\x00")
+        if _leak_recv_exact(sock, 2) != b"\x05\x00":
+            raise OSError("SOCKS5 handshake rejected")
+        dom = host.encode("ascii")
+        sock.sendall(b"\x05\x01\x00\x03" + bytes((len(dom),)) + dom
+                     + dst_port.to_bytes(2, "big"))
+        head = _leak_recv_exact(sock, 4)
+        if len(head) < 4:
+            raise OSError(f"SOCKS5 short reply: {head!r}")
+        if head[1] != 0:
+            raise OSError(f"SOCKS5 CONNECT rejected (code {head[1]})")
+        atyp = head[3]
+        tail_len = {1: 4 + 2, 4: 16 + 2}.get(atyp)
+        if tail_len is None:
+            length = _leak_recv_exact(sock, 1)
+            if len(length) != 1:
+                raise OSError("SOCKS5 malformed reply")
+            tail_len = length[0] + 2
+        tail = _leak_recv_exact(sock, tail_len)
+        if len(tail) != tail_len:
+            raise OSError("SOCKS5 truncated reply")
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _leak_fetch_socks(socks_port, scheme, host, path, timeout):
+    """Fetch the echo THROUGH the local SOCKS5 inbound; the echoed source
+    IP is by construction the proxy's exit IP."""
+    port = 443 if scheme == "https" else 80
+    sock = _leak_socks5_connect(socks_port, host, port, timeout)
+    try:
+        return _leak_http_get(sock, scheme, host, path, timeout)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _leak_race(fetcher, timeout):
+    """Race every echo endpoint concurrently; first VALIDATED IP wins.
+    Returns (ip | None, first_error | None)."""
+    out = {"ip": None, "err": None}
+
+    def _run(scheme, host, path):
+        if out["ip"]:
+            return
+        try:
+            body = fetcher(scheme, host, path, timeout)
+        except Exception as e:
+            if out["err"] is None:
+                out["err"] = f"{host}: {e}"
+            return
+        ip = _leak_valid_ip(body)
+        if ip and out["ip"] is None:
+            out["ip"] = ip
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(_LEAK_ECHO_ENDPOINTS)) as ex:
+        futs = [ex.submit(_run, *ep) for ep in _LEAK_ECHO_ENDPOINTS]
+        concurrent.futures.wait(futs, timeout=timeout + 2)
+        for f in futs:
+            f.cancel()
+    return out["ip"], out["err"]
+
+
+def _leak_probe(socks_port, timeout=5):
+    """Compare DIRECT egress vs SOCKS-proxied egress concurrently.
+
+    Returns (status, message) with status in
+    {"ok", "leak", "no-proxy", "inconclusive", "no-network"}."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        fd = ex.submit(_leak_race, _leak_fetch_direct, timeout)
+        ft = ex.submit(
+            _leak_race,
+            lambda s, h, p, t: _leak_fetch_socks(socks_port, s, h, p, t),
+            timeout)
+        dip, derr = fd.result()
+        tip, terr = ft.result()
+    if dip is None and tip is None:
+        return "no-network", (f"no probe answered (direct: {derr or 'no answer'}; "
+                              f"tunnel: {terr or 'no answer'})")
+    if tip is None:
+        return "no-proxy", (f"SOCKS inbound 127.0.0.1:{socks_port} did not "
+                            f"answer ({terr or 'no answer'}) - proxy client down?")
+    if dip is None:
+        return "inconclusive", (f"tunnel exit {tip} OK, but the direct probe "
+                                f"got no answer ({derr or 'no answer'})")
+    if dip == tip:
+        return "ok", (f"no leak - direct egress matches the tunnel exit {tip}; "
+                      "all traffic rides the TUN")
+    return "leak", (f"direct egress {dip} != tunnel exit {tip} - direct "
+                    "traffic escapes outside the TUN (real IP is exposed)")
+
+
 # Fast, reliable verification endpoints — tried in order.
 # connectivitycheck.gstatic.com (Android check) and cp.cloudflare.com both
-# respond in <100ms from almost anywhere; api.ipify.org is a slow fallback.
+# respond in <100ms from almost anywhere; msftconnecttest.com (Windows' own
+# NCSI probe) is another ultra-light fallback; api.ipify.org is LAST because
+# it is slower and its TLS handshake through a congested tunnel can time out
+# (which used to read as "tunnel broken" in the monitor even when the tunnel
+# was fine).
 _VERIFY_URLS = [
     "http://connectivitycheck.gstatic.com/generate_204",
     "http://cp.cloudflare.com/",
+    "http://msftconnecttest.com/connecttest.txt",
     "https://api.ipify.org/",
 ]
 
@@ -1766,19 +2307,34 @@ _VERIFY_PRINT_LOCK = threading.Lock()
 def _verify_worker(url, timeout, attempts, tag, shared):
     """Retry ONE verification URL until it succeeds or `attempts` run out.
     Runs on its own thread (all URLs are probed at the SAME time), so a dead
-    endpoint can never delay the ones that work. First success anywhere wins."""
+    endpoint can never delay the ones that work. First success anywhere wins.
+
+    DNS-RESOLUTION failures (getaddrinfo/[Errno 11001] - plain UDP/53 through
+    the TUN not working, e.g. a SOCKS client whose UDP relay is broken) fail
+    INSTANTLY and do not heal by retrying, so they get at most 2 quick tries
+    with a 1s gap; the point is to reach the DoH escalation fast instead of
+    burning the full 5x2s budget on a resolver that cannot recover on its
+    own."""
+    dns_fails = 0
     for i in range(1, attempts + 1):
         ok, msg = _probe_tunnel_once(url, timeout=timeout)
         if ok:
             shared["ok"] = True
             shared["msg"] = msg
             return
+        dns_fail = msg.startswith("DNS resolve")
         with _VERIFY_PRINT_LOCK:
             if shared["ok"]:
                 return
             shared["last_err"] = msg.split(": ", 1)[-1] if ": " in msg else msg
             print(f"    [{i}/{attempts}]{tag} {url}: {msg}", flush=True)
-        time.sleep(2)
+        if dns_fail:
+            dns_fails += 1
+            if dns_fails >= 2:
+                return   # give up on this URL - let the DoH escalation take over
+            time.sleep(1)
+        else:
+            time.sleep(2)
 
 
 def wait_for_tunnel_stable(timeout=5):
@@ -1827,6 +2383,13 @@ def wait_for_tunnel_stable(timeout=5):
             configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
         except Exception as e:
             print(f"[!] DoH switch failed: {e}", flush=True)
+        # Flush the resolver cache so lookups stop hitting the broken plain-UDP
+        # path and pick up the freshly registered DoH servers immediately.
+        try:
+            run_ps("Clear-DnsClientCache -ErrorAction SilentlyContinue; "
+                   "ipconfig /flushdns | Out-Null")
+        except Exception:
+            pass
         if _run_round(" (DoH)"):
             return True
     return False
@@ -1913,7 +2476,8 @@ def start_tun2socks_pipe(device_name, ip4, ip6, port, tun2socks_path,
         sys.exit(f"[!] Wintun adapter '{device_name}' did not appear.")
 
     if device_name == TUN:
-        print(f"[*] Configuring Wintun: DNS4={dns4}  DNS6={dns6}")
+        print(f"[*] Configuring Wintun: DNS4={dns4 or '(none)'}  "
+              f"DNS6={dns6 or '(none)'}")
         configure_tun(dns4, dns6)
     else:
         # Secondary pipe: addresses only, never DNS (the primary owns it).
@@ -1945,14 +2509,20 @@ def main():
     ap.add_argument("--vpn-interface", default=None, metavar="ALIAS",
                     help="Manually specify the Windows VPN adapter's InterfaceAlias for "
                          "--vless-over-vpn, if auto-detection via Get-VpnConnection fails")
-    ap.add_argument("--dns4", default=DNS4, metavar="IP",
-                    help=f"DNS server to set on the Wintun adapter for IPv4 (default {DNS4}). "
-                         "If DNS lookups fail even though the tunnel itself works, try a "
-                         "different resolver here - some networks block specific DNS IPs "
-                         "directly, and some VLESS configs route well-known DNS IPs "
-                         "'direct' (outside the tunnel) by routing-rule default.")
-    ap.add_argument("--dns6", default=DNS6, metavar="IP",
-                    help=f"DNS server to set on the Wintun adapter for IPv6 (default {DNS6})")
+    ap.add_argument("--dns4", default=None, metavar="IP",
+                    help=f"IPv4 DNS server to set on the Wintun adapter. Pass --dns4 "
+                         f"(and/or --dns6) and the tunnel uses EXACTLY what you gave: a "
+                         f"--dns4 without --dns6 sets IPv4 DNS only and leaves IPv6 DNS "
+                         f"unset. With neither flag the defaults are used ({DNS4} + "
+                         f"{DNS6}); --dns4 {DNS4} alone also counts as 'no choice' for "
+                         f"backward compatibility. If DNS lookups fail even though the "
+                         f"tunnel itself works, try a different resolver here - some "
+                         f"networks block specific DNS IPs directly, and some VLESS "
+                         f"configs route well-known DNS IPs 'direct' (outside the "
+                         f"tunnel) by routing-rule default.")
+    ap.add_argument("--dns6", default=None, metavar="IP",
+                    help=f"IPv6 DNS server to set on the Wintun adapter. See --dns4 for "
+                         f"the selection rules (default when nothing is chosen: {DNS6})")
     ap.add_argument("--dns-mode", choices=["plain", "doh", "auto"], default="auto",
                     help="Wintun DNS delivery: plain (UDP/53 - needs UDP relay through "
                          "the proxy), doh (DNS-over-HTTPS over TCP/443 - works whenever TCP "
@@ -2017,11 +2587,24 @@ def main():
     # (called on every route install, and again if tun2socks recreates the adapter)
     # uses them instead of falling back to the hardcoded DNS4/DNS6 defaults.
     global _ACTIVE_DNS4, _ACTIVE_DNS6, _ACTIVE_DNS_MODE, _ACTIVE_DOH_TEMPLATE
+    global _control_mtime
     global vpn_override_iface
-    _ACTIVE_DNS4 = args.dns4
-    _ACTIVE_DNS6 = args.dns6
+    _ACTIVE_DNS4, _ACTIVE_DNS6 = _resolve_dns_choice(args.dns4, args.dns6)
+    if _ACTIVE_DNS4 and _ACTIVE_DNS6:
+        print(f"[*] DNS: IPv4 {_ACTIVE_DNS4} + IPv6 {_ACTIVE_DNS6}")
+    elif _ACTIVE_DNS4:
+        print(f"[*] DNS: IPv4 {_ACTIVE_DNS4} (v4 only - IPv6 DNS stays unset)")
+    elif _ACTIVE_DNS6:
+        print(f"[*] DNS: IPv6 {_ACTIVE_DNS6} (v6 only - IPv4 DNS stays unset)")
+    else:
+        print("[*] DNS: none set")
     _ACTIVE_DNS_MODE = args.dns_mode
     _ACTIVE_DOH_TEMPLATE = args.doh_template
+    # Baseline the live-reconfig channel (see _baseline_control_file): only
+    # control-file writes made while THIS run is up may change the DNS - a
+    # leftover file from an earlier session must never override the launch
+    # flags this run was started with.
+    _baseline_control_file()
 
     if not is_admin():
         sys.exit("[!] Run this script as Administrator.")
@@ -2125,7 +2708,7 @@ def main():
         print(f"    {name}: {server} -> {', '.join(ep4 + ep6)}")
 
     tun_proc = start_tun2socks_pipe(TUN, TUN4, TUN6, args.port,
-                                    args.tun2socks, args.dns4, args.dns6)
+                                    args.tun2socks, _ACTIVE_DNS4, _ACTIVE_DNS6)
 
     # ── Install bypass routes NOW (before the tun2socks IPv6 restart) ──
     # Resolving the egress and adding the /32 (and /128) bypass routes here
@@ -2241,7 +2824,7 @@ def main():
         sys.exit(f"[!] tun2socks exited after restart: {tun_proc.returncode}")
     if not wait_for_tun():
         sys.exit("[!] Wintun adapter did not reappear after restart.")
-    configure_tun(args.dns4, args.dns6)
+    configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
 
     # ── Second proxy pipe (optional, --proxy2-port) ──────────────────────────
     # A second TUN adapter + tun2socks against a second local SOCKS5 port.
@@ -2318,6 +2901,10 @@ def main():
 
         # CLI-provided second-hop hosts get their TUN2 routes right away, so
         # the feature works headless; the dashboard can add more live.
+        # Their prefixes are also collected so the geoip pass below never
+        # removes/overrides them (a geo CIDR equal to one of these /32s would
+        # otherwise be swept away and re-pointed at the geo egress).
+        _p2b_v4, _p2b_v6 = [], []
         for entry in (args.proxy2_bypass_ip or []):
             ep4, ep6 = resolve_all_safe(entry, label=f"proxy2-bypass {entry}")
             if ep4 is None and ep6 is None:
@@ -2325,20 +2912,33 @@ def main():
             print(f"    [proxy2-bypass] {entry} -> "
                   f"{', '.join((ep4 or []) + (ep6 or []))} via {TUN2}")
             for ip in (ep4 or []):
+                _p2b_v4.append(ip)
                 add_v4(f"{ip}/32", TUN2, TUN2_IP4, metric=1)
             for ip in (ep6 or []):
+                _p2b_v6.append(ip)
                 add_v6(f"{ip}/128", TUN2, TUN2_IP6, metric=1)
 
     # (Bypass routes are now installed right after the first Wintun config,
     #  before the tun2socks IPv6 restart, so they take effect instantly.)
 
     # ── geoip.dat bypass (route-level "bypass mainland" / geoip:cn) ─────────
-    # Install these BEFORE the TUN default route so domestic destinations are
-    # captured by the more-specific country ranges and stay direct, while the
-    # TUN split-default still carries the rest of the world.
-    if args.geoip:
+    # Installs in a BACKGROUND thread (below): every geo prefix is more
+    # specific than the TUN split-defaults, so the country ranges win the
+    # lookup whenever they land - install order vs the default routes does
+    # not matter, but NOT blocking "[+] TUNNEL ACTIVE" does.
+    def _geo_install():
+        # Runs in a BACKGROUND daemon thread (launched right below). The geo
+        # install can legitimately take minutes (file decode + 3000+ route
+        # adds); running it INLINE delayed "[+] TUNNEL ACTIVE" past the
+        # dashboard's 90s startup watchdog, which then killed a HEALTHY helper
+        # ("helper hung for 90s" right after "Installing geoip:ir bypass..." -
+        # and geo never finished loading). Route ordering does not depend on
+        # install order: every geo prefix is more specific than the /0-/1
+        # split-defaults, so the country routes win the lookup whenever they
+        # land. The tunnel comes up immediately; country routes stream in
+        # behind it (watch the GEO panel fill up).
         code = args.geoip_code
-        print(f"[*] Loading geoip file bypass for code '{code}' from {args.geoip} ...")
+        print(f"[*] Loading geoip file bypass for code '{code}' from {args.geoip} ... (background)")
         try:
             # Emit a [GEO-PARSE] marker as the file is decoded so the dashboard
             # shows the *file load* phase (not just the later route install) and
@@ -2395,9 +2995,34 @@ def main():
             # tunnel setup - the wintun default + split-default routes below must
             # always be installed even if the country bypass blows up.
             try:
-                add_geoip_bypass(code, cidrs, g_iface, g_gw, v6iface, v6gw)
+                # Endpoints + user bypass entries OUTRANK the country ranges:
+                # geoip.dat can contain the VLESS/VPN server's own IP (even as
+                # an exact /32 identical to its host route).  Without this, the
+                # geo install's conflict sweep would delete the server's host
+                # route and re-add it pointing at the GEO egress - the proxy
+                # transport then loops into its own tunnel (endless failing
+                # connects to the server IP in the log).
+                _p2v4 = (p2_v4 + _p2b_v4) if args.proxy2_port is not None else []
+                _p2v6 = (p2_v6 + _p2b_v6) if args.proxy2_port is not None else []
+                add_geoip_bypass(
+                    code, cidrs, g_iface, g_gw, v6iface, v6gw,
+                    protected=collect_protected_geo_prefixes(
+                        server_v4=v4, server_v6=v6,
+                        bypass_v4=extra_bypass_v4, bypass_v6=extra_bypass_v6,
+                        vpn_v4=vpn_v4, vpn_v6=vpn_v6,
+                        proxy2_v4=_p2v4, proxy2_v6=_p2v6,
+                    ),
+                )
             except Exception as e:
                 print(f"[!] geoip bypass install failed ({code}): {e}; continuing without it.")
+
+    if args.geoip:
+        # Background daemon: never blocks the startup sequence (see the
+        # docstring on _geo_install). Daemon because a Ctrl+C/[T] stop must
+        # not be held up by a half-finished geo install - the exit cleanup
+        # sweeps whatever routes actually made it into the table.
+        threading.Thread(target=_geo_install, name="geo-install",
+                         daemon=True).start()
 
     print("[*] Installing IPv4 default route through Wintun...")
     # The wintun IPv4 address (192.168.123.1) is the next-hop for every IPv4
@@ -2532,6 +3157,7 @@ def main():
 
     last_vpn_status = None
     last_probe = 0.0
+    last_leak = None      # last leak verdict - report only on CHANGE
     fails = 0
     mon_interval = max(5, args.monitor_interval)
     mon_retries = max(1, args.monitor_retries)
@@ -2549,7 +3175,8 @@ def main():
                 status = get_vpn_connection_names_status().get(vpn_conn_name_for_check)
                 if status != last_vpn_status:
                     if status and status != "Connected":
-                        print(f"[!] Windows VPN '{vpn_conn_name_for_check}' status changed: {status}")
+                        print(f"[!] Windows VPN '{vpn_conn_name_for_check}' status changed: {status}",
+                              flush=True)
                     last_vpn_status = status
             # Live monitor / debug loop: periodically verify the tunnel resolves
             # and carries traffic through the TUN. On repeated failure, self-heal
@@ -2557,11 +3184,38 @@ def main():
             # manual restart. --no-monitor disables this entirely.
             if not args.no_monitor and (now - last_probe) >= mon_interval:
                 last_probe = now
-                ok, msg = _probe_tunnel_once()
+                ok, msg = _probe_tunnel_multi(timeout=4)
                 if ok:
                     fails = 0
                     print(f"[MONITOR] tunnel OK: {msg}", flush=True)
+                    # Leak check - part of the regular monitor: prove that
+                    # ALL egress (direct traffic included) still rides the
+                    # TUN, not just the verification probe's own HTTP. Only
+                    # meaningful when the tunnel itself just verified. The
+                    # dashboard reacts to these markers: "LEAK DETECTED"
+                    # marks the tunnel DEGRADED, a later "leak check OK"
+                    # restores RUNNING. Verdict is reported only when it
+                    # CHANGES, so the log stays quiet.
+                    try:
+                        leak_status, leak_msg = _leak_probe(args.port,
+                                                            timeout=5)
+                    except Exception as e:
+                        leak_status, leak_msg = "inconclusive", f"probe error: {e}"
+                    if leak_status != last_leak:
+                        last_leak = leak_status
+                        if leak_status == "ok":
+                            print(f"[MONITOR] leak check OK: {leak_msg}",
+                                  flush=True)
+                        elif leak_status == "leak":
+                            print(f"[MONITOR] LEAK DETECTED: {leak_msg}",
+                                  flush=True)
+                        else:
+                            print(f"[MONITOR] leak check {leak_status}: "
+                                  f"{leak_msg}", flush=True)
                 else:
+                    # Egress broken: re-arm the leak verdict so the first
+                    # healthy cycle after recovery re-reports it once.
+                    last_leak = None
                     fails += 1
                     print(f"[MONITOR] tunnel check failed ({fails}/{mon_retries}): {msg}", flush=True)
                     if fails >= mon_retries:
@@ -2569,7 +3223,7 @@ def main():
                         # rides over TCP/443 instead of the broken UDP/53 path.
                         if _ACTIVE_DNS_MODE == "auto":
                             print("[*] Monitor: repeated DNS/egress failures; "
-                                  "escalating wintun DNS to DoH.")
+                                  "escalating wintun DNS to DoH.", flush=True)
                             _ACTIVE_DNS_MODE = "doh"
                         # Self-heal with the LIVE DNS values, not the
                         # launch-time ones - otherwise a DNS change applied

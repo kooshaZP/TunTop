@@ -22,7 +22,7 @@ Right-click `Run_Helper.ps1` → "Run with PowerShell" → confirm the UAC promp
 ## Tunnel
 
 ### Traffic isn't going through the tunnel
-Run a leak test with `[L]` inside the dashboard. It compares your direct exit IP with the tunneled exit IP. If they match, traffic is leaking outside the tunnel.
+Run a leak test with `[L]` inside the dashboard. It compares your direct exit IP with the tunneled exit IP. If they **match**, all traffic — including "direct" traffic — is riding the tunnel (no leak). If the direct IP **differs** from the tunnel exit, direct traffic is escaping outside the tunnel (a leak). The tunnel's monitor loop runs this check automatically every cycle and logs the result as `[MONITOR] leak check ...` lines.
 
 ### Health scan shows failing probes
 Press `[D]` to export diagnostics — it captures your config, routes, logs, and the last scan. Attach it to a GitHub issue for fastest help.
