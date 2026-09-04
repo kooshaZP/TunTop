@@ -868,11 +868,48 @@ def _ipv6_tun_verdict(port, url="https://www.cloudflare.com/cdn-cgi/trace"):
                    f"(curl -6 -> {code}); IPv6 tunnel is broken")
 
 
+def _dns_enforcement_check(dns_ip, is_v6=False):
+    """Health check: which interface would Windows actually SELECT to reach
+    this resolver? (DNS leak-PROTECTION, not resolver availability.)
+
+    Find-NetRoute -RemoteIPAddress <resolver> returns the route Windows's
+    own selection algorithm would use for that destination - the ground
+    truth, not a guess from route-table filtering. Enforced = the selected
+    interface is the Wintun TUN, so UDP/53 to this resolver physically
+    cannot leave except through the tunnel. If Windows selects the
+    physical NIC (or a VPN), the resolver is reachable OUTSIDE the tunnel:
+    either a deliberate bypass (geo routing writes those routes on
+    purpose) or broken enforcement - the detail names the interface so
+    the user can tell policy from accident.
+    """
+    ok, out = _ps(
+        "$a = (Find-NetRoute -RemoteIPAddress "
+        f"'{ps_quote(dns_ip)}' -ErrorAction SilentlyContinue | "
+        "Select-Object -First 1 -ExpandProperty InterfaceAlias); "
+        "if ($a) { 'SELECTED ' + $a } else { 'NO-ROUTE' }")
+    if not ok:
+        return None, f"route probe failed: {out}"
+    if "NO-ROUTE" in out:
+        return None, (f"{dns_ip}: Windows has no route to it at all right "
+                      "now - enforcement state unknown")
+    iface = out.split("SELECTED", 1)[1].strip() or "?"
+    if re.match(r"(?i)^wintun2?$", iface):
+        fam = "IPv6" if is_v6 else "IPv4"
+        return True, (f"{dns_ip} rides the TUN ({fam}) - Windows would send "
+                      "DNS to it only through the tunnel")
+    return False, (f"{dns_ip} is reachable OUTSIDE the tunnel - Windows "
+                   f"selects '{iface}' for it, so DNS to this resolver can "
+                   "bypass the TUN (expected only if you deliberately "
+                   "bypassed this resolver; otherwise a leak)")
+
+
 def _leak_check(port, timeout=None):
     """Health-check wrapper around the Monitor-layer leak probe.
 
     Verdict mapping (see tuntop/monitor/leak.py):
       ok           -> PASS (direct egress == tunnel exit: nothing escapes)
+      same-exit    -> PASS (addresses differ but same network: exit-side
+                    rotation, both legs rode the tunnel)
       leak         -> FAIL (direct traffic escapes the TUN)
       no-proxy     -> FAIL (the SOCKS inbound is down - tunnel not usable)
       no-network   -> FAIL (neither leg answered)
@@ -1035,6 +1072,18 @@ def build_checks(ns):
         # traverses the TUN and exits at the SAME IP as the SOCKS-proxied
         # fetch. A differing direct IP means traffic escapes the TUN.
         ("Tunnel leak test (direct vs tunnel egress)", lambda: _leak_check(p)),
+        # ── DNS leak protection (enforcement, not availability) ──────────
+        # The rows above prove the RESOLVER WORKS; the two rows below prove
+        # the resolvers are UNREACHABLE WITHOUT the tunnel - i.e. the TUN is
+        # the only path DNS queries can take, so a half-broken tunnel cannot
+        # silently emit plaintext UDP/53 out of the physical NIC. When the
+        # chosen resolver is itself bypassed (geo/bypass routing), that is a
+        # deliberate policy, not a leak - the details say so.
+        ("DNS v4 enforcement (no path without TUN)",
+         lambda: _dns_enforcement_check(dns, False)),
+        ("DNS v6 enforcement (no path without TUN)",
+         lambda: _dns_enforcement_check(
+             getattr(ns, "dns6", None) or _cfgdef.DNS6, True)),
         q("v2rayN core process",
           "Get-Process -ErrorAction SilentlyContinue | ? {$_.ProcessName -match '^(xray|v2ray|sing-box|mihomo|clash)'} | select -First 1 | % {$_.ProcessName + ' PID ' + $_.Id}"),
     ]
@@ -3426,7 +3475,8 @@ class BTopTui:
                            f"{d.get('ms', '?')} ms, via tunnel {t.get('ms', '?')} ms.")
                 prefix = {"leak": "[!]", "no-proxy": "[!]",
                           "no-network": "[!]"}.get(status, "[+]"
-                                                   if status == "ok" else "[i]")
+                                                   if status in ("ok", "same-exit")
+                                                   else "[i]")
                 self._blog(f"{prefix} Leak test: {msg}")
             except Exception as e:
                 self._blog(f"[!] Leak test crashed: {e.__class__.__name__}: {e}")

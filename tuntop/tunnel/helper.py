@@ -2125,8 +2125,8 @@ def _leak_probe(socks_port, timeout=5):
     """Compare DIRECT egress vs SOCKS-proxied egress concurrently.
 
     Returns (status, message) with status in
-    {"ok", "leak", "no-proxy", "inconclusive", "no-network"} - see
-    tuntop/network/leak_probe.py for the full verdict table."""
+    {"ok", "same-exit", "leak", "no-proxy", "inconclusive", "no-network"} -
+    see tuntop/network/leak_probe.py for the full verdict table."""
     status, message, _legs = _import_leak_probe().run_leak_probe(
         socks_port, timeout=timeout)
     return status, message
@@ -3049,7 +3049,7 @@ def main():
                         leak_status, leak_msg = "inconclusive", f"probe error: {e}"
                     if leak_status != last_leak:
                         last_leak = leak_status
-                        if leak_status == "ok":
+                        if leak_status in ("ok", "same-exit"):
                             print(f"[MONITOR] leak check OK: {leak_msg}",
                                   flush=True)
                         elif leak_status == "leak":

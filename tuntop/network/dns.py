@@ -150,8 +150,16 @@ def _dns_query_udp(host, server, qtype, timeout=1.5):
 
 
 def _dns_query_doh(host, qtype, endpoint, timeout=4.0):
-    """DNS-over-HTTPS (RFC 8484 GET, wire format). Rides TCP/443, so it works
-    in the situations where UDP/53 through the tunnel does not."""
+    """DNS-over-HTTPS (RFC 8484 GET, wire format).
+
+    ROUTING CAVEAT: this rides TCP/443 wherever TCP/443 is *routed* - it
+    only relays through the proxy when the TUN owns the default route.
+    That is exactly what makes it a resolution fallback (it survives
+    networks where UDP/53 egress is blocked) and exactly what disqualifies
+    it as leak PROTECTION: in the same half-broken state that kills the
+    system resolver, these queries can leave via the physical NIC in
+    plaintext-443 to a public resolver. Treat it as availability, never
+    as privacy enforcement."""
     try:
         import urllib.request
         _tid, pkt = _dns_build_query(host, qtype)

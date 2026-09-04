@@ -24,8 +24,17 @@ show the SAME IP that IP is the tunnel exit, i.e. even "direct" traffic
 rides the TUN and nothing escapes):
 
   ok            direct == tunnel exit -> NO leak, all egress via the tunnel
-  leak          direct != tunnel exit -> direct traffic escapes the TUN and
-                                       reveals the real (ISP) public IP
+  same-exit     direct != tunnel exit BUT both addresses belong to the
+                SAME network (same /32) -> both legs still exited through
+                the tunnel; the addresses differ only because the exit
+                rotates its outbound address between connections (dual-
+                stack pools, CDNs). NOT a leak: the real ISP IP would be
+                from a completely different network. (The old code called
+                this a LEAK - a false positive on every provider that
+                rotates IPv6 addresses per connection.)
+  leak          direct != tunnel exit AND the addresses belong to
+                DIFFERENT networks -> direct traffic escapes the TUN and
+                reveals the real (ISP) public IP
   no-proxy      the SOCKS inbound did not answer - tunnel leg impossible,
                                        not a leak verdict
   inconclusive  the tunnel leg is proven fine but the direct probe got no
@@ -53,6 +62,31 @@ __all__ = ["run_leak_probe", "LEAK_TIMEOUT"]
 # How long one echo attempt may take, and therefore the practical upper
 # bound of the whole probe (both legs run concurrently).
 LEAK_TIMEOUT = 5.0
+
+# Prefix length under which two different addresses count as "the same
+# network". /32 covers both real-world rotation cases: IPv6 providers hand
+# out addresses from one /32 (or larger) block per exit, and IPv4 hosts sit
+# on a single /32 by definition - so a genuine ISP IP (a different network
+# altogether) can never land inside it, while exit-side rotation (pools,
+# CDNs, per-connection IPv6) reliably does.
+_PREFIX_LEN = 32
+
+
+def _same_network(a, b):
+    """True when two address strings belong to the same /{_PREFIX_LEN}.
+
+    Two connections through the same tunnel exit frequently echo DIFFERENT
+    addresses (the exit rotates its outbound IP: v6 pools, CDN frontends).
+    A real leak shows a different NETWORK (your ISP), not a different
+    address from the exit's own block - so comparing ownership, not string
+    equality, is what stops the probe from crying wolf."""
+    try:
+        na = ipaddress.ip_network(f"{a}/{_PREFIX_LEN}", strict=False)
+        nb = ipaddress.ip_network(f"{b}/{_PREFIX_LEN}", strict=False)
+        return na == nb
+    except ValueError:
+        return False
+
 
 # IP-echo endpoints raced per leg: (scheme, host, path).  HTTPS first
 # (captive portals cannot forge a valid TLS certificate for these hosts),
@@ -258,8 +292,15 @@ def _verdict(direct, tunnel, socks_port):
     if dip == tip:
         return "ok", (f"no leak - direct egress matches the tunnel exit {tip}; "
                       "all traffic rides the TUN")
-    return "leak", (f"LEAK: direct egress {dip} != tunnel exit {tip} - direct "
-                    "traffic escapes outside the TUN and shows your real IP "
+    if _same_network(dip, tip):
+        return "same-exit", (
+            f"no leak - direct egress {dip} and tunnel exit {tip} differ but "
+            f"belong to the SAME network (/{_PREFIX_LEN}): both legs exited "
+            "through the tunnel; the exit server rotated its outbound address "
+            "between the two connections. Your real IP was NOT exposed.")
+    return "leak", (f"LEAK: direct egress {dip} != tunnel exit {tip} - the two "
+                    "addresses belong to DIFFERENT networks, so direct traffic "
+                    "escapes outside the TUN and shows your real IP "
                     "(expected only if you deliberately bypass this destination)")
 
 

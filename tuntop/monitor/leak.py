@@ -31,7 +31,10 @@ def as_check_result(status, message):
 
     "inconclusive" counts as a PASS: the tunnel leg was proven working and
     only the direct comparison could not be made - that is not a tunnel
-    fault (see the verdict table in tuntop/network/leak_probe.py)."""
-    if status == "inconclusive":
+    fault (see the verdict table in tuntop/network/leak_probe.py).
+    "same-exit" also passes: the direct leg's address differs from the
+    tunnel exit's but belongs to the SAME network - both legs rode the
+    tunnel and the exit rotated its outbound address between connections."""
+    if status in ("inconclusive", "same-exit"):
         return True, message
     return status == "ok", message

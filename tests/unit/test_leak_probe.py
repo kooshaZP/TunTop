@@ -81,6 +81,29 @@ class TestVerdictMatrix(unittest.TestCase):
         self.assertIn("9.9.9.9", msg)
         self.assertIn("1.1.1.1", msg)
 
+    def test_same_exit_when_same_network_not_same_address(self):
+        # Exit-side address rotation: both legs belong to the same /32, so
+        # both rode the tunnel - NOT a leak. Regression test for the old
+        # string-equality verdict that false-alarmed on this exact pattern
+        # (2a09:bac5:... pair reported by a user on a v6-less Wi-Fi).
+        status, msg = L._verdict(
+            _leg("2a09:bac5:465:c00::132:18"),
+            _leg("2a09:bac5:5275:2864::406:48"), 10808)
+        self.assertEqual(status, "same-exit")
+        self.assertIn("SAME network", msg)
+        self.assertNotIn("LEAK", msg)
+
+    def test_leak_when_different_networks(self):
+        # A different /32 (real ISP IP vs tunnel exit) is still a leak.
+        status, _ = L._verdict(_leg("89.198.14.7"), _leg("45.12.33.9"), 10808)
+        self.assertEqual(status, "leak")
+
+    def test_same_network_helper(self):
+        self.assertTrue(L._same_network("2a09:bac5:465:c00::132:18",
+                                        "2a09:bac5:5275:2864::406:48"))
+        self.assertFalse(L._same_network("89.198.14.7", "45.12.33.9"))
+        self.assertFalse(L._same_network("garbage", "8.8.8.8"))
+
     def test_no_proxy_when_tunnel_leg_dead(self):
         status, msg = L._verdict(_leg("9.9.9.9"), _leg(None, "refused"), 10808)
         self.assertEqual(status, "no-proxy")
@@ -110,6 +133,10 @@ class TestAsCheckResult(unittest.TestCase):
         # The tunnel leg was proven fine; a mute direct probe is not a
         # tunnel fault.
         self.assertEqual(ML.as_check_result("inconclusive", "m"), (True, "m"))
+
+    def test_same_exit_passes_with_detail(self):
+        # Same-network address rotation is not a tunnel fault either.
+        self.assertEqual(ML.as_check_result("same-exit", "m"), (True, "m"))
 
 
 class TestRaceLeg(unittest.TestCase):

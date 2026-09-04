@@ -5,6 +5,20 @@ All notable changes to TunTop are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **The [L] leak test no longer false-alarms on exit-side address
+  rotation**: the verdict compared the direct and tunnel egress IPs as
+  plain strings, so when the tunnel exit rotates its outbound IPv6
+  between the two connections (both addresses inside one provider /32 -
+  e.g. 2a09:bac5:465:c00::... vs 2a09:bac5:5275:2864:... on a Wi-Fi with
+  no native IPv6, where "direct" traffic provably has no path but the
+  TUN) it screamed "LEAK: ... shows your real IP" for traffic that never
+  left the tunnel. Verdicts are now ownership-aware: identical address ->
+  ok; different address but SAME /32 -> the new "same-exit" verdict (both
+  legs rode the tunnel; the exit rotated its outbound address - NOT a
+  leak); different NETWORK -> leak (the real-ISP case is still caught).
+  The monitor layer, the helper's [MONITOR] loop and the dashboard all
+  treat "same-exit" as a pass. Regression tests pin the exact reported
+  address pair as same-exit and a cross-network pair as leak.
 - **Health-panel rows can no longer overflow the panel or silently lose
   their detail**: `format_panel()` computed the detail budget as
   `width - len(name) - 8` with NO guard - a check label longer than the
@@ -135,7 +149,21 @@ All notable changes to TunTop are documented here.
   blocked/lying endpoint (captive portal, interception page) can never
   produce a false verdict; the manual `[L]` test no longer depends on
   `curl.exe` and reports per-leg latency plus a clear verdict for every
-  outcome (ok / leak / no-proxy / inconclusive / no-network).
+  outcome (ok / same-exit / leak / no-proxy / inconclusive / no-network).
+- **DNS enforcement checks in the health panel** (leak PROTECTION, not
+  resolver availability - the distinction the egress probe alone cannot
+  make): "DNS v4/v6 enforcement (no path without TUN)" rows ask Windows
+  (`Find-NetRoute -RemoteIPAddress <resolver>`) which interface it would
+  actually SELECT for the configured resolver. Selected interface is the
+  Wintun TUN -> enforced (UDP/53 to that resolver physically cannot leave
+  except through the tunnel). Windows selects the physical NIC / a VPN ->
+  flagged as bypassable with the interface named (expected only with a
+  deliberate resolver bypass; otherwise a leak). The old DNS rows proved
+  only that the resolver ANSWERS - a half-broken tunnel that let UDP/53
+  escape via the physical NIC still showed a green board. The DoH
+  fallback's docstring now states outright that it is availability, never
+  privacy enforcement (it rides TCP/443 wherever 443 is routed - which in
+  a half-broken state is the physical NIC).
 
 ## Previous
 
