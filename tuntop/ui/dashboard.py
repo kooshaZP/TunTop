@@ -1997,9 +1997,16 @@ class BTopTui:
             for i in range(read.value):
                 rec = buf[i]
                 if rec.EventType == KEY_EVENT and rec.Event.KeyEvent.bKeyDown:
-                    ch = rec.Event.KeyEvent.uChar
+                    ke = rec.Event.KeyEvent
+                    ch = ke.uChar
                     if ch and ch != '\x00':
-                        self._mouse_queue.append(('key', ch.lower()))
+                        # Shift+letter -> '<letter>!' (see _read_char): keeps
+                        # Shift+J/K paging distinct from plain j/k scrolling.
+                        if (ch.isalpha() and ch.isupper()
+                                and not (ke.dwControlKeyState & 0x80)):
+                            self._mouse_queue.append(('key', ch.lower() + "!"))
+                        else:
+                            self._mouse_queue.append(('key', ch.lower()))
                     else:
                         v = vmap.get(rec.Event.KeyEvent.wVirtualKeyCode)
                         if v:
@@ -2017,19 +2024,27 @@ class BTopTui:
                                 self._mouse_queue.append(
                                     ('click', self._resolve_action(action)))
                                 break
-                    elif (me.dwEventFlags & 0x0004) and self._overlay_wheel:
-                        # Mouse wheel (WHEEL_DELTA flag 0x0004): scroll the
-                        # ACTIVE OVERLAY one row per notch. Queued as plain
-                        # navigation keys so every picker loop handles it
-                        # without knowing about the mouse. The main dashboard
-                        # ignores the wheel - its log already auto-follows
-                        # unless scrolled, and there the arrows remain king.
+                    elif (me.dwEventFlags & 0x0004):
+                        # Mouse wheel (WHEEL_DELTA flag 0x0004). With an
+                        # overlay up it scrolls THAT overlay (queued as
+                        # plain navigation keys so every picker loop
+                        # handles it without knowing about the mouse).
+                        # On the main dashboard it scrolls the EVENT LOG
+                        # (5 lines per notch): big logs no longer depend
+                        # on the keyboard, and the auto-follow resumes
+                        # the moment the scroll position returns to 0.
                         delta = ctypes.c_short(
                             (me.dwButtonState >> 16) & 0xFFFF).value
-                        if delta > 0:
-                            self._mouse_queue.append(('key', 'up'))
-                        elif delta < 0:
-                            self._mouse_queue.append(('key', 'down'))
+                        if self._overlay_wheel:
+                            if delta > 0:
+                                self._mouse_queue.append(('key', 'up'))
+                            elif delta < 0:
+                                self._mouse_queue.append(('key', 'down'))
+                        else:
+                            if delta > 0:
+                                self._mouse_queue.append(('key', 'k'))
+                            elif delta < 0:
+                                self._mouse_queue.append(('key', 'j'))
             if not self._mouse_queue:
                 return None
             kind, val = self._mouse_queue.pop(0)
@@ -2074,6 +2089,10 @@ class BTopTui:
             return {'H': 'up', 'P': 'down', 'K': 'left', 'M': 'right',
                     'I': 'pgup', 'Q': 'pgdn', 'G': 'home', 'O': 'end'}.get(sc)
         if ch.isprintable():
+            # Shift+letter -> '<letter>!' (paging), plain letter -> lower
+            # (log scroll etc.). Same convention as _read_char.
+            if ch.isalpha() and ch.isupper():
+                return ch.lower() + "!"
             return ch.lower()
         return None
 
@@ -2117,7 +2136,14 @@ class BTopTui:
                     # Enter/\r, Esc/\x1b, Backspace/\x08). Extended keys
                     # (arrows, F-keys) report uChar == '\x00' and are skipped.
                     if ke.uChar:
-                        return ke.uChar
+                        # Shift+letter arrives as the UPPERCASE char - map it
+                        # to '<letter>!' so bindings can tell Shift+J/K
+                        # (health-check paging) from plain j/k (log scroll).
+                        c = ke.uChar
+                        if c.isalpha() and c.isupper() and not (
+                                ke.dwControlKeyState & 0x80):   # not ctrl
+                            return c.lower() + "!"
+                        return c
                 except Exception:
                     return None
         # No managed handle (non-console host): fall back to msvcrt.
@@ -2239,7 +2265,10 @@ class BTopTui:
         self._full_repaint = True
 
         size = _get_window_size() or (80, 24)
-        w = max(52, min(size[0] - 6, 86))
+        # DYNAMIC SIZE: wider windows get a wider, taller input box (long
+        # prompts and examples stay readable instead of wrapping into a
+        # cramped 52-86 col strip).
+        w = max(52, min(size[0] - 4, 104))
         pal = theme()
         acc = pal["active"]
 
@@ -2975,7 +3004,10 @@ class BTopTui:
         selects, a second click on the selected row confirms (same as Enter)
         - and the mouse wheel scrolls when an overlay is up."""
         size = _get_window_size() or (80, 24)
-        w = max(56, min(size[0] - 6, 92))
+        # DYNAMIC SIZE: use the window generously - wide terminal = wide
+        # overlay (up to 110 cols), small window = shrink to fit. Same for
+        # the visible row budget (callers pass `avail` from window height).
+        w = max(56, min(size[0] - 4, 110))
         pal = theme()
         acc = pal["active"]
         # The overlay OWNS the input mapping while it is up: drop the main
@@ -3056,7 +3088,7 @@ class BTopTui:
             return
         labels = self._bypass_labels()
         size = _get_window_size() or (80, 24)
-        avail = max(5, min(20, size[1] - 6))
+        avail = max(5, min(28, size[1] - 8))
         sel = 0
         self._overlay_wheel = True   # wheel scrolls this overlay
         try:
@@ -3296,58 +3328,119 @@ class BTopTui:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _edit_geo(self):
-        new_code = self._read_line(
-            f"Geo bypass country code (current "
-            f"{getattr(self.ns, 'geoip_code', 'cn') or 'none'}):",
-            title="GEOIP SETTINGS",
-            examples=["ir = Iran   cn = China   ru = Russia   pk = Pakistan",
-                      "or enter any ISO country code",
-                      "leave empty to cancel"])
-        if not new_code:
-            return
-        self.ns.geoip_code = new_code.strip().lower()
-        self.log_lines.append(f"[*] Geo bypass code set to '{self.ns.geoip_code}'.")
-        # Egress target - same "direct / proxy2 / vpn" choice as [A], and it
-        # can be changed while the app is running (routes are re-pointed live).
-        t = self._read_line(
-            "Route geoip country traffic via: [Enter]=keep current, "
-            "1=direct, 2=proxy2, 3=vpn (Windows VPN):",
-            title="GEOIP  -  CHOOSE EGRESS",
-            examples=[f"current: {self._geo_target()}",
-                      "2 needs proxy2 configured (press [Z])",
-                      "the choice applies live - no tunnel restart"])
-        t = (t or "").strip()
+        """[F] Geo Manager - a single action menu instead of the old chained
+        prompts. Shows the live geo state (code, egress, route count) and
+        offers apply / change / REMOVE, so undoing a geo bypass no longer
+        requires stopping the tunnel."""
+        code = getattr(self.ns, "geoip_code", None) or "none"
         target = self._geo_target()
-        if t == "1":
-            target = "direct"
-        elif t == "2":
-            if getattr(self.ns, "proxy2_port", None):
-                target = "proxy2"
+        geo = getattr(self.ns, "geoip", None)
+        # Live route count for the current code (what the user actually
+        # cares about: is the bypass active right now?).
+        n_routes = ""
+        cidrs = self._geo_sweep_cidrs()
+        if cidrs:
+            n_routes = f"  ~{len(cidrs)} country CIDRs"
+        val = self._read_line(
+            f"1=Apply/Re-apply   2=Change code   3=Change egress   "
+            f"4=Remove geo bypass   Esc=cancel",
+            title=(f"GEO MANAGER  -  code {code} · egress {target} · "
+                   f"file {'set' if geo else 'NOT set'}{n_routes}"),
+            examples=[f"current egress: {target}"
+                      + ("   (2 needs proxy2 [Z])" if target != "proxy2" else ""),
+                      "Remove = delete every country route, live",
+                      "the tunnel keeps running through all actions"])
+        v = (val or "").strip()
+        if v in ("", "esc"):
+            return
+        if v == "4":
+            self._remove_geo_bypass()
+            return
+        if v == "2":
+            new_code = self._read_line(
+                f"Geo bypass country code (current {code}):",
+                title="GEO MANAGER  -  COUNTRY CODE",
+                examples=["ir = Iran   cn = China   ru = Russia   pk = Pakistan",
+                          "or enter any ISO country code",
+                          "leave empty to cancel"])
+            if not new_code:
+                return
+            self.ns.geoip_code = new_code.strip().lower()
+            self.log_lines.append(
+                f"[*] Geo bypass code set to '{self.ns.geoip_code}'.")
+            code = self.ns.geoip_code
+        if v == "3":
+            t = self._read_line(
+                "Route geoip country traffic via: [Enter]=keep current, "
+                "1=direct, 2=proxy2, 3=vpn (Windows VPN):",
+                title="GEO MANAGER  -  CHOOSE EGRESS",
+                examples=[f"current: {self._geo_target()}",
+                          "2 needs proxy2 configured (press [Z])",
+                          "the choice applies live - no tunnel restart"])
+            t = (t or "").strip()
+            target = self._geo_target()
+            if t == "1":
+                target = "direct"
+            elif t == "2":
+                if getattr(self.ns, "proxy2_port", None):
+                    target = "proxy2"
+                else:
+                    self.log_lines.append(
+                        "[!] proxy2 is not configured (press [Z] to add it) - "
+                        "keeping the current egress.")
+            elif t == "3":
+                target = "winvpn"
+            if target != self._geo_target():
+                self._set_geo_target(target)
+                self.log_lines.append(f"[*] Geo egress target: {target}.")
+        if v == "1" or v == "2" or v == "3":
+            if getattr(self.ns, "geoip", None):
+                # A geo file is configured - apply/re-apply LIVE, no restart.
+                self._reapply_geo_bypass()
+            elif v != "1":
+                self.log_lines.append(
+                    "[i] Country code/egress saved. No geoip file configured "
+                    "yet - press [W] to download geoip.dat, then Apply.")
             else:
-                self.log_lines.append(
-                    "[!] proxy2 is not configured (press [Z] to add it) - "
-                    "keeping the current egress.")
-        elif t == "3":
-            target = "winvpn"
-        if target != self._geo_target():
-            self._set_geo_target(target)
-            self.log_lines.append(f"[*] Geo egress target: {target}.")
-        if getattr(self.ns, "geoip", None):
-            # A geo file is configured - re-apply the ranges LIVE, no restart.
-            self._reapply_geo_bypass(target=target)
-        else:
-            path = self._read_line(
-                "Path to v2rayN geoip.dat (empty = cancel):",
-                title="GEOIP FILE PATH",
-                examples=["C:\\Program Files\\v2rayN\\bin\\geoip.dat"])
-            if path and os.path.isfile(path):
-                self.ns.geoip = path
-                self.log_lines.append(f"[*] Geoip file set: {path}.")
-                self._apply_launch_change("geoip file added")
-            elif path:
-                self.log_lines.append(
-                    f"[!] File not found: {path} - geoip unchanged. "
-                    "(Tip: press [W] to download geoip.dat automatically.)")
+                path = self._read_line(
+                    "Path to v2rayN geoip.dat (empty = cancel):",
+                    title="GEOIP FILE PATH",
+                    examples=["C:\\Program Files\\v2rayN\\bin\\geoip.dat"])
+                if path and os.path.isfile(path):
+                    self.ns.geoip = path
+                    self.log_lines.append(f"[*] Geoip file set: {path}.")
+                    self._reapply_geo_bypass()
+                elif path:
+                    self.log_lines.append(
+                        f"[!] File not found: {path} - geoip unchanged. "
+                        "(Tip: press [W] to download geoip.dat automatically.)")
+
+    def _remove_geo_bypass(self):
+        """[F] -> 4: live-REMOVE every route belonging to the configured geo
+        country code (any interface), without stopping the tunnel. Runs on a
+        background thread like every other mutating action."""
+        cidrs = self._geo_sweep_cidrs()
+        if not cidrs:
+            self.log_lines.append(
+                "[i] No geo bypass configured for the current code - nothing "
+                "to remove.")
+            return
+        code = getattr(self.ns, "geoip_code", None) or "?"
+        self.log_lines.append(
+            f"[*] Removing geo bypass '{code}' "
+            f"({len(cidrs)} country CIDRs) live...")
+
+        def _worker():
+            n = self._remove_geo_routes_for(cidrs)
+            if n:
+                self._blog(f"[+] Geo bypass '{code}' removed live "
+                           f"({n} routes deleted). Country traffic now "
+                           "follows the tunnel.")
+            else:
+                self._blog(f"[i] No live routes matched geo:'{code}' - "
+                           "already clean.")
+            self._geo_reset_progress()
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Profiles ([O] save / [I] load) ──────────────────────────────────────
     # Presets of everything that shapes the helper's command line, stored in
@@ -3389,7 +3482,7 @@ class BTopTui:
             for n in names
         ]
         size = _get_window_size() or (80, 24)
-        avail = max(5, min(20, size[1] - 6))
+        avail = max(5, min(28, size[1] - 8))
         sel, top = 0, 0
         self._overlay_wheel = True   # wheel scrolls this overlay
         try:
@@ -3857,6 +3950,11 @@ class BTopTui:
         try:
             # Route file-load progress to the geo panel too (mirrors the [S]
             # launch path, which passes an on_progress that emits [GEO-PARSE]).
+            # Reset first: a second apply must not inherit the previous
+            # pass's elapsed timer / completed state (the stuck-forever
+            # "elapsed 1663s" panel).
+            self._geo_reset_progress()
+
             def _on_progress(pos, total):
                 if total:
                     self._update_geo_progress(
@@ -4153,22 +4251,26 @@ class BTopTui:
             # the UI responsive and logs progress into the event log.
             self._start_geo_download(force=True)
             return True
-        elif key == 'k':
+        elif key == 'k!':
+            # SHIFT+K / SHIFT+J: page the health-check list (was plain [K]/[J],
+            # which fought the log scroll - plain j/k now scrolls the log).
             self.page = max(0, self.page - 1)
             return True
-        elif key == 'j':
+        elif key == 'j!':
             page_count = max(1, (max(len(self.results), 1) +
                                  self.page_size - 1) // self.page_size)
             self.page = min(page_count - 1, max(0, self.page + 1))
             return True
-        elif key in ('up', 'pgup'):
-            # Scroll the event log toward older entries.
-            step = 10 if key == 'pgup' else 1
+        elif key in ('up', 'pgup', 'k'):
+            # Scroll the event log toward older entries. j/k = vim-style
+            # line-by-line (see the [J/K] footer chip); arrows = 1, PgUp/PgDn
+            # = 10.
+            step = 10 if key == 'pgup' else (5 if key == 'k' else 1)
             self._log_scroll = min(len(self.log_lines), self._log_scroll + step)
             return True
-        elif key in ('down', 'pgdn'):
-            # Scroll the event log toward newer entries.
-            step = 10 if key == 'pgdn' else 1
+        elif key in ('down', 'pgdn', 'j'):
+            # Scroll the event log toward newer entries (same scale).
+            step = 10 if key == 'pgdn' else (5 if key == 'j' else 1)
             self._log_scroll = max(0, self._log_scroll - step)
             return True
         elif key == 'home':
@@ -4400,6 +4502,23 @@ class BTopTui:
                 # "incomplete" panel on screen indefinitely.
                 self._geo_progress_done_ts = time.time()
                 _snap_parse_done(self.geo_parse, m.group(1))
+
+    def _geo_reset_progress(self):
+        """Clear all geo progress state before a NEW install pass starts.
+
+        Without this a second [R]/[F] apply inherits the previous pass's
+        state: _geo_load_started_ts stayed set from the FIRST-ever apply
+        (so 'elapsed' counted the whole session - the 1663s panel), and a
+        previously-completed pass left geo_progress entries that made
+        any_incomplete / finished logic read stale data."""
+        with self._geo_lock:
+            self.geo_progress = {}
+            self.geo_parse = {}
+            self._geo_progress_done_ts = None
+            self._geo_load_started_ts = None
+            self._geo_disp_loaded = 0.0
+            self._geo_done_announced = False
+            self._geo_last_marker_ts = time.time()
 
     def draw(self):
         # While the [Q] progress-bar cleanup is running we own the whole screen;
@@ -5400,10 +5519,10 @@ class BTopTui:
                 ],
                 [
                     ('u', "[U] Servers"), ('v', "[V] Proxy(VLESS) thru VPN"),
-                    ('y', "[Y] VPN Bypass"), ('f', "[F] Geo Config"),
+                    ('y', "[Y] VPN Bypass"), ('f', "[F] Geo Manager"),
                     ('w', "[W] Get/Update GeoIP"),
                     ('o', "[O] Save Profile"), ('i', "[I] Load Profile"),
-                    ('k', "[K/J] Page"), ('up', "[Arrows] Scroll"),
+                    ('k', "[J/K] Log scroll"), ('up', "[Arrows] Scroll"),
                 ],
                 [
                     ('1', "[1] Metrics"), ('2', "[2] Endpoint"),
@@ -5412,10 +5531,33 @@ class BTopTui:
                     ('0', "[0] Show All"),
                 ],
             ]
-            # Shrink-aware: 2 footer rows keep the essentials (controls +
-            # live-edit); only a full window shows all four.
-            for items in _help_rows[:footer_h]:
-                _help_row(items)
+            # DYNAMIC WRAP: instead of four fixed rows that overflow on a
+            # narrow window (the old truncated-jumble look), measure each
+            # chip's visible width and flow items onto as many rows as the
+            # window can hold - wide window = fewer rows, narrow = more.
+            # The shrink budget (self._help_rows: 4/2/0) then decides how
+            # MANY of those wrapped rows actually fit this frame.
+            _gap = "    "
+            _flat = [it for _r in _help_rows for it in _r]
+            _wrap_rows = []
+            _cur, _curw = [], 0
+            for _key, _label in _flat:
+                _br = _label.find("]")
+                _desc = _label[_br + 1:].strip() if _br != -1 else ""
+                # Visible width: chip " X " + gap + description.
+                _w_need = 3 + len(_gap) + len(_desc)
+                if _cur and _curw + len(_gap) + _w_need > IW - 4:
+                    _wrap_rows.append(_cur)
+                    _cur, _curw = [], 0
+                _cur.append((_key, _label))
+                _curw += (_w_need if _curw == 0 else len(_gap) + _w_need)
+            if _cur:
+                _wrap_rows.append(_cur)
+            # Show as many wrapped rows as the shrink budget allows; on a
+            # very narrow window the tail chips yield (better a clean cut
+            # than the old wrapped-jumble overflow).
+            for _items in _wrap_rows[:footer_h]:
+                _help_row(_items)
 
         # ── Render to terminal ─────────────────────────────────────────
         # Flicker reduction strategy:

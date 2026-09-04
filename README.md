@@ -95,12 +95,14 @@ TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into your proxy
 | `[A]` `[X]`                   | Add/remove bypass instantly, with target choice: direct / proxy2 / vpn (no restart) |
 | `[L]` `[D]`                   | Leak test / export diagnostics                        |
 | `[O]` `[I]`                   | Save / load profile                                   |
-| `[U]` `[V]` `[Y]` `[F]`       | Servers (live) / VPN mode / VPN bypass / geo config (code + egress, live) |
+| `[U]` `[V]` `[Y]` `[F]`       | Servers (live) / VPN mode / VPN bypass / geo manager (apply · change · remove, live) |
 | `[Z]`                         | Add/change/remove the second proxy (proxy2) at runtime |
 | `[P]` `[N]` `[E]`             | SOCKS port / DNS (live, no restart) / endpoint port (live) |
 | `[R]`                         | Re-apply geoip country bypass live                    |
 | `[G]` `[M]` `[H]`             | Graph mode / theme / help show-hide                   |
 | `1-6`, `0`                    | Hide/show panels                                      |
+| `j`/`k` / mouse wheel         | Scroll the event log (5 lines per wheel notch)        |
+| `Shift`+`j`/`k`               | Page the health-check list                            |
 
 On short windows (16:9 screens) the panels shrink first — health-check rows,
 then the graph — and the help footer is only removed as the last resort.

@@ -1844,19 +1844,37 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
         if done:
             with geo_lock:
                 loaded += done
-                cur = loaded
-            if total:
-                print(f"[GEO-LOAD] code={code} loaded={cur} total={total}", flush=True)
+                # NOTE: no print here. This runs on a ThreadPoolExecutor
+                # worker; during a live [R] re-apply the dashboard's stdout
+                # sink only intercepts the INSTALLING thread, so a print
+                # here punches a raw "[GEO-LOAD] ..." line straight through
+                # the TUI frame (the stray [GEO-LOAD] text burned into the
+                # dashboard) AND the marker never reaches the progress
+                # panel (bar stuck at 0%). The joining thread below emits
+                # the marker after each future completes instead.
 
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(len(sub_batches), GEO_MAX_WORKERS)) as ex:
         futures = [ex.submit(_install_sub, fam, grp, ifa, gw)
                    for fam, grp, ifa, gw in sub_batches]
-    for fut in concurrent.futures.as_completed(futures):
-        try:
-            fut.result()
-        except Exception:
-            pass
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                fut.result()
+            except Exception:
+                pass
+            # Progress marker on the INSTALLING (sink-owner) thread, once
+            # per finished sub-batch: `loaded` is the geo_lock-guarded
+            # total the workers advanced. The old code printed from the
+            # worker threads themselves - during a live [R] re-apply those
+            # writes bypassed the dashboard's stdout sink (it only
+            # intercepts the installing thread), so the raw "[GEO-LOAD]"
+            # text punched straight through the TUI frame AND the progress
+            # panel never saw the markers (bar stuck at 0%).
+            if total:
+                with geo_lock:
+                    cur = loaded
+                print(f"[GEO-LOAD] code={code} loaded={cur} total={total}",
+                      flush=True)
     for fam in ("v4", "v6"):
         if fam in err_by_fam:
             msg = f"[!] geoip:{code} {fam} batch had route failures (continuing)."
