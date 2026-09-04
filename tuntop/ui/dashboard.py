@@ -1572,6 +1572,8 @@ class BTopTui:
         self.checks = build_checks(args)
         self.log_lines = []
         self._log_scroll = 0        # lines scrolled back from the newest log entry
+        self._checks_scroll = 0     # checks scrolled back from the newest row
+                                    # (same scroll-back model as the log)
         self._hscroll = 0           # horizontal scroll column for logs/health rows
         self._log_visible = 10      # how many log lines fit in the event-log panel
         self._show_help = True      # footer key/action guide; toggle with [H]
@@ -2041,6 +2043,10 @@ class BTopTui:
                             elif delta < 0:
                                 self._mouse_queue.append(('key', 'down'))
                         else:
+                            # Main dashboard: wheel scrolls the LOG and the
+                            # HEALTH CHECKS together (5 rows per notch), the
+                            # same way j/k does - both panels use the same
+                            # scroll-back model, so they stay in step.
                             if delta > 0:
                                 self._mouse_queue.append(('key', 'k'))
                             elif delta < 0:
@@ -4193,6 +4199,7 @@ class BTopTui:
         elif key == 'c':
             self.run_checks()
             self.page = 0
+            self._checks_scroll = 0   # a fresh scan shows its newest rows
             return True
         elif key == 's':
             if not self.proc or self.proc.poll() is not None:
@@ -4251,33 +4258,35 @@ class BTopTui:
             # the UI responsive and logs progress into the event log.
             self._start_geo_download(force=True)
             return True
-        elif key == 'k!':
-            # SHIFT+K / SHIFT+J: page the health-check list (was plain [K]/[J],
-            # which fought the log scroll - plain j/k now scrolls the log).
-            self.page = max(0, self.page - 1)
+        elif key == 'k':
+            # Health checks scroll EXACTLY like the log (same model: a
+            # scroll-back offset that auto-follows, arrows/PgUp/PgDn step,
+            # mouse wheel steps). j = newer, k = older, matching the log.
+            self._checks_scroll = min(
+                max(0, len(self.results) - 1), self._checks_scroll + 5)
             return True
-        elif key == 'j!':
-            page_count = max(1, (max(len(self.results), 1) +
-                                 self.page_size - 1) // self.page_size)
-            self.page = min(page_count - 1, max(0, self.page + 1))
+        elif key == 'j':
+            self._checks_scroll = max(0, self._checks_scroll - 5)
             return True
-        elif key in ('up', 'pgup', 'k'):
-            # Scroll the event log toward older entries. j/k = vim-style
-            # line-by-line (see the [J/K] footer chip); arrows = 1, PgUp/PgDn
-            # = 10.
-            step = 10 if key == 'pgup' else (5 if key == 'k' else 1)
+        elif key in ('up', 'pgup'):
+            # Scroll the event log toward older entries (arrows = 1 line,
+            # PgUp = 10). The mouse wheel also scrolls the log; j/k page
+            # the health-check list.
+            step = 10 if key == 'pgup' else 1
             self._log_scroll = min(len(self.log_lines), self._log_scroll + step)
             return True
-        elif key in ('down', 'pgdn', 'j'):
-            # Scroll the event log toward newer entries (same scale).
-            step = 10 if key == 'pgdn' else (5 if key == 'j' else 1)
+        elif key in ('down', 'pgdn'):
+            # Scroll the event log toward newer entries.
+            step = 10 if key == 'pgdn' else 1
             self._log_scroll = max(0, self._log_scroll - step)
             return True
         elif key == 'home':
             self._log_scroll = len(self.log_lines)
+            self._checks_scroll = max(0, len(self.results) - 1)  # oldest check
             return True
         elif key == 'end':
             self._log_scroll = 0
+            self._checks_scroll = 0                              # follow newest
             return True
         elif key in ('left', 'right'):
             # Horizontal scroll for long log lines / health details.
@@ -5343,15 +5352,21 @@ class BTopTui:
             L.append(_bot(pal["throughput"]))
 
 
-        # ── Health checks table (paged) ────────────────────────────────
+        # ── Health checks table (scrolls like the log) ─────────────────
         if "checks" not in self._hidden:
             page_size = max(8, min(12, IW // 40))
             if self._checks_cap:
                 page_size = max(5, min(page_size, self._checks_cap))
             self.page_size = page_size
-            page_count = max(1, (max(done, 1) + page_size - 1) // page_size)
-            self.page = min(self.page, max(0, page_count - 1))
-            start = self.page * page_size
+            # Log-style scroll window: `_checks_scroll` counts rows scrolled
+            # back from the newest result. The window auto-follows new rows
+            # while at the bottom (offset 0) and clamps when results shrink.
+            total_checks = max(0, len(self.results) - 1)
+            self._checks_scroll = max(
+                0, min(self._checks_scroll, total_checks))
+            start = max(0, len(self.results) - page_size - self._checks_scroll)
+            end = start + page_size
+            start = max(0, min(start, max(0, len(self.results) - page_size)))
 
             # Title shows a plain (ANSI-free) pass/fail summary so _top() can still
             # centre it by visible width; the per-row colour/shape lives below.
@@ -5367,7 +5382,7 @@ class BTopTui:
                 sep_line = f"{pal['light']}{BOX_V} {BOX_MID * (IW - 1)}{BOX_V}{RESET}"
                 L.append(sep_line)
 
-                check_rows = self.results[start:start + page_size]
+                check_rows = self.results[start:end]
                 # Proportional column widths: {border} {name(n_w)} {detail(d_w)} {border}
                 # Content fills panel minus left/right spacing: n_w + d_w = IW - 4.
                 # Clamp both columns to a minimum of 1 so a very narrow window (or
@@ -5408,14 +5423,16 @@ class BTopTui:
 
                 footer_sep = f"{pal['health']}{BOX_V} {BOX_MID * (IW - 1)}{BOX_V}{RESET}"
                 L.append(footer_sep)
-                if page_count > 1:
-                    pg_label = f"Page {self.page + 1}/{page_count}"
-                    pg_row = len(L)
-                    L.append(_row(pg_label.center(IW - 4, BOX_MID)))
-                    # Left half of the page-label row = prev page, right half = next.
-                    mid_x = 2 + (IW - 1) // 2
-                    self._click_map.append((pg_row, 2, mid_x, "k"))
-                    self._click_map.append((pg_row, mid_x, 2 + (IW - 1), "j"))
+                # Scroll indicator in the log's style: range shown / total,
+                # with a dim "auto-follow" marker when at the newest rows.
+                if self.results:
+                    first_shown = start + 1
+                    last_shown = min(len(self.results), end)
+                    pos = f"{first_shown}-{last_shown} of {len(self.results)}"
+                    if self._checks_scroll > 0:
+                        pos += f"  [\u25b2 {self._checks_scroll} more below - j to follow]"
+                    L.append(_row(pos.center(IW - 4, BOX_MID),
+                                  color=pal["health"]))
             L.append(_bot(pal["health"]))
 
         # ── Event log (bottom panel, scrollable with Up/Down / PgUp/PgDn) ──
@@ -5522,7 +5539,7 @@ class BTopTui:
                     ('y', "[Y] VPN Bypass"), ('f', "[F] Geo Manager"),
                     ('w', "[W] Get/Update GeoIP"),
                     ('o', "[O] Save Profile"), ('i', "[I] Load Profile"),
-                    ('k', "[J/K] Log scroll"), ('up', "[Arrows] Scroll"),
+                    ('k', "[J/K] Page"), ('up', "[Arrows] Scroll"),
                 ],
                 [
                     ('1', "[1] Metrics"), ('2', "[2] Endpoint"),

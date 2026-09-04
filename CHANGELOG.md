@@ -130,6 +130,15 @@ All notable changes to TunTop are documented here.
   mouse users (the status bar grows a dim "click here to show help"
   hotspot while hidden); and [S] while the tunnel is already up logs why
   it's a no-op instead of silence.
+- **Health checks scroll exactly like the event log** (j/k keys and mouse
+  wheel, 5 rows per step): the old fixed 9-12-row PAGES are gone - no more
+  "Page 6/6" hopping where each page jump re-renders the whole list and
+  new scan results could never be seen past the last page boundary. The
+  panel now uses the same scroll-back model as the log: it auto-follows
+  the newest results while at the bottom, j/k (or the wheel) move a
+  scroll-back offset up/down the list, Home/End jump to the oldest/newest
+  row, and the footer shows the visible range ("26-35 of 45") instead of
+  a page counter.
 
 ### Added
 - **Leak test is now part of the regular check while the tunnel runs**:

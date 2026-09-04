@@ -101,8 +101,7 @@ TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into your proxy
 | `[R]`                         | Re-apply geoip country bypass live                    |
 | `[G]` `[M]` `[H]`             | Graph mode / theme / help show-hide                   |
 | `1-6`, `0`                    | Hide/show panels                                      |
-| `j`/`k` / mouse wheel         | Scroll the event log (5 lines per wheel notch)        |
-| `Shift`+`j`/`k`               | Page the health-check list                            |
+| `j`/`k` / mouse wheel         | Scroll the health checks AND the event log (5 rows per wheel notch) |
 
 On short windows (16:9 screens) the panels shrink first — health-check rows,
 then the graph — and the help footer is only removed as the last resort.
