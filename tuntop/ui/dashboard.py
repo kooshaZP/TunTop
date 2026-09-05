@@ -7051,3 +7051,6 @@ def main():
                 f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n{tb}\n")
         except Exception:
             pass
+
+if __name__ == "__main__":
+    main()
