@@ -6188,7 +6188,13 @@ class BTopTui:
         hosts = []
         hosts += list(self.endpoint_v4) + list(self.endpoint_v6)
         for h in (list(getattr(self.ns, "bypass_ip", []) or [])
-                  + list(getattr(self.ns, "server", []) or [])):
+                  + list(getattr(self.ns, "server", []) or [])
+                  # proxy2 second-hop and Windows-VPN endpoint bypasses also
+                  # install /32+/128 host routes (same add_v4/add_v6 path) -
+                  # a force-killed helper would leave those behind too.
+                  + list(getattr(self.ns, "proxy2_bypass_ip", []) or [])
+                  + list(getattr(self.ns, "vpn_server", []) or [])
+                  + list(getattr(self.ns, "vpn_bypass_ip", []) or [])):
             if h not in hosts:
                 hosts.append(h)
         ips = []
@@ -6304,6 +6310,44 @@ class BTopTui:
             return []
         return [r for r in self._dump_route_table()
                 if str(r.get("DestinationPrefix")) in cidrs]
+
+    def _sweep_lan_leftovers(self):
+        """Last-resort exit sweep for the helper's LAN bypass routes
+        (10/8, 172.16/12, 192.168/16, ... via the physical adapter). The
+        helper removes them in its own cleanup (they are in added_routes),
+        but a force-killed helper skips that - and stale LAN routes after a
+        network change keep steering RFC1918 traffic at a dead gateway.
+        Gateway-matched like the watchdog's sweep, so foreign static routes
+        are never touched. Returns how many were removed."""
+        import ipaddress
+        try:
+            def_gw = _get_ipv4_default()
+            if not def_gw:
+                return 0
+            iface, gw = str(def_gw[0]), str(def_gw[1])
+            lan_prefixes = {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                            "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4",
+                            "255.255.255.255/32"}
+            rows = []
+            for r in self._dump_route_table():
+                dp = str(r.get("DestinationPrefix", ""))
+                if dp not in lan_prefixes:
+                    continue
+                alias = str(r.get("InterfaceAlias", "") or "")
+                nh = str(r.get("NextHop", "") or "")
+                if alias != iface:
+                    continue
+                if nh and nh not in (gw, "0.0.0.0", "On-link"):
+                    continue
+                if nh in ("0.0.0.0", "::"):
+                    nh = ""
+                rows.append((dp, alias, nh))
+            if not rows:
+                return 0
+            self._batch_delete_routes(rows)
+            return len(rows)
+        except Exception:
+            return 0
 
     def _sweep_geo_leftovers(self, progress=None):
         """Last-resort exit sweep for HELPER-installed geoip country-bypass
@@ -6428,6 +6472,7 @@ class BTopTui:
         """Run all last-resort sweeps idempotently; never raises."""
         for sweep in (self._cleanup_live_routes,
                       self._sweep_geo_leftovers,
+                      self._sweep_lan_leftovers,
                       self._final_host_route_sweep):
             try:
                 sweep()
@@ -6630,6 +6675,8 @@ class BTopTui:
         tasks.append(("Sweeping leftover geoip country routes",
                       lambda: self._sweep_geo_leftovers(
                           progress=self._sweep_progress_cb)))
+        tasks.append(("Sweeping leftover LAN bypass routes",
+                      self._sweep_lan_leftovers))
         tasks.append(("Sweeping endpoint host bypass routes",
                       self._final_host_route_sweep))
         tasks.append(("Verifying routes are clear",
