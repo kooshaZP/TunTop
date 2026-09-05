@@ -178,6 +178,82 @@ def kill_pid(pid: int, log=None) -> bool:
     return False
 
 
+#: LAN bypass prefixes TunTop's helper installs EVERY run
+#: (mirror of tuntop/tunnel/helper.py:_add_lan_bypass - keep in sync).
+#: Swept after an unclean exit only when the live route's next-hop matches
+#: the CURRENT default gateway (or is on-link) on that same interface, so
+#: a foreign static route to one of these ranges (corporate VPN split
+#: routes, admin-configured) via a different gateway is never touched.
+LAN_BYPASS_PREFIXES = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+    "224.0.0.0/4",
+    "255.255.255.255/32",
+]
+
+
+def sweep_lan_routes(log=None) -> int:
+    """Remove leftover LAN bypass routes from the PHYSICAL adapter. They are
+    benign on the network where they were installed (they point at the same
+    gateway Windows uses anyway) but stale after a network change, so a
+    crash followed by switching Wi-Fi would otherwise keep routing RFC1918
+    traffic at the old gateway. Returns how many were removed."""
+    log = log or (lambda m: None)
+    try:
+        import tuntop.network.routing as routing
+        def_gw = routing._get_ipv4_default()
+        if not def_gw:
+            return 0
+        iface, gw = def_gw[0], def_gw[1]
+        ok, out = routing._ps(
+            "Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+            "Select-Object DestinationPrefix,InterfaceAlias,NextHop | "
+            "ConvertTo-Json -Compress -Depth 2")
+        rows = []
+        if ok and out.strip():
+            data = json.loads(out)
+            if isinstance(data, dict):
+                data = [data]
+            rows = data
+        victims = []
+        for r in rows:
+            dp = str(r.get("DestinationPrefix", ""))
+            if dp not in LAN_BYPASS_PREFIXES:
+                continue
+            alias = str(r.get("InterfaceAlias", "") or "")
+            nh = str(r.get("NextHop", "") or "")
+            # Gateway/iface match keeps foreign static routes alive.
+            if alias != str(iface):
+                continue
+            if nh and nh not in (str(gw), "0.0.0.0", "On-link"):
+                continue
+            victims.append((dp, alias, nh))
+        if not victims:
+            return 0
+        import tempfile
+        lines = [f'interface ipv4 delete route {dp} "{alias}"'
+                 f'{"" if nh in ("0.0.0.0", "On-link") else (" " + nh if nh else "")}'
+                 for dp, alias, nh in victims]
+        fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="wd_lan_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            subprocess.run(["netsh", "-f", tmp],
+                           capture_output=True, timeout=120)
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+        return len(victims)
+    except Exception as e:
+        _log(f"watchdog: LAN sweep failed: {e}", log)
+        return 0
+
+
 def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
     """Remove every live route whose DestinationPrefix is one of the geoip
     country's CIDRs. Geo bypass routes live on the PHYSICAL adapter, so the
@@ -301,6 +377,11 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
     n_geo = sweep_geo_routes(geoip, geoip_code, log=log)
     if n_geo:
         _log(f"watchdog: removed {n_geo} leftover geoip route(s)", log)
+
+    # LAN bypass routes (helper installs them every run, physical adapter).
+    n_lan = sweep_lan_routes(log=log)
+    if n_lan:
+        _log(f"watchdog: removed {n_lan} leftover LAN bypass route(s)", log)
 
     # Clear the marker ONLY if it is still ours - a session started while
     # we swept has written its own by now and owns the system.
