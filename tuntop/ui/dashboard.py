@@ -1525,7 +1525,6 @@ class BTopTui:
         self.rx_hist = []              # download KiB/s, for the graph
         self.tx_hist = []              # upload KiB/s, for the graph
         self.ping_samples = []
-        self.page = 0
         self.last_checked = None
         self.baseline_bytes = [None]   # mutable ref for get_wintun_speed: (rx,tx,ts)
         self._last_raw_rx = None       # previous absolute Wintun RX byte total
@@ -1596,7 +1595,6 @@ class BTopTui:
         self._bypass_res_state = {}
         self._bypass_res_lock = threading.Lock()
         self._bypass_res_thread = None
-        self.page_size = 9
         # Resolve every configured server (repeatable --server) and combine
         # the resulting IPs for display and endpoint health checks.
         self.endpoint_v4, self.endpoint_v6 = [], []
@@ -1999,16 +1997,9 @@ class BTopTui:
             for i in range(read.value):
                 rec = buf[i]
                 if rec.EventType == KEY_EVENT and rec.Event.KeyEvent.bKeyDown:
-                    ke = rec.Event.KeyEvent
-                    ch = ke.uChar
+                    ch = rec.Event.KeyEvent.uChar
                     if ch and ch != '\x00':
-                        # Shift+letter -> '<letter>!' (see _read_char): keeps
-                        # Shift+J/K paging distinct from plain j/k scrolling.
-                        if (ch.isalpha() and ch.isupper()
-                                and not (ke.dwControlKeyState & 0x80)):
-                            self._mouse_queue.append(('key', ch.lower() + "!"))
-                        else:
-                            self._mouse_queue.append(('key', ch.lower()))
+                        self._mouse_queue.append(('key', ch.lower()))
                     else:
                         v = vmap.get(rec.Event.KeyEvent.wVirtualKeyCode)
                         if v:
@@ -2031,10 +2022,10 @@ class BTopTui:
                         # overlay up it scrolls THAT overlay (queued as
                         # plain navigation keys so every picker loop
                         # handles it without knowing about the mouse).
-                        # On the main dashboard it scrolls the EVENT LOG
-                        # (5 lines per notch): big logs no longer depend
-                        # on the keyboard, and the auto-follow resumes
-                        # the moment the scroll position returns to 0.
+                        # On the main dashboard the wheel scrolls whichever
+                        # panel the cursor is OVER: inside the health-checks
+                        # panel rows -> the checks list, anywhere else -> the
+                        # event log (5 rows per notch, same as j/k).
                         delta = ctypes.c_short(
                             (me.dwButtonState >> 16) & 0xFFFF).value
                         if self._overlay_wheel:
@@ -2043,14 +2034,17 @@ class BTopTui:
                             elif delta < 0:
                                 self._mouse_queue.append(('key', 'down'))
                         else:
-                            # Main dashboard: wheel scrolls the LOG and the
-                            # HEALTH CHECKS together (5 rows per notch), the
-                            # same way j/k does - both panels use the same
-                            # scroll-back model, so they stay in step.
+                            my = me.dwMousePosition.Y
+                            over_checks = any(
+                                row <= my <= row + 13
+                                for row, _x0, _x1, act in self._click_map
+                                if act == "5")
                             if delta > 0:
-                                self._mouse_queue.append(('key', 'k'))
+                                self._mouse_queue.append(
+                                    ('key', 'k' if over_checks else 'up'))
                             elif delta < 0:
-                                self._mouse_queue.append(('key', 'j'))
+                                self._mouse_queue.append(
+                                    ('key', 'j' if over_checks else 'down'))
             if not self._mouse_queue:
                 return None
             kind, val = self._mouse_queue.pop(0)
@@ -2095,10 +2089,6 @@ class BTopTui:
             return {'H': 'up', 'P': 'down', 'K': 'left', 'M': 'right',
                     'I': 'pgup', 'Q': 'pgdn', 'G': 'home', 'O': 'end'}.get(sc)
         if ch.isprintable():
-            # Shift+letter -> '<letter>!' (paging), plain letter -> lower
-            # (log scroll etc.). Same convention as _read_char.
-            if ch.isalpha() and ch.isupper():
-                return ch.lower() + "!"
             return ch.lower()
         return None
 
@@ -2142,14 +2132,7 @@ class BTopTui:
                     # Enter/\r, Esc/\x1b, Backspace/\x08). Extended keys
                     # (arrows, F-keys) report uChar == '\x00' and are skipped.
                     if ke.uChar:
-                        # Shift+letter arrives as the UPPERCASE char - map it
-                        # to '<letter>!' so bindings can tell Shift+J/K
-                        # (health-check paging) from plain j/k (log scroll).
-                        c = ke.uChar
-                        if c.isalpha() and c.isupper() and not (
-                                ke.dwControlKeyState & 0x80):   # not ctrl
-                            return c.lower() + "!"
-                        return c
+                        return ke.uChar
                 except Exception:
                     return None
         # No managed handle (non-console host): fall back to msvcrt.
@@ -4198,7 +4181,6 @@ class BTopTui:
             return True
         elif key == 'c':
             self.run_checks()
-            self.page = 0
             self._checks_scroll = 0   # a fresh scan shows its newest rows
             return True
         elif key == 's':
@@ -4270,8 +4252,8 @@ class BTopTui:
             return True
         elif key in ('up', 'pgup'):
             # Scroll the event log toward older entries (arrows = 1 line,
-            # PgUp = 10). The mouse wheel also scrolls the log; j/k page
-            # the health-check list.
+            # PgUp = 10). The mouse wheel also scrolls the log; j/k scroll
+            # the health-check panel the same way.
             step = 10 if key == 'pgup' else 1
             self._log_scroll = min(len(self.log_lines), self._log_scroll + step)
             return True
@@ -5357,7 +5339,6 @@ class BTopTui:
             page_size = max(8, min(12, IW // 40))
             if self._checks_cap:
                 page_size = max(5, min(page_size, self._checks_cap))
-            self.page_size = page_size
             # Log-style scroll window: `_checks_scroll` counts rows scrolled
             # back from the newest result. The window auto-follows new rows
             # while at the bottom (offset 0) and clamps when results shrink.
