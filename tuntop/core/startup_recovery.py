@@ -60,6 +60,25 @@ def clear_marker(path: str = MARKER_FILE) -> None:
         pass
 
 
+def record_helper(helper_pid: int, path: str = MARKER_FILE) -> None:
+    """Attach the tunnel helper's PID to the session marker (best-effort).
+
+    The cleanup watchdog reads this after an unclean dashboard exit so it
+    can stop the helper - and through `taskkill /T` its whole process tree,
+    tun2socks included - BEFORE sweeping the routes. Without this, a still
+    running helper could restart tun2socks or re-assert routes while the
+    watchdog is mid-sweep."""
+    try:
+        data = read_marker(path) or {}
+        if int(data.get("pid", 0) or 0) <= 0:
+            return                      # no live session marker: nothing to do
+        data["helper_pid"] = int(helper_pid)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
 def read_marker(path: str = MARKER_FILE) -> Optional[dict]:
     """The previous run's marker, if it never got to clean up. None means
     either a clean exit or a first run."""

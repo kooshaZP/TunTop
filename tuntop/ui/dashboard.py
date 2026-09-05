@@ -1573,7 +1573,26 @@ class BTopTui:
         self._log_scroll = 0        # lines scrolled back from the newest log entry
         self._checks_scroll = 0     # checks scrolled back from the newest row
                                     # (same scroll-back model as the log)
-        self._hscroll = 0           # horizontal scroll column for logs/health rows
+        self._log_hscroll = 0       # horizontal scroll for long log lines
+        self._checks_hscroll = 0    # ...and for long health-check details. TWO
+                                    # separate offsets: Left/Right scroll the
+                                    # ACTIVE panel's columns only (see
+                                    # _scroll_panel), never both at once.
+        # ACTIVE scroll panel: the one j/k, the mouse wheel and Left/Right
+        # target. Set by HOVER - moving the mouse over a visible log/checks
+        # panel makes it active (and stays active until another panel is
+        # hovered); hidden panels can never become active. The default keeps
+        # the checks panel's historical j/k role so keyboard-only hosts (no
+        # mouse reports at all) behave exactly as documented.
+        self._active_panel = "checks"
+        self._mouse_hovered = False # True once the mouse has hovered a panel;
+                                    # until then every key group keeps its
+                                    # historical target (j/k -> checks,
+                                    # arrows/Left-Right -> log) so hosts with
+                                    # no mouse behave exactly as documented.
+        self._mouse_y = None        # last reported mouse row (None = no mouse info yet)
+        self._checks_region = None  # (top, bottom) console rows of the HEALTH CHECKS panel
+        self._log_region = None     # (top, bottom) console rows of the EVENT LOG panel
         self._log_visible = 10      # how many log lines fit in the event-log panel
         self._show_help = True      # footer key/action guide; toggle with [H]
         self._hidden = set()         # section ids hidden via [1]-[5],[B]; [0] shows all
@@ -1970,6 +1989,43 @@ class BTopTui:
             return f"\033[7m{text}\033[27m"
         return text
 
+    def _hover_scroll_panel(self, mouse_y):
+        """Which scrollable panel the given mouse row lands in: 'checks' over
+        the HEALTH CHECKS panel, 'log' over the EVENT LOG panel, None when the
+        position is unknown or over anything else. Only VISIBLE panels can
+        match - hidden panels draw no rows and record no region, which is the
+        "window is not hidden" half of the hover rule."""
+        if mouse_y is None:
+            return None
+        if ("checks" not in self._hidden and self._checks_region
+                and self._checks_region[0] <= mouse_y <= self._checks_region[1]):
+            return "checks"
+        if ("log" not in self._hidden and self._log_region
+                and self._log_region[0] <= mouse_y <= self._log_region[1]):
+            return "log"
+        return None
+
+    def _scroll_panel(self, keyboard_default="log"):
+        """The panel j/k, the arrows, Left/Right and (away from both panels)
+        the mouse wheel currently target.
+
+        Once the mouse has hovered a visible log/checks panel, that panel
+        stays the target until another one is hovered. BEFORE the first
+        hover (and on hosts with no mouse at all) each key group keeps its
+        historical role via `keyboard_default` - j/k pass "checks", the
+        arrows and Left/Right pass "log" (the default) - so keyboard-only
+        hosts behave exactly as documented before this feature existed.
+        If the active panel has been HIDDEN in the meantime ([5]/[6]/[0])
+        the target falls back to the log so keys never die on a panel that
+        isn't there."""
+        if self._mouse_hovered:
+            if self._active_panel == "checks" and "checks" not in self._hidden:
+                return "checks"
+            return "log"
+        if keyboard_default == "checks" and "checks" not in self._hidden:
+            return "checks"
+        return "log"
+
     def _poll_input(self):
         """Non-blocking unified keyboard+mouse poll via ReadConsoleInputW.
         Only used once _init_mouse() has succeeded; returns a single logical
@@ -2006,6 +2062,10 @@ class BTopTui:
                             self._mouse_queue.append(('key', v))
                 elif rec.EventType == MOUSE_EVENT:
                     me = rec.Event.MouseEvent
+                    # Remember WHERE the mouse is on EVERY mouse record
+                    # (move, click or wheel): the hovered panel decides the
+                    # ACTIVE scroll target for j/k, the wheel and Left/Right.
+                    self._mouse_y = me.dwMousePosition.Y
                     if me.dwEventFlags == 0 and (me.dwButtonState & FROM_LEFT_1ST_BUTTON):
                         y = me.dwMousePosition.Y
                         x = me.dwMousePosition.X
@@ -2034,17 +2094,28 @@ class BTopTui:
                             elif delta < 0:
                                 self._mouse_queue.append(('key', 'down'))
                         else:
-                            my = me.dwMousePosition.Y
-                            over_checks = any(
-                                row <= my <= row + 13
-                                for row, _x0, _x1, act in self._click_map
-                                if act == "5")
-                            if delta > 0:
-                                self._mouse_queue.append(
-                                    ('key', 'k' if over_checks else 'up'))
-                            elif delta < 0:
-                                self._mouse_queue.append(
-                                    ('key', 'j' if over_checks else 'down'))
+                            # Hover decides the target: over the HEALTH CHECKS
+                            # panel -> that list (5 rows per notch, same as
+                            # j/k); over the EVENT LOG or anywhere else -> the
+                            # log (1 line per notch, as before). Hovering a
+                            # panel also SETS the active one, which is what
+                            # j/k and Left/Right target until the mouse moves
+                            # onto a different panel.
+                            hover = self._hover_scroll_panel(self._mouse_y)
+                            if hover:
+                                self._active_panel = hover
+                                self._mouse_hovered = True
+                            target = hover or "log"
+                            if target == "checks":
+                                if delta > 0:
+                                    self._mouse_queue.append(('key', 'k'))
+                                elif delta < 0:
+                                    self._mouse_queue.append(('key', 'j'))
+                            else:
+                                if delta > 0:
+                                    self._mouse_queue.append(('key', 'up'))
+                                elif delta < 0:
+                                    self._mouse_queue.append(('key', 'down'))
             if not self._mouse_queue:
                 return None
             kind, val = self._mouse_queue.pop(0)
@@ -4240,40 +4311,71 @@ class BTopTui:
             # the UI responsive and logs progress into the event log.
             self._start_geo_download(force=True)
             return True
-        elif key == 'k':
-            # Health checks scroll EXACTLY like the log (same model: a
-            # scroll-back offset that auto-follows, arrows/PgUp/PgDn step,
-            # mouse wheel steps). j = newer, k = older, matching the log.
-            self._checks_scroll = min(
-                max(0, len(self.results) - 1), self._checks_scroll + 5)
+        elif key in ('j', 'k'):
+            # j = toward newer, k = toward older - applied to whichever
+            # panel is ACTIVE. Hovering a visible log/checks panel with the
+            # mouse retargets them (see _scroll_panel); before the mouse has
+            # picked a panel the checks panel keeps its historical j/k role,
+            # so keyboard-only hosts behave exactly as documented. 5 rows per
+            # press, matching the log's arrow/PgUp model and the wheel notch.
+            if self._scroll_panel("checks") == "checks":
+                if key == 'k':
+                    self._checks_scroll = min(
+                        max(0, len(self.results) - 1), self._checks_scroll + 5)
+                else:
+                    self._checks_scroll = max(0, self._checks_scroll - 5)
+            else:
+                if key == 'k':
+                    self._log_scroll = min(
+                        len(self.log_lines), self._log_scroll + 5)
+                else:
+                    self._log_scroll = max(0, self._log_scroll - 5)
             return True
-        elif key == 'j':
-            self._checks_scroll = max(0, self._checks_scroll - 5)
-            return True
-        elif key in ('up', 'pgup'):
-            # Scroll the event log toward older entries (arrows = 1 line,
-            # PgUp = 10). The mouse wheel also scrolls the log; j/k scroll
-            # the health-check panel the same way.
-            step = 10 if key == 'pgup' else 1
-            self._log_scroll = min(len(self.log_lines), self._log_scroll + step)
-            return True
-        elif key in ('down', 'pgdn'):
-            # Scroll the event log toward newer entries.
-            step = 10 if key == 'pgdn' else 1
-            self._log_scroll = max(0, self._log_scroll - step)
+        elif key in ('up', 'pgup', 'down', 'pgdn'):
+            # Vertical scroll for the ACTIVE panel (the one the mouse hovers;
+            # _scroll_panel explains the fallbacks). Up/PgUp = toward older,
+            # Down/PgDn = toward newer; arrows step 1 line, PgUp/PgDn 10.
+            step = 10 if key in ('pgup', 'pgdn') else 1
+            older = key in ('up', 'pgup')
+            if self._scroll_panel() == "checks":
+                if older:
+                    self._checks_scroll = min(
+                        max(0, len(self.results) - 1), self._checks_scroll + step)
+                else:
+                    self._checks_scroll = max(0, self._checks_scroll - step)
+            else:
+                if older:
+                    self._log_scroll = min(
+                        len(self.log_lines), self._log_scroll + step)
+                else:
+                    self._log_scroll = max(0, self._log_scroll - step)
             return True
         elif key == 'home':
-            self._log_scroll = len(self.log_lines)
-            self._checks_scroll = max(0, len(self.results) - 1)  # oldest check
+            # Jump the ACTIVE panel to its oldest row.
+            if self._scroll_panel() == "checks":
+                self._checks_scroll = max(0, len(self.results) - 1)
+            else:
+                self._log_scroll = len(self.log_lines)
             return True
         elif key == 'end':
-            self._log_scroll = 0
-            self._checks_scroll = 0                              # follow newest
+            # Back to the newest row: re-arm auto-follow on the ACTIVE panel.
+            if self._scroll_panel() == "checks":
+                self._checks_scroll = 0
+            else:
+                self._log_scroll = 0
             return True
         elif key in ('left', 'right'):
-            # Horizontal scroll for long log lines / health details.
+            # Horizontal scroll for long log lines / health details - ONE
+            # panel at a time: the ACTIVE one (see _scroll_panel). Each panel
+            # owns its own column offset, so scrolling the health details
+            # never drags the log columns with it (and vice versa).
             step = 8
-            self._hscroll = max(0, self._hscroll + (step if key == 'right' else -step))
+            if self._scroll_panel() == "checks":
+                self._checks_hscroll = max(
+                    0, self._checks_hscroll + (step if key == 'right' else -step))
+            else:
+                self._log_hscroll = max(
+                    0, self._log_hscroll + (step if key == 'right' else -step))
             return True
         elif key == 'a':
             # STEP 1: paste the IP/hostname FIRST. STEP 2: pick the route.
@@ -4592,6 +4694,10 @@ class BTopTui:
             spd_snap = list(self.speed_hist)
             ping_snap = list(self.ping_samples)
         self._click_map = []
+        # Scroll regions are rebuilt every frame; a hidden panel simply never
+        # records one this frame (hover detection treats that as inactive).
+        self._checks_region = None
+        self._log_region = None
         pal = theme()   # active palette for this frame (switchable with [M])
 
         state = self.state
@@ -4607,18 +4713,23 @@ class BTopTui:
         W    = w                # full terminal width
         IW   = w - 2            # inner width (between side borders)
 
-        # Clamp the horizontal scroll so it can't run off the end of the widest
-        # line we might show (event-log entries + health-check rows).
-        _hmax = 0
+        # Clamp each panel's horizontal scroll to its OWN widest content, so
+        # the offsets can't run off the end (log lines vs health-check rows
+        # are measured separately now that each panel scrolls independently).
+        _log_hmax = 0
         for e in self.log_lines:
             _w = len(re.sub(r'\x1b\[[^m]*m', '', str(e)))
-            if _w > _hmax:
-                _hmax = _w
+            if _w > _log_hmax:
+                _log_hmax = _w
+        self._log_hscroll = max(
+            0, min(self._log_hscroll, max(0, _log_hmax - (IW - 1) + 2)))
+        _chk_hmax = 0
         for num, name, ok, detail in self.results:
             _w = len(f"[{num:02}] {name}") + 1 + len(detail)
-            if _w > _hmax:
-                _hmax = _w
-        self._hscroll = max(0, min(self._hscroll, max(0, _hmax - (IW - 1) + 2)))
+            if _w > _chk_hmax:
+                _chk_hmax = _w
+        self._checks_hscroll = max(
+            0, min(self._checks_hscroll, max(0, _chk_hmax - (IW - 1) + 2)))
 
         # ── Helper: ANSI-aware centre (escape codes are zero-width) ─
         def _acenter(text, width, fill=BOX_MID):
@@ -5352,8 +5463,14 @@ class BTopTui:
             # Title shows a plain (ANSI-free) pass/fail summary so _top() can still
             # centre it by visible width; the per-row colour/shape lives below.
             self._click_map.append((len(L), 0, w, "5"))
-            L.append(_top(f"HEALTH CHECKS   \u2714 {passed} ok   \u2717 {failed} fail",
-                          pal["health"]))
+            # The ACTIVE scroll panel gets a scroll marker in its title - one
+            # glance shows which panel j/k, Left/Right and the wheel target.
+            checks_title = f"HEALTH CHECKS   \u2714 {passed} ok   \u2717 {failed} fail"
+            if (self._mouse_hovered and self._active_panel == "checks"
+                    and "checks" not in self._hidden):
+                checks_title += "   \u2195 scroll"
+            self._checks_title = len(L)   # panel's first row (title) - see region below
+            L.append(_top(checks_title, pal["health"]))
 
             if not self.results:
                 # No checks run yet - don't pad to a fixed height, just show a short
@@ -5395,7 +5512,7 @@ class BTopTui:
                     det_part = detail
                     L.append(_row(
                         f"{mark} {name_col}{name_part}{RESET} {det_col}{det_part}{RESET}",
-                        hscroll=self._hscroll, color=border,
+                        hscroll=self._checks_hscroll, color=border,
                     ))
 
                 if len(check_rows) < page_size:
@@ -5410,10 +5527,19 @@ class BTopTui:
                     first_shown = start + 1
                     last_shown = min(len(self.results), end)
                     pos = f"{first_shown}-{last_shown} of {len(self.results)}"
-                    if self._checks_scroll > 0:
+                    if self._checks_scroll > 0 and self._scroll_panel("checks") == "checks":
                         pos += f"  [\u25b2 {self._checks_scroll} more below - j to follow]"
                     L.append(_row(pos.center(IW - 4, BOX_MID),
                                   color=pal["health"]))
+            # Record this panel's on-screen console-row region (title..bottom
+            # border) for mouse-hover detection; clamp to the frame so a
+            # taller-than-window frame can never claim rows past the screen.
+            # At this point every row except the bottom border is already in L.
+            if h:
+                self._checks_region = (
+                    self._checks_title, min(len(L), h - 1))
+            else:
+                self._checks_region = None
             L.append(_bot(pal["health"]))
 
         # ── Event log (bottom panel, scrollable with Up/Down / PgUp/PgDn) ──
@@ -5455,21 +5581,40 @@ class BTopTui:
             if total > v:
                 # 1-based range of the slice currently shown.
                 title += f"  ({start + 1}-{end} of {total})"
-            if self._hscroll > 0:
-                title += f"  [\u25c4 scrolled {self._hscroll}c]"
+            if self._log_hscroll > 0:
+                title += f"  [\u25c4 scrolled {self._log_hscroll}c]"
+            if (self._mouse_hovered and self._active_panel == "log"
+                    and "log" not in self._hidden):
+                title += "   \u2195 scroll"
+            self._log_title = len(L)   # panel's first row (title) - see region below
             self._click_map.append((len(L), 0, w, "6"))
             L.append(_top(title, pal["log"]))
             for entry in visible:
                 formatted = _format_log_line(entry)
                 if formatted == entry:
                     formatted = f"{DIM}{entry}{RESET}"
-                L.append(_row(formatted, hscroll=self._hscroll))
+                L.append(_row(formatted, hscroll=self._log_hscroll))
             # Keep the panel a fixed height so the border doesn't jump while scrolling.
             for _ in range(max(0, v - len(visible))):
                 L.append(_row(""))
+            # Region for hover detection (title..bottom border), frame-clamped.
+            if h:
+                self._log_region = (self._log_title, min(len(L), h - 1))
+            else:
+                self._log_region = None
             L.append(_bot(pal["log"]))
 
         # ── Keyboard/mouse help (footer, two rows: run controls + live edit) ─
+        def _chip_key(label):
+            """Chip text for a help label: everything inside the leading
+            [brackets], with '/' shown as a space so a combo like [J/K]
+            reads as "J K" (the old renderer took only label[1], which
+            displayed a single letter for a two-key combo)."""
+            br = label.find("]")
+            if label.startswith("[") and br > 1:
+                return label[1:br].replace("/", " ").strip()
+            return label[1] if len(label) > 1 else "?"
+
         def _help_row(items):
             # Each item is (action, "[X] description"). Render the key as a
             # filled chip and the description in dim text, so the bindings read
@@ -5485,7 +5630,7 @@ class BTopTui:
             offset = 0
             row = len(L)
             for key, label in items:
-                keychar = label[1] if len(label) > 1 else "?"
+                keychar = _chip_key(label)
                 br = label.find("]")
                 desc = label[br + 1:].strip() if br != -1 else ""
                 chip = (f"\033[48;2;55;68;92m\033[38;2;225;232;255m"
@@ -5520,7 +5665,7 @@ class BTopTui:
                     ('y', "[Y] VPN Bypass"), ('f', "[F] Geo Manager"),
                     ('w', "[W] Get/Update GeoIP"),
                     ('o', "[O] Save Profile"), ('i', "[I] Load Profile"),
-                    ('k', "[J/K] Page"), ('up', "[Arrows] Scroll"),
+                    ('k', "[J/K] Page: hovered panel"), ('up', "[\u2191\u2193] Scroll: hovered panel"),
                 ],
                 [
                     ('1', "[1] Metrics"), ('2', "[2] Endpoint"),
@@ -5542,8 +5687,10 @@ class BTopTui:
             for _key, _label in _flat:
                 _br = _label.find("]")
                 _desc = _label[_br + 1:].strip() if _br != -1 else ""
-                # Visible width: chip " X " + gap + description.
-                _w_need = 3 + len(_gap) + len(_desc)
+                # Visible width: chip " KEY " + gap + description (KEY is the
+                # full bracket content, so a combo chip like "J K" or the
+                # arrows glyph pair is measured at its real width).
+                _w_need = len(_chip_key(_label)) + 2 + len(_gap) + len(_desc)
                 if _cur and _curw + len(_gap) + _w_need > IW - 4:
                     _wrap_rows.append(_cur)
                     _cur, _curw = [], 0
@@ -5803,6 +5950,13 @@ class BTopTui:
                           f"bringing up the Wintun adapter, routes follow...")
             self.logs.put(f"[dns] configured resolver: "
                           f"{self.ns.dns4 or _cfgdef.DNS4 + ' (default)'}")
+            # Record the helper PID in the crash marker so the cleanup watchdog
+            # can stop the helper (and its tun2socks tree) if the dashboard
+            # dies uncleanly (Alt+F4, Task Manager, crash, power loss).
+            try:
+                startup_recovery.record_helper(self.proc.pid)
+            except Exception:
+                pass
             # Fresh tunnel: fresh dedup for [net] lines (ordered dict; see
             # _poll_connections for why a set is no longer used).
             self._seen_conns = {}
@@ -6677,9 +6831,9 @@ class BTopTui:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="btop-style dashboard for v2ray TUN monitoring.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__)
+    description="btop-style dashboard for v2ray TUN monitoring.",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=__doc__)
     ap.add_argument("--server", nargs="+", default=["198.51.100.1"],
                     help="VLESS server IP or hostname (repeatable: --server a b)")
     ap.add_argument("--port", type=int, default=10808, help="SOCKS5 inbound port")
@@ -6739,12 +6893,12 @@ def main():
     # bare host or IP, so normalise once, up front (the [A] key does the same).
     args.bypass_ip = [h for h in (_host_from_url(x) for x in (args.bypass_ip or [])) if h]
     args.proxy2_bypass_ip = [h for h in (_host_from_url(x)
-                                         for x in (args.proxy2_bypass_ip or [])) if h]
+                                             for x in (args.proxy2_bypass_ip or [])) if h]
     args.proxy2_server = [_host_from_url(s) or s for s in (args.proxy2_server or [])]
     args.server = [_host_from_url(s) or s for s in (args.server or [])]
 
     if not _admin():
-        sys.exit("[!] Run this as Administrator (use Run_Helper.bat).")
+            sys.exit("[!] Run this as Administrator (use Run_Helper.bat).")
 
     # ── Binary integrity (tuntop/integrity.py) ─────────────────────────
     # tun2socks.exe / wintun.dll run inside this ADMIN process: a swapped
@@ -6752,11 +6906,11 @@ def main():
     # against the pinned SHA-256 hashes BEFORE anything is launched.
     # Refuses to start on MISSING/MISMATCH unless --trust-binaries.
     _bin_ok, _bin_reports, _bin_msgs = integrity.verify_for_launch(
-        args.tun2socks, trust=args.trust_binaries)
+            args.tun2socks, trust=args.trust_binaries)
     for _m in _bin_msgs:
-        print(_m)
+            print(_m)
     if not _bin_ok:
-        sys.exit(1)
+            sys.exit(1)
 
     # Fix the console codepage/font up *before* deciding whether Unicode
     # glyphs are safe - this is what actually makes a plain cmd.exe or
@@ -6773,32 +6927,54 @@ def main():
     # clean ALL of it BEFORE the new tunnel starts, so this launch never
     # builds on top of stale state.
     _startup_hosts = list(dict.fromkeys(
-        [s for s in (args.server or []) if s]
-        + [h for h in (args.bypass_ip or []) if h]))
+            [s for s in (args.server or []) if s]
+            + [h for h in (args.bypass_ip or []) if h]))
     try:
-        _recovery_actions = startup_recovery.startup_recover(
-            hosts=_startup_hosts, log=lambda m: print(m))
-        if _recovery_actions:
-            print("[+] Startup recovery complete - clean slate for this run.")
+            _recovery_actions = startup_recovery.startup_recover(
+                hosts=_startup_hosts, log=lambda m: print(m))
+            if _recovery_actions:
+                print("[+] Startup recovery complete - clean slate for this run.")
     except Exception as e:
-        # Recovery must never block the launch; the helper's own
-        # preflight_cleanup is still there as the second line of defence.
-        print(f"[!] Startup recovery could not run: {e}")
+            # Recovery must never block the launch; the helper's own
+            # preflight_cleanup is still there as the second line of defence.
+            print(f"[!] Startup recovery could not run: {e}")
+
+    # Spawn the cleanup watchdog (detached, outlives the dashboard).
+    # It waits for THIS process to die, then runs the SAME recovery sweep
+    # if the exit was unclean (crash marker still ours). Pure stdlib,
+    # zero pip deps, no console - diagnostics go to .cleanup_watchdog.log
+    # next to the marker file.
+    try:
+            import subprocess
+            _watchdog_script = os.path.join(os.path.dirname(__file__),
+                                             "core", "cleanup_watchdog.py")
+            _hosts_arg = ",".join(_startup_hosts)
+            subprocess.Popen([sys.executable, _watchdog_script,
+                              "--pid", str(os.getpid()),
+                              "--hosts", _hosts_arg],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL,
+                             creationflags=subprocess.DETACHED_PROCESS |
+                                         subprocess.CREATE_NEW_PROCESS_GROUP)
+    except Exception as e:
+            # Watchdog is best-effort; if it fails to start, the next launch's
+            # startup_recover still cleans everything.
+            print(f"[!] Cleanup watchdog could not start: {e}")
 
     def _atexit_all():
-        try:
-            if app is not None:
-                # Full sweep (live routes + geo leftovers + host routes): even
-                # if [Q]'s own teardown was skipped somehow, nothing lingers.
-                app._exit_route_sweep()
-        except Exception as e:
-            print(f"[!] Route cleanup on exit failed: {e}")
-        _teardown_wintun()
-        # Verified clean exit: the crash marker goes away, so the NEXT
-        # launch knows it starts from a clean slate.
-        startup_recovery.clear_marker()
+            try:
+                if app is not None:
+                    # Full sweep (live routes + geo leftovers + host routes): even
+                    # if [Q]'s own teardown was skipped somehow, nothing lingers.
+                    app._exit_route_sweep()
+            except Exception as e:
+                print(f"[!] Route cleanup on exit failed: {e}")
+            _teardown_wintun()
+            # Verified clean exit: the crash marker goes away, so the NEXT
+            # launch knows it starts from a clean slate.
+            startup_recovery.clear_marker()
     atexit.register(_atexit_all)
-
     if args.ascii:
         _apply_glyphs(False)
     elif args.unicode:
@@ -6824,6 +7000,7 @@ def main():
         ctypes.windll.kernel32.SetConsoleCtrlHandler(_CTRL_HANDLER_REF, True)
     except Exception:
         pass
+    pass
 
     app = None
     try:
@@ -6875,20 +7052,3 @@ def main():
                 f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n{tb}\n")
         except Exception:
             pass
-        print("Press any key to close this window...")
-        try:
-            import msvcrt
-            msvcrt.getwch()
-        except Exception:
-            pass
-        sys.exit(1)
-
-    # Normal exit (e.g. [Q]): blank the screen so the launcher's
-    # "Press any key to close this window..." prompt doesn't paint over the
-    # last dashboard frame.
-    sys.stdout.write("\033[0m\033[?25h\033[2J\033[3J\033[H")
-    sys.stdout.flush()
-
-
-if __name__ == "__main__":
-    main()

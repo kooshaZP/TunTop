@@ -46,7 +46,49 @@ cd TunTop
 
 Install any SOCKS5-capable proxy client — e.g. [v2rayN](https://github.com/2dust/v2rayN), Xray, sing-box, or Clash Meta — and enable its local SOCKS inbound (default `127.0.0.1:10808`).
 
-### 3. Run
+### 3. Set the server (the VLESS proxy origin)
+
+TunTop also needs the address of your proxy's **origin server** — the remote
+VLESS/Xray server your local SOCKS5 client (v2rayN, etc.) connects to. This is
+the one address that must **NOT** go through the tunnel itself: TunTop routes
+it around the TUN automatically, but you have to tell it where the origin is.
+Pick **one** of these ways:
+
+- **Edit `Run_Helper.ps1`** — set the `$Servers` line near the top:
+
+  ```powershell
+  $Servers = @('203.0.113.10')                    # a bare IP
+  # $Servers = @('example.com')                   # or a hostname
+  # $Servers = @('a.example.com', 'b.example.com') # multiple are fine
+  ```
+
+- **Command line** — `--server` is repeatable:
+
+  ```powershell
+  python tuntop/ui/dashboard.py --server 203.0.113.10 --server example.com
+  ```
+
+- **Live in the dashboard** — press `[U]` (Servers) and type the address(es),
+  comma or space separated. **A full share link works too**: pasting something
+  like `vless://uuid@203.0.113.10:443?type=ws...` or `https://example.com/...`
+  is fine — TunTop strips the scheme, UUID/userinfo, port and path and keeps
+  only the host. Changes made with `[U]` are resolved immediately and take
+  effect on the next tunnel start (`[S]`).
+
+**Why the origin never goes through the TUN:** for every address you list,
+TunTop resolves it (both IPv4 and IPv6) and installs explicit host routes
+(`/32` for IPv4, `/128` for IPv6) through the **physical NIC**. The tunnel's
+own connection to the origin therefore always rides the real network and never
+enters the TUN — otherwise the tunnel would try to reach its server through
+itself (a routing loop) and nothing would connect. You can verify this in the
+`[2]` panel: **SERVER / RESOLVED** on the *TUNNEL* side, and the same
+addresses listed under **DIRECT** (what is routed around the tunnel).
+
+> If your origin sits behind a CDN or reaches other domains, bypass those too:
+> `--bypass-ip cdn.example.com` (repeatable) or press **[A]** in the dashboard
+> and choose *direct* — same bypass mechanism, for any extra host.
+
+### 4. Run
 
 **Easiest — double-click `Start_TunTop.bat`.** It fixes the two classic
 "downloaded from GitHub and it won't run" problems automatically (strips the
@@ -101,7 +143,7 @@ TunTop builds a Wintun TUN adapter, feeds it through `tun2socks` into your proxy
 | `[R]`                         | Re-apply geoip country bypass live                    |
 | `[G]` `[M]` `[H]`             | Graph mode / theme / help show-hide                   |
 | `1-6`, `0`                    | Hide/show panels                                      |
-| `j`/`k` / mouse wheel         | Scroll the health checks AND the event log (5 rows per wheel notch) |
+| `j`/`k` / arrows / PgUp / wheel / ←→ | Scroll: hovering a panel makes it the ACTIVE target for j/k, arrows, PgUp/PgDn, Home/End, ←/→ and the wheel |
 
 On short windows (16:9 screens) the panels shrink first — health-check rows,
 then the graph — and the help footer is only removed as the last resort.
@@ -156,6 +198,7 @@ tests/                     <- 170+ tests across 5 tiers
 - **Dashboard won't start** — TunTop needs Administrator rights. Right-click `Run_Helper.ps1` → Run as Administrator.
 - **Health scan fails** — press `[D]` to export diagnostics (config, routes, logs, last scan) and attach it to an issue.
 - **Traffic leaks** — run `[L]` to compare direct vs tunneled exit IP, and confirm v2rayN's SOCKS5 inbound is listening on the port TunTop uses (`[P]`).
+- **Tunnel starts but nothing connects** — check the `SERVER`/`RESOLVED` rows in the `[2]` panel: the origin must resolve and be listed under **DIRECT**. See *Set the server (the VLESS proxy origin)* above; if the origin is behind a CDN, bypass that domain too (`[A]` → direct).
 - **Running alongside another VPN** — use VPN mode (`[V]`) and VPN bypass (`[Y]`) so TunTop rides the existing VPN instead of fighting for the default route.
 - **Still stuck?** Open an issue and attach the diagnostics file from `[D]`. See also [FAQ](FAQ.md).
 

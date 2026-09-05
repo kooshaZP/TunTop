@@ -4,6 +4,20 @@ All notable changes to TunTop are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **The event log and the health-check panel each get their own scroll, and
+  the mouse decides which one is ACTIVE**: moving the cursor over a visible
+  panel makes it the active scroll target (its title grows a "⇕ scroll"
+  marker). j/k, the arrow keys, PgUp/PgDn, Home/End, the mouse wheel and
+  the Left/Right horizontal scroll all apply to that one panel only —
+  Left/Right now use a separate column
+  offset per panel (`_log_hscroll` / `_checks_hscroll`) instead of one
+  shared offset that moved both panels' columns at once. Before the mouse
+  has hovered anything, j/k keeps its historical role (health checks) and
+  the wheel behaves exactly as before, so keyboard-only hosts are
+  unaffected. If the active panel is hidden with [5]/[6]/[0], scrolling
+  falls back to the other panel so the keys never die on a missing panel.
+
 ### Fixed
 - **The [L] leak test no longer false-alarms on exit-side address
   rotation**: the verdict compared the direct and tunnel egress IPs as

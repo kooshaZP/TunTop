@@ -28,7 +28,7 @@ $DnsServer         = ''            # empty = built-in defaults (8.8.8.8 + 2606:4
 $DnsServerV6       = ''
 
 # VLESS server address(es) - IP or hostname, as many as you like.
-$Servers           = @('45.142.120.16')
+$Servers           = @('188.114.97.6')
 
 # geoip.dat bypass (route-level "bypass a country").
 # The script looks for geoip.dat inside a 'geofil' sub-folder next to this script.
