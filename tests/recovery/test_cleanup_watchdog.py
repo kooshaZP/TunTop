@@ -1,4 +1,4 @@
-"""Unit tests for tuntop.core.cleanup_watchdog - Phase 5+ crash watchdog.
+﻿"""Unit tests for tuntop.core.cleanup_watchdog - Phase 5+ crash watchdog.
 
 Every probe, wait, and PID kill is faked: deterministic, no Windows, no
 subprocesses, no network. The decision logic (when to sweep, what to clear)
@@ -18,6 +18,7 @@ from tuntop.core.cleanup_watchdog import (
     kill_pid,
     main,
     sweep_after_unclean_exit,
+    sweep_geo_routes,
     wait_for_exit,
 )
 
@@ -194,6 +195,15 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
 
 # ── main() ────────────────────────────────────────────────────────────
 
+
+    def test_accepts_geoip_kwargs(self):
+        """sweep_after_unclean_exit takes geoip/geoip_code (physical-adapter sweep)."""
+        path = make_marker(pid=4242)
+        p, state = self._make_probes()
+        result = sweep_after_unclean_exit(4242, marker_path=path, probes=p,
+                                          geoip=None, geoip_code="ir")
+        self.assertTrue(result)
+
 class TestMain(unittest.TestCase):
     def test_main_writes_log_and_returns_zero(self):
         """main() should return 0 on a clean sweep."""
@@ -230,6 +240,15 @@ def read_marker(path):
             return json.load(f)
     except Exception:
         return None
+
+
+class TestSweepGeoRoutes(unittest.TestCase):
+    def test_missing_file_returns_zero(self):
+        self.assertEqual(sweep_geo_routes(r"C:\\definitely\\missing.dat", "ir"), 0)
+
+    def test_none_geoip_returns_zero(self):
+        self.assertEqual(sweep_geo_routes(None, "ir"), 0)
+
 
 
 if __name__ == "__main__":
