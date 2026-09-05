@@ -1,4 +1,4 @@
-name: Release
+﻿name: Release
 
 on:
   push:
@@ -21,6 +21,24 @@ jobs:
 
       - name: Run tests
         run: python -m unittest discover -s tests -t . -v
+
+      - name: Fetch vendored binaries (tun2socks + wintun)
+        run: |
+          # The binaries are gitignored, so a fresh checkout has none - the
+          # exe would build with none embedded and refuse to start ("NOT
+          # FOUND at ..._MEI..."). Same sources Run_Helper.ps1 uses.
+          $ErrorActionPreference = 'Stop'
+          $tmp = Join-Path $env:RUNNER_TEMP 'tuntop-bin'
+          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+          $t2 = Invoke-WebRequest -Uri 'https://github.com/xjasonlyu/tun2socks/releases/download/v2.7.0/tun2socks-windows-amd64-v3.zip' -OutFile (Join-Path $tmp 't2.zip') -UseBasicParsing
+          Expand-Archive -LiteralPath (Join-Path $tmp 't2.zip') -DestinationPath (Join-Path $tmp 't2') -Force
+          $t2exe = Get-ChildItem (Join-Path $tmp 't2') -Recurse -Filter 'tun2socks*.exe' | Select-Object -First 1 -ExpandProperty FullName
+          Copy-Item $t2exe (Join-Path $env:GITHUB_WORKSPACE 'tun2socks-windows-amd64-v3.exe') -Force
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile (Join-Path $tmp 'wt.zip') -UseBasicParsing
+          Expand-Archive -LiteralPath (Join-Path $tmp 'wt.zip') -DestinationPath (Join-Path $tmp 'wt') -Force
+          Copy-Item (Join-Path $tmp 'wt\wintun\bin\amd64\wintun.dll') (Join-Path $env:GITHUB_WORKSPACE 'wintun.dll') -Force
+          Get-ChildItem $env:GITHUB_WORKSPACE -Filter 'tun2socks*' | Select-Object Name, Length
+          Get-Item (Join-Path $env:GITHUB_WORKSPACE 'wintun.dll') | Select-Object Name, Length
 
       - name: Build standalone executable
         run: |

@@ -49,7 +49,19 @@ def app_dir() -> str:
     directory the *assets* are shipped in, never the temp sandbox.
     """
     if getattr(_sys, "frozen", False):
-        return getattr(_sys, "_MEIPASS", _os.path.dirname(_sys.executable))
+        # Onefile: _MEIPASS holds whatever the build embedded. The vendored
+        # binaries are GITIGNORED, so CI builds may embed NONE - then the exe
+        # must find them NEXT TO ITSELF (TunTop.exe in the user's folder,
+        # exactly where the PS1 downloader drops them). Prefer the exe dir
+        # when it actually has the binaries, else fall back to _MEIPASS.
+        exe_dir = _os.path.dirname(_sys.executable)
+        meipass = getattr(_sys, "_MEIPASS", exe_dir)
+        for cand in (meipass, exe_dir):
+            if _os.path.isfile(_os.path.join(
+                    cand, "tun2socks-windows-amd64-v3.exe")):
+                return cand
+        return exe_dir if _os.path.isfile(_os.path.join(
+            exe_dir, "wintun.dll")) else meipass
     here = _os.path.dirname(_os.path.abspath(__file__))
     if _os.path.basename(here) == "ui":
         return _os.path.dirname(here)

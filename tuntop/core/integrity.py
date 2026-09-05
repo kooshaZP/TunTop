@@ -1,4 +1,4 @@
-"""Binary integrity verification - trust the bytes you run as ADMIN.
+﻿"""Binary integrity verification - trust the bytes you run as ADMIN.
 
 TunTop launches `tun2socks.exe` (and loads `wintun.dll`) from an
 Administrator process that rewrites the system routing table. If either
@@ -157,9 +157,21 @@ def verify_for_launch(tun2socks_path: str, wintun_path: Optional[str] = None,
                         "binaries above are UNVERIFIED.")
         ok = True
     if not ok:
-        messages.append("[!] Refusing to start with unverified binaries. "
-                        "Restore the files above (they ship with the "
-                        "repo), or override with --trust-binaries if you "
-                        "rebuilt them yourself.")
+        import sys
+        if getattr(sys, "frozen", False):
+            exe_dir = os.path.dirname(sys.executable)
+            messages.append(
+                "[!] Refusing to start with unverified binaries. "
+                f"Put both files next to TunTop.exe ({exe_dir}) - "
+                "tun2socks-windows-amd64-v3.exe and wintun.dll - or just "
+                "run Run_Helper.ps1, which downloads them automatically. "
+                "(Override with --trust-binaries only if you rebuilt them "
+                "yourself.)")
+        else:
+            messages.append(
+                "[!] Refusing to start with unverified binaries. "
+                "Restore the files above (Run_Helper.ps1 downloads them "
+                "automatically), or override with --trust-binaries if you "
+                "rebuilt them yourself.")
     return ok, reports, messages
 
