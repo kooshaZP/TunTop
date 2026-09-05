@@ -2,7 +2,7 @@
 
 All notable changes to TunTop are documented here.
 
-## [Unreleased]
+## [1.0.2] - 2026-09-05
 
 ### Fixed
 - **Sudden-exit cleanup actually works now** - the detached cleanup watchdog
