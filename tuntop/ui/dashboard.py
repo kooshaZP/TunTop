@@ -6945,31 +6945,31 @@ def main():
     # zero pip deps, no console - diagnostics go to .cleanup_watchdog.log
     # next to the marker file.
     try:
-            import subprocess
-            _watchdog_script = os.path.join(os.path.dirname(__file__),
-                                             "core", "cleanup_watchdog.py")
-            _hosts_arg = ",".join(_startup_hosts)
-            subprocess.Popen([sys.executable, _watchdog_script,
-                              "--pid", str(os.getpid()),
-                              "--hosts", _hosts_arg],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL,
-                             stdin=subprocess.DEVNULL,
-                             creationflags=subprocess.DETACHED_PROCESS |
-                                         subprocess.CREATE_NEW_PROCESS_GROUP)
+        import subprocess
+        _watchdog_script = os.path.join(os.path.dirname(__file__),
+                                         "core", "cleanup_watchdog.py")
+        _hosts_arg = ",".join(_startup_hosts)
+        subprocess.Popen([sys.executable, _watchdog_script,
+                          "--pid", str(os.getpid()),
+                          "--hosts", _hosts_arg],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL,
+                         creationflags=subprocess.DETACHED_PROCESS |
+                                 subprocess.CREATE_NEW_PROCESS_GROUP)
     except Exception as e:
-            # Watchdog is best-effort; if it fails to start, the next launch's
-            # startup_recover still cleans everything.
-            print(f"[!] Cleanup watchdog could not start: {e}")
+        # Watchdog is best-effort; if it fails to start, the next launch's
+        # startup_recover still cleans everything.
+        print(f"[!] Cleanup watchdog could not start: {e}")
 
     def _atexit_all():
-            try:
-                if app is not None:
-                    # Full sweep (live routes + geo leftovers + host routes): even
-                    # if [Q]'s own teardown was skipped somehow, nothing lingers.
-                    app._exit_route_sweep()
-            except Exception as e:
-                print(f"[!] Route cleanup on exit failed: {e}")
+        try:
+            if app is not None:
+                # Full sweep (live routes + geo leftovers + host routes): even
+                # if [Q]'s own teardown was skipped somehow, nothing lingers.
+                app._exit_route_sweep()
+        except Exception as e:
+            print(f"[!] Route cleanup on exit failed: {e}")
             _teardown_wintun()
             # Verified clean exit: the crash marker goes away, so the NEXT
             # launch knows it starts from a clean slate.
@@ -7000,7 +7000,6 @@ def main():
         ctypes.windll.kernel32.SetConsoleCtrlHandler(_CTRL_HANDLER_REF, True)
     except Exception:
         pass
-    pass
 
     app = None
     try:
