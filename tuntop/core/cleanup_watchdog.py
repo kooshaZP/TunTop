@@ -35,6 +35,7 @@ tested without Windows (tests/recovery/test_cleanup_watchdog.py).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -65,8 +66,26 @@ DEFAULT_GRACE_SECONDS = 3.0
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         ".cleanup_watchdog.log")
 
+#: Live-session state sidecar (written by the dashboard whenever bypass /
+#: geo state changes, deleted on clean teardown). Read at sweep time so
+#: bypasses the user added LIVE (dashboard [A]/[F] dialogs, after the
+#: watchdog was spawned with the startup args) are cleaned too.
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          ".cleanup_watchdog_state.json")
+
 
 _LOG_SEEN: set = set()
+
+
+def read_live_state(path: str = STATE_FILE) -> dict:
+    """Best-effort read of the dashboard's live-session state sidecar.
+    Missing/corrupt -> {} (the sweep then relies on the startup args)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _log(msg: str, log=None) -> None:
@@ -332,11 +351,23 @@ def main(argv=None) -> int:
             except Exception:
                 helper_pid = None
         hosts = [h.strip() for h in (args.hosts or "").split(",") if h.strip()]
+        # Merge the dashboard's live-session state: bypasses/geo chosen
+        # AFTER this watchdog was spawned (dashboard [A]/[F]/geo dialogs)
+        # are only present here - never in the startup args.
+        state = read_live_state(args.marker.replace(
+            os.path.basename(args.marker),
+            os.path.basename(STATE_FILE))) if os.path.isfile(
+                os.path.join(os.path.dirname(args.marker),
+                             os.path.basename(STATE_FILE))) else read_live_state()
+        hosts = list(dict.fromkeys(
+            hosts + [h for h in (state.get("hosts") or []) if h]))
+        geoip = state.get("geoip") or args.geoip
+        geoip_code = state.get("geoip_code") or args.geoip_code
         sweep_after_unclean_exit(args.pid, hosts=hosts,
                                  helper_pid=helper_pid,
                                  marker_path=args.marker,
-                                 geoip=args.geoip,
-                                 geoip_code=args.geoip_code)
+                                 geoip=geoip,
+                                 geoip_code=geoip_code)
     except Exception as e:
         _log(f"watchdog: unexpected failure: {e}")
         return 1

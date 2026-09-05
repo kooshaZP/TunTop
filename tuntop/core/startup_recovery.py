@@ -149,6 +149,18 @@ def default_probes() -> Probes:
         found = []
         for h in hosts or []:
             v4, v6 = _resolve_cached(h)
+            if not v4 and not v6:
+                # Fresh process (the watchdog) has an empty DNS cache and
+                # _resolve_cached does zero I/O by design - do a real
+                # resolve here, best effort, so hostname bypass entries are
+                # still matched against the live table. An IP literal or a
+                # dead host just yields [] and is skipped.
+                try:
+                    from tuntop.network.dns import _resolve_detail
+                    v4, v6, _err, _src = _resolve_detail(
+                        h, use_cache=False, fallback=False)
+                except Exception:
+                    v4, v6 = [], []
             for ip in v4:
                 dest = f"{ip}/32"
                 if routing._route_exists_v4(dest):

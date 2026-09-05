@@ -2897,6 +2897,7 @@ class BTopTui:
         self.log_lines.append(
             "    (resolving + installing the route live in the background "
             "- no restart needed)")
+        self._write_watchdog_state()
         self._ensure_bypass_resolver()
 
     def _remove_bypass_ip(self, entry, target="direct"):
@@ -2947,6 +2948,7 @@ class BTopTui:
         # no reason). The entry is already gone from the bypass list, so the next
         # tunnel start/restart simply won't re-apply it. The [A] key is the only
         # one gated by the auto-restart ([Z]) toggle.
+        self._write_watchdog_state()
         self._remove_bypass_routes_async(entry, known, target=target)
 
     def _remove_bypass_routes_async(self, entry, known, target="direct"):
@@ -3479,6 +3481,7 @@ class BTopTui:
         """[F] -> 4: live-REMOVE every route belonging to the configured geo
         country code (any interface), without stopping the tunnel. Runs on a
         background thread like every other mutating action."""
+        self._write_watchdog_state()
         cidrs = self._geo_sweep_cidrs()
         if not cidrs:
             self.log_lines.append(
@@ -3718,6 +3721,30 @@ class BTopTui:
         self._last_raw_tx = None
         self.launch()
         self.log_lines.append(f"[+] Restarted with SOCKS port {new_port}")
+
+    def _write_watchdog_state(self):
+        """Snapshot the session's route-relevant state into the watchdog's
+        sidecar so an unclean exit sweep covers EVERYTHING this session
+        added - including bypasses and geo config chosen AFTER launch
+        (the watchdog only got the startup args). Best-effort, tiny file."""
+        try:
+            path = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "core", ".cleanup_watchdog_state.json"))
+            data = {
+                "pid": os.getpid(),
+                "hosts": list(dict.fromkeys(
+                    [s for s in (getattr(self.ns, "server", None) or []) if s]
+                    + [h for h in (getattr(self.ns, "bypass_ip", None) or []) if h]
+                    + [h for h in (getattr(self.ns, "proxy2_bypass_ip", None) or []) if h]
+                    + [h for h in (getattr(self.ns, "vpn_bypass_ip", None) or []) if h])),
+                "geoip": getattr(self.ns, "geoip", None),
+                "geoip_code": getattr(self.ns, "geoip_code", None),
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
 
     def _write_control_file(self):
         """Write the helper's live-reconfig control file (the exact path the
@@ -3976,6 +4003,7 @@ class BTopTui:
         freezing the UI. It hands the work to a background thread the same way
         every other mutating action (_add_bypass_ip, telemetry, connection
         polling) is backgrounded."""
+        self._write_watchdog_state()
         geo = getattr(self.ns, "geoip", None)
         if not geo:
             self.log_lines.append(
@@ -6932,7 +6960,13 @@ def main():
     # builds on top of stale state.
     _startup_hosts = list(dict.fromkeys(
             [s for s in (args.server or []) if s]
-            + [h for h in (args.bypass_ip or []) if h]))
+            + [h for h in (args.bypass_ip or []) if h]
+            # proxy2 second-hop bypasses and Windows-VPN endpoint bypasses
+            # also install /32+/128 host routes - a hard exit leaves those
+            # behind exactly like the primary ones, so recovery and the
+            # watchdog need them in the sweep list too.
+            + [h for h in (getattr(args, "proxy2_bypass_ip", None) or []) if h]
+            + [h for h in (getattr(args, "vpn_server", None) or []) if h]))
     try:
             _recovery_actions = startup_recovery.startup_recover(
                 hosts=_startup_hosts, log=lambda m: print(m))
