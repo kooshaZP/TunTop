@@ -17,6 +17,17 @@ All notable changes to TunTop are documented here.
   `tuntop/core/.cleanup_watchdog.log`.
 
 
+- **The released standalone exe starts now** - the v1.0.2 exe CI published
+  first had NO tun2socks/wintun inside (both are gitignored, so the Actions
+  checkout had none and `TunTop.spec` silently dropped them), and the
+  integrity check refused with `NOT FOUND at ..._MEI...`. Fixed three ways:
+  CI fetches both binaries before building (same sources `Run_Helper.ps1`
+  uses), the frozen app now also looks next to `TunTop.exe` itself (where
+  the PS1 downloader drops them), and the refusal message names the exact
+  fix for the frozen case. Verified end-to-end: rebuilt exe (14.4 MB) has
+  both binaries embedded, `--help` exits 0, non-admin boot reaches the
+  elevation hint.
+
 ### Changed
 - **The event log and the health-check panel each get their own scroll, and
   the mouse decides which one is ACTIVE**: moving the cursor over a visible
