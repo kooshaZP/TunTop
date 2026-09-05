@@ -1,4 +1,4 @@
-"""Detached cleanup watchdog - the safety net under EVERY exit path.
+﻿"""Detached cleanup watchdog - the safety net under EVERY exit path.
 
 Normal teardown ([Q], Ctrl+C, a window close that finishes within its
 5-second slot, atexit) removes the Wintun adapter, its routes and every
@@ -43,7 +43,8 @@ import time
 # When executed as a script (`python cleanup_watchdog.py --pid N`), the
 # package root is NOT on sys.path (sys.path[0] is this file's directory).
 # Fix that before importing anything from the tuntop package.
-_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))   # file is tuntop/core/x.py -> repo root
 if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 
@@ -65,11 +66,17 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         ".cleanup_watchdog.log")
 
 
+_LOG_SEEN: set = set()
+
+
 def _log(msg: str, log=None) -> None:
     """Report to the caller's sink AND append to the on-disk diary (the
     watchdog has no console - without the file, a sweep that ran or failed
-    silently would be undiagnosable)."""
-    if log is not None:
+    silently would be undiagnosable). The sink may itself be _log (main()
+    wires it that way) - a _sentinel de-dupes that chain so every message
+    lands in the diary exactly once."""
+    if log is not None and msg not in _LOG_SEEN:
+        _LOG_SEEN.add(msg)
         try:
             log(msg)
         except Exception:
@@ -190,9 +197,8 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
 
     findings = scan(hosts=list(hosts or []), probes=probes,
                     marker_path=marker_path)
-    actions = recover(findings, probes=probes, log=log)
-    for a in actions:
-        _log(f"watchdog: {a}", log)
+    actions = recover(findings, probes=probes,
+                      log=lambda m: _log(m, log))
     if not actions:
         _log("watchdog: sweep found nothing left to clean", log)
 
@@ -240,8 +246,7 @@ def main(argv=None) -> int:
         hosts = [h.strip() for h in (args.hosts or "").split(",") if h.strip()]
         sweep_after_unclean_exit(args.pid, hosts=hosts,
                                  helper_pid=helper_pid,
-                                 marker_path=args.marker,
-                                 log=lambda m: None)
+                                 marker_path=args.marker)
     except Exception as e:
         _log(f"watchdog: unexpected failure: {e}")
         return 1
