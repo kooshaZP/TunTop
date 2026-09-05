@@ -159,9 +159,82 @@ def kill_pid(pid: int, log=None) -> bool:
     return False
 
 
+def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
+    """Remove every live route whose DestinationPrefix is one of the geoip
+    country's CIDRs. Geo bypass routes live on the PHYSICAL adapter, so the
+    Wintun teardown above never sees them - after a hard kill they keep
+    routing that country's traffic around the (now dead) tunnel, which both
+    breaks connectivity for those prefixes and leaves the bypass intent
+    armed for the next session. Batch netsh -f deletes, same fast path the
+    dashboard's own sweep uses. Returns how many were removed."""
+    log = log or (lambda m: None)
+    try:
+        if not geoip or not os.path.isfile(geoip):
+            return 0
+        from tuntop.geoip import parse_geoip          # repo root on sys.path
+        import tuntop.network.routing as routing
+        cidrs = set(parse_geoip(geoip, geoip_code))
+        if not cidrs:
+            return 0
+        ok, out = routing._ps(
+            "Get-NetRoute -AddressFamily IPv4,IPv6 -ErrorAction SilentlyContinue | "
+            "Select-Object DestinationPrefix,InterfaceAlias,NextHop | "
+            "ConvertTo-Json -Compress -Depth 2")
+        rows = []
+        if ok and out.strip():
+            import json as _json
+            data = _json.loads(out)
+            if isinstance(data, dict):
+                data = [data]
+            rows = data
+        victims = []
+        for r in rows:
+            dp = str(r.get("DestinationPrefix", ""))
+            if dp not in cidrs:
+                continue
+            alias = str(r.get("InterfaceAlias", "") or "").replace("'", "")
+            nh = str(r.get("NextHop", "") or "")
+            victims.append((dp, alias, nh))
+        if not victims:
+            return 0
+        # Batch netsh -f deletes: hundreds of lines per process, disjoint
+        # prefixes cannot collide.
+        import tempfile
+        chunks = [victims[i:i + 256] for i in range(0, len(victims), 256)]
+        removed = 0
+        for chunk in chunks:
+            lines = []
+            for dp, alias, nh in chunk:
+                verb = "ipv6" if ":" in dp else "ipv4"
+                nh_tok = ""
+                if nh and nh not in ("0.0.0.0", "::"):
+                    nh_tok = f" {nh}"
+                lines.append(f'interface {verb} delete route {dp} "{alias}"{nh_tok}')
+            try:
+                fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="wd_geo_")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines))
+                    subprocess.run(["netsh", "-f", tmp],
+                                   capture_output=True, timeout=180)
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except Exception:
+                        pass
+                removed += len(chunk)
+            except Exception:
+                pass
+        return removed
+    except Exception as e:
+        _log(f"watchdog: geo sweep failed: {e}", log)
+        return 0
+
+
 def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
                              marker_path: str = MARKER_FILE, log=None,
-                             probes=None) -> bool:
+                             probes=None, geoip: str = None,
+                             geoip_code: str = "cn") -> bool:
     """The watchdog's whole decision, in one testable function.
 
     Returns True when an unclean exit of session `pid` was detected and
@@ -169,7 +242,9 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
     a newer session) returns False and touches nothing.
 
     `probes` is passed straight through to startup_recovery's scan/recover
-    so tests can run the whole path with fakes and no Windows.
+    so tests can run the whole path with fakes and no Windows. When
+    `geoip`/`geoip_code` are given, geo-bypass routes on the PHYSICAL
+    adapter are swept too (the Wintun teardown can't see them).
     """
     log = log or (lambda m: None)
     try:
@@ -202,6 +277,12 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
     if not actions:
         _log("watchdog: sweep found nothing left to clean", log)
 
+    # Geo bypass routes sit on the PHYSICAL adapter - invisible to the
+    # Wintun teardown. Sweep them by CIDR match if a geoip file is known.
+    n_geo = sweep_geo_routes(geoip, geoip_code, log=log)
+    if n_geo:
+        _log(f"watchdog: removed {n_geo} leftover geoip route(s)", log)
+
     # Clear the marker ONLY if it is still ours - a session started while
     # we swept has written its own by now and owns the system.
     try:
@@ -224,6 +305,13 @@ def main(argv=None) -> int:
                     help="dashboard process to wait for")
     ap.add_argument("--hosts", default="",
                     help="comma-separated origin hosts for the route sweep")
+    ap.add_argument("--geoip", default=None, metavar="PATH",
+                    help="geoip .dat path - after an unclean exit, every live "
+                         "route whose prefix matches --geoip-code's CIDRs is "
+                         "swept too (they live on the PHYSICAL adapter, which "
+                         "the Wintun teardown never touches)")
+    ap.add_argument("--geoip-code", default="cn", metavar="CC",
+                    help="country code inside --geoip to sweep (default cn)")
     ap.add_argument("--helper-pid", type=int, default=None,
                     help="tunnel helper PID (from the session marker)")
     ap.add_argument("--marker", default=MARKER_FILE)
@@ -246,7 +334,9 @@ def main(argv=None) -> int:
         hosts = [h.strip() for h in (args.hosts or "").split(",") if h.strip()]
         sweep_after_unclean_exit(args.pid, hosts=hosts,
                                  helper_pid=helper_pid,
-                                 marker_path=args.marker)
+                                 marker_path=args.marker,
+                                 geoip=args.geoip,
+                                 geoip_code=args.geoip_code)
     except Exception as e:
         _log(f"watchdog: unexpected failure: {e}")
         return 1

@@ -6958,9 +6958,16 @@ def main():
             os.path.dirname(os.path.abspath(__file__))),
             "core", "cleanup_watchdog.py")
         _hosts_arg = ",".join(_startup_hosts)
-        subprocess.Popen([sys.executable, _watchdog_script,
-                          "--pid", str(os.getpid()),
-                          "--hosts", _hosts_arg],
+        _wd_cmd = [sys.executable, _watchdog_script,
+                   "--pid", str(os.getpid()),
+                   "--hosts", _hosts_arg]
+        # Hand over the geo config so an unclean exit sweep can also clear
+        # geo bypass routes on the PHYSICAL adapter (the Wintun teardown
+        # never touches those).
+        if getattr(args, "geoip", None) and os.path.isfile(args.geoip):
+            _wd_cmd += ["--geoip", args.geoip,
+                        "--geoip-code", getattr(args, "geoip_code", "cn")]
+        subprocess.Popen(_wd_cmd,
                          stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL,
