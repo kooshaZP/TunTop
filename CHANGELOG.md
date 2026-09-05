@@ -4,6 +4,19 @@ All notable changes to TunTop are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Sudden-exit cleanup actually works now** - the detached cleanup watchdog
+  had three defects that left it inert in real runs (unit tests import the
+  module and never execute it as a script, so all passed): wrong package-root
+  path (`ModuleNotFoundError` before any logic), doubled log plumbing through
+  a lambda sink, and a `TunTop.geoip` typo in the dashboard's own geo sweep
+  that made it match zero CIDRs. Live-fire rehearsed: dead PID + stale crash
+  marker -> helper tree-kill, Wintun adapter/routes teardown, geo bypass
+  routes on the PHYSICAL adapter swept by CIDR (new `--geoip/--geoip-code`
+  handoff from the dashboard), marker cleared; diary in
+  `tuntop/core/.cleanup_watchdog.log`.
+
+
 ### Changed
 - **The event log and the health-check panel each get their own scroll, and
   the mouse decides which one is ACTIVE**: moving the cursor over a visible
