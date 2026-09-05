@@ -6256,8 +6256,12 @@ class BTopTui:
                 here = os.path.dirname(os.path.abspath(__file__))
                 if here not in sys.path:
                     sys.path.insert(0, here)
+                # tuntop.geoip (NOT "TunTop.geoip" - that typo made every sweep see
+                # an empty CIDR set and silently clean nothing). parse_geoip keeps a
+                # cross-run disk cache, so decoding is instant even for a
+                # multi-megabyte .dat.
                 cidrs = set(importlib.import_module(
-                    "TunTop.geoip").parse_geoip(geo, code))
+                    "tuntop.geoip").parse_geoip(geo, code))
             except Exception:
                 cidrs = set()
         self._geo_sweep_cidrs_val = cidrs
@@ -6946,8 +6950,13 @@ def main():
     # next to the marker file.
     try:
         import subprocess
-        _watchdog_script = os.path.join(os.path.dirname(__file__),
-                                         "core", "cleanup_watchdog.py")
+        # dashboard.py lives in tuntop/ui/, so the watchdog (tuntop/core/) is
+        # TWO levels up from this file - dirname(dirname(__file__)), not
+        # dirname(__file__) (that built tuntop/ui/core/... which never
+        # existed, so Popen raised and the watchdog never ran at all).
+        _watchdog_script = os.path.join(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))),
+            "core", "cleanup_watchdog.py")
         _hosts_arg = ",".join(_startup_hosts)
         subprocess.Popen([sys.executable, _watchdog_script,
                           "--pid", str(os.getpid()),
