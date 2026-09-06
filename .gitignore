@@ -1,5 +1,6 @@
 # --- build artifacts -------------------------------------------------------
 dist/
+build/
 
 # --- downloaded at first run; never commit binaries -----------------------
 *.exe
