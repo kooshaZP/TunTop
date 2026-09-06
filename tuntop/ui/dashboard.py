@@ -395,7 +395,9 @@ _unicode_setup_ok = True  # updated by _set_unicode_font() once it actually runs
 
 
 def _probe_unicode_support():
-    """Decide whether Unicode box/block glyphs are safe to use. Defaults to
+    """(Legacy) heuristic for whether Unicode glyphs render. No longer on
+    the default startup path - Unicode is now forced on unless --ascii or
+    BTOP_ASCII=1. Kept for debugging odd terminals. Defaults to
     yes almost everywhere: mintty (Git Bash), Windows Terminal, ConEmu, and
     VS Code all render them natively, and _enable_ansi()/_set_unicode_font()
     already switch a classic conhost (plain cmd.exe or PowerShell console) to
@@ -7040,7 +7042,8 @@ def main():
     ap.add_argument("--font-size", type=int, default=0, metavar="N",
                     help="console font height in pixels-ish units (e.g. 18)")
     ap.add_argument("--unicode", action="store_true",
-                    help="Force Unicode box/block glyphs even if auto-detection is unsure")
+                    help="(default) Unicode box/block glyphs; kept for "
+                         "compatibility - use --ascii to opt out")
     ap.add_argument("--ascii", action="store_true",
                     help="Force plain ASCII glyphs (+/-/#) even if Unicode looks supported")
     ap.add_argument("--bypass-ip", action="append", default=[], metavar="HOST_OR_IP",

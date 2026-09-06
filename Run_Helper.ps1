@@ -296,7 +296,7 @@ switch ($mode.Trim()) {
 # box/block glyphs, or force plain ASCII (+ - #) for a weak/old console.
 Write-Host ''
 Write-Host 'Choose glyph mode:'
-Write-Host '  [1] Auto    - use Unicode box/block glyphs if the terminal supports them'
+Write-Host '  [1] Auto    - Unicode box/block glyphs (now the default; --ascii opts out)'
 Write-Host '  [2] Unicode - force box/block glyphs (needs a Unicode-capable font)'
 Write-Host '  [3] ASCII   - plain + - # (safe for old cmd.exe / Raster font)'
 $gmode = Read-Host 'Select glyph mode (1/2/3)'

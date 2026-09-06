@@ -2,6 +2,15 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.4] - 2026-09-06
+
+### Changed
+- **Unicode glyphs are the default** in the standalone exe (and everywhere
+  else): box-drawing/block glyphs render without passing `--unicode`. The
+  conhost font/codepage fix-up runs before the decision, so the classic
+  console can draw them. `--ascii` (or `BTOP_ASCII=1`) still opts out; the
+  launcher's glyph menu text now matches.
+
 ## [1.0.3] - 2026-09-05
 
 ### Added
