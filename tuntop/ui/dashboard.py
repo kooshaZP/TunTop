@@ -1973,8 +1973,18 @@ class BTopTui:
                 self.recovery.report_success()
             elif tr.target is TunnelState.STOPPED and \
                     (tr.reason or "").startswith("helper process"):
-                self.recovery.report_failure(FailureKind.PROCESS,
-                                             tr.reason or "helper died")
+                # The helper's stdout EOF can reach this reader BEFORE the
+                # user-stop path reaches recovery.pause() - the exit of a
+                # REQUESTED stop then raced in as a fake "crash" (the user
+                # saw "Problem detected - helper process exited" plus a
+                # recovery restart right after pressing stop). Any teardown
+                # in flight means the exit is expected - absorb it.
+                if (self._stopping.is_set() or self._shutting_down
+                        or self._cleanup_done):
+                    pass
+                else:
+                    self.recovery.report_failure(FailureKind.PROCESS,
+                                                 tr.reason or "helper died")
         except Exception:
             pass
 
@@ -2003,6 +2013,15 @@ class BTopTui:
                 self.launch()
             except Exception as e:
                 self._blog(f"[!] launch during recovery restart failed: {e}")
+            # "Alive" right after launch is weak evidence: the helper can
+            # still exit seconds later on a startup check (e.g.
+            # --vless-over-vpn with no connected VPN) - which the user saw
+            # as "Recovery verified" followed by the helper dying. Give the
+            # helper its startup window before trusting the PID.
+            for _ in range(6):
+                if not (self.proc and self.proc.poll() is None):
+                    return False
+                time.sleep(0.5)
             return bool(self.proc and self.proc.poll() is None)
         finally:
             with self._restart_lock:
@@ -4243,7 +4262,17 @@ class BTopTui:
             # but the worker only recognised "proxy2"/"direct", so a winvpn
             # request fell into the physical-adapter else below - the user saw
             # normal physical traffic and "geo via VPN" did nothing.)
-            vpn4 = _get_vpn_ipv4_default(getattr(self.ns, "vpn_interface", None))
+            vpn4 = None
+            for _attempt in range(4):
+                vpn4 = _get_vpn_ipv4_default(
+                    getattr(self.ns, "vpn_interface", None))
+                if vpn4:
+                    break
+                if _attempt < 3:
+                    self._blog(
+                        f"[*] No connected Windows VPN route yet "
+                        f"(attempt {_attempt + 1}/4) - waiting 3s and retrying...")
+                    time.sleep(3)
             vpn6 = _get_vpn_ipv6_default(getattr(self.ns, "vpn_interface", None))
             if not vpn4:
                 self._blog(

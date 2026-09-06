@@ -2543,7 +2543,21 @@ def main():
     vless_iface, vless_gateway = iface, gateway
     vpn_conn_name_for_check = None
     if args.vless_over_vpn:
-        vpn_default = get_vpn_ipv4_default(args.vpn_interface)
+        # The VPN lookup runs once per helper start. When --vless-over-vpn is
+        # combined with auto-recovery, a start can land while the Windows VPN
+        # is still RE-CONNECTING (its adapter/routes disappear for seconds
+        # during the transport drop that killed the tunnel in the first
+        # place) - a single immediate check then declares "no VPN" and the
+        # helper exits, looping. Retry the lookup over a short window first.
+        vpn_default = None
+        for _attempt in range(4):
+            vpn_default = get_vpn_ipv4_default(args.vpn_interface)
+            if vpn_default:
+                break
+            if _attempt < 3:
+                print(f"[*] No active Windows VPN route yet "
+                      f"(attempt {_attempt + 1}/4) - waiting 3s and retrying...")
+                time.sleep(3)
         if not vpn_default:
             hint = (" (--vpn-interface did not match any live route)" if args.vpn_interface else
                     " Use --vpn-interface <alias> if this VPN isn't visible to Get-VpnConnection.")

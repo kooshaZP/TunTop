@@ -2,6 +2,26 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.10] - 2026-09-06
+
+### Fixed
+- **A user-requested stop no longer masquerades as a crash** - the helper's
+  stdout EOF could reach the reader thread a moment BEFORE the stop path
+  paused the recovery engine, so a normal [T] stop produced
+  "Problem detected (process: helper process exited)" and an automatic
+  restart right after the tunnel was intentionally stopped. Teardown-in-
+  flight exits are now absorbed.
+- **Recovery no longer declares victory on a helper that dies during
+  startup** - "Recovery verified" fired on PID-alive alone; the helper can
+  still exit seconds later on a startup gate (e.g. --vless-over-vpn with no
+  VPN connected). The verify step now watches the process through its
+  startup window (~3s) before claiming a fix.
+- **--vless-over-vpn survives a VPN that is still reconnecting** - a start
+  landing while the Windows VPN adapter is mid-reconnect (no routes for a
+  few seconds) used to exit immediately with "no active Windows VPN default
+  route found". The lookup now retries for ~9s before giving up (helper and
+  the [F] geo-via-VPN worker).
+
 ## [1.0.9] - 2026-09-06
 
 ### Fixed
