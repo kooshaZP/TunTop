@@ -208,6 +208,13 @@ tests/                     <- 170+ tests across 5 tiers
   info resource, a real icon — but only a code-signing certificate (paid) fully
   eliminates them.
 - **Dashboard won't start** — TunTop needs Administrator rights. Right-click `Run_Helper.ps1` → Run as Administrator.
+- **Page renders wrong — lots of `???????????` instead of the boxes/panels** — the
+  console font can't draw the Unicode glyphs. Fix: **right-click the title bar at
+  the top of the console window → Properties → Font tab**, and switch the font to
+  a TrueType mono font — **Cascadia Mono**, **Cascadia Mono SemiLight** (the
+  default TunTop requests), **Consolas**, or **Lucida Console**. Raster fonts
+  (the default on some systems) simply have no glyphs for those characters.
+  Also make sure the codepage is UTF-8: `chcp 65001`. Then restart TunTop.
 - **Health scan fails** — press `[D]` to export diagnostics (config, routes, logs, last scan) and attach it to an issue.
 - **Traffic leaks** — run `[L]` to compare direct vs tunneled exit IP, and confirm v2rayN's SOCKS5 inbound is listening on the port TunTop uses (`[P]`).
 - **Tunnel starts but nothing connects** — check the `SERVER`/`RESOLVED` rows in the `[2]` panel: the origin must resolve and be listed under **DIRECT**. See *Set the server (the VLESS proxy origin)* above; if the origin is behind a CDN, bypass that domain too (`[A]` → direct).
