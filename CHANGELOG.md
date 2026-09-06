@@ -2,6 +2,21 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.6] - 2026-09-06
+
+### Changed
+- **The exe moves itself into Windows Terminal when available** - a classic
+  conhost window (what you get double-clicking the exe) is the weakest
+  renderer TunTop can end up in: several glyph slots keep showing '?' even
+  after the font/codepage fix-up, because the console HOST - not cmd vs
+  PowerShell - does the drawing. When the frozen exe starts inside a plain
+  conhost and Windows Terminal is installed, it now relaunches itself there
+  (every original argument carried over) instead: WT renders every
+  box/block/●/✔ glyph natively with its own profile font. Running from
+  Windows Terminal, VS Code, ConEmu or any other modern host is detected
+  and left untouched; child helper/watchdog processes never relaunch;
+  `BTOP_NO_WT=1` opts out.
+
 ## [1.0.5] - 2026-09-06
 
 ### Fixed

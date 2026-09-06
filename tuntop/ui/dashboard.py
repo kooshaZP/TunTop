@@ -7182,6 +7182,38 @@ def main():
             import importlib
             sys.exit(importlib.import_module(_child_mod).main() or 0)
 
+    # ── Prefer Windows Terminal over legacy conhost (frozen exe) ────────
+    # Double-clicking the exe opens a classic conhost window - the weakest
+    # renderer TunTop can end up in: its default font is often a Raster face
+    # and several glyph slots keep showing '?' even after the font/codepage
+    # fix-up below. When the exe starts inside a plain conhost and Windows
+    # Terminal is installed, move the whole dashboard there instead: WT
+    # renders every box/block/●/✔ glyph natively with its own profile font
+    # (the "PowerShell window" experience, minus the cmd.exe drawing bugs).
+    # Child helper/watchdog processes never get here (dispatch above already
+    # exited), the relaunch passes every original argument through, and
+    # BTOP_NO_WT=1 opts out entirely.
+    if (getattr(_sys, "frozen", False)
+            and _detect_terminal_host() == "conhost"
+            and sys.stdout.isatty()
+            and not os.environ.get("BTOP_NO_WT")
+            and not any(a in sys.argv for a in ("-h", "--help"))):
+        _wt = (shutil.which("wt.exe") or os.path.join(
+            os.environ.get("LOCALAPPDATA", ""),
+            "Microsoft", "WindowsApps", "wt.exe"))
+        if _wt and os.path.isfile(_wt):
+            try:
+                _exe = os.path.abspath(_sys.executable)
+                subprocess.Popen([_wt, "-d", os.path.dirname(_exe), _exe]
+                                 + sys.argv[1:],
+                                 creationflags=subprocess.DETACHED_PROCESS
+                                 | subprocess.CREATE_NEW_PROCESS_GROUP,
+                                 close_fds=True)
+                print("[i] Relaunching in Windows Terminal ...")
+                sys.exit(0)
+            except Exception:
+                pass   # alias missing/broken - keep the current conhost
+
     ap = argparse.ArgumentParser(
     description="btop-style dashboard for v2ray TUN monitoring.",
     formatter_class=argparse.RawDescriptionHelpFormatter,
