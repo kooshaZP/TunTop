@@ -1,4 +1,4 @@
-﻿# TunTop
+# TunTop
 
 [![CI](https://github.com/kooshaZP/TunTop/actions/workflows/ci.yml/badge.svg)](https://github.com/kooshaZP/TunTop/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/kooshaZP/TunTop/blob/main/LICENSE)
@@ -243,18 +243,55 @@ tests/                     <- 170+ tests across 5 tiers
 
 ## Troubleshooting
 
-- **Antivirus deletes / blocks `TunTop.exe`** — false positive. TunTop is an unsigned
-  open-source exe; Windows Defender and other AVs heuristically flag unsigned
-  VPN/network tools. Fixes, in order of preference:
-  1. Restore it from Defender protection history and add an exclusion for the
-     TunTop folder (Windows Security → Virus & threat protection → Exclusions).
-  2. Verify the download first: `certutil -hashfile TunTop.exe SHA256` and compare
-     with `checksums.txt` from the release — then exclude with confidence.
-  3. Or skip the exe entirely: run `Run_Helper.bat` (Python source), which AVs
-     treat as plain scripts.
-  The build reduces false positives where it can: no UPX packing, full version
-  info resource, a real icon — but only a code-signing certificate (paid) fully
-  eliminates them.
+### Antivirus deletes TunTop.exe ("Trojan:Win32/Wacatac.B!ml")
+
+**Why it happens.** This is a false positive, and it is expected. The `!ml` in the
+detection name means a machine-learning model flagged the file — not a known
+malware signature. TunTop is an **unsigned** onefile exe that (a) extracts itself
+to a temp folder, (b) runs as Administrator, and (c) rewrites the system routing
+table, adapter DNS and VPN state. That is *exactly* the behavior profile of real
+trojans, so the model scores it as dangerous — because there is no cryptographic
+proof (a code-signing certificate) that the file came from a trusted publisher.
+Nothing in the program contacts or executes anything from an attacker; every
+network connection it makes is to your own proxy and to official download
+sources pinned by SHA-256.
+
+**How to use TunTop without the AV deleting it (Windows Defender, step by step):**
+
+1. **Restore the file** — Windows Security → *Virus & threat protection* →
+   *Protection history* → find the `TunTop.exe` entry → **Actions → Restore**.
+   (Command line: `powershell "Add-MpPreference -ExclusionPath 'C:\path\to\TunTop folder'"` first if it re-deletes on restore.)
+2. **Add a folder exclusion BEFORE re-running it** — Windows Security →
+   *Virus & threat protection* → *Manage settings* → *Exclusions* →
+   *Add an exclusion* → **Folder** → pick the folder where `TunTop.exe` lives.
+   Admin PowerShell one-liner (replace the path):
+   `Add-MpPreference -ExclusionPath 'C:\Tools\TunTop'`
+3. **Verify you restored the real file** — in the release you downloaded, open
+   `checksums.txt`, then in a terminal run:
+   `certutil -hashfile TunTop.exe SHA256`
+   The hash must match the `TunTop.exe` line exactly. If it does, the bytes are
+   the ones the CI server built — scan results are then provably about the
+   unsigned format, not about tampered content.
+4. **Keep the exe and its folder in one place** — moving it around re-triggers
+   real-time scanning on each new location.
+
+**Zero-AV-trouble alternative: run from source (recommended).** AVs almost never
+flag plain Python scripts, because nothing is packed or self-extracting:
+
+1. Install [Python 3.11](https://www.python.org/downloads/) (tick *Add to PATH*).
+2. Download the source: **Code → Download ZIP** on the repo page (or
+   `git clone https://github.com/kooshaZP/TunTop.git`).
+3. Double-click **`Start_TunTop.bat`** (in the repo root) → accept the UAC prompt.
+   It unblocks the downloaded files (Mark of the Web), bypasses the PowerShell
+   execution policy for that one run, sets a proper console font, and starts
+   the dashboard — no AV quarantine, because there is nothing packed to scan.
+
+The exe stays available for people who prefer one file; on CI-built releases the
+published binary is identical to what the workflow built — see `checksums.txt`.
+
+The build already reduces false-positive surface (no UPX packing, full version
+resource, real icon), but only a code-signing certificate eliminates ML-flagged
+false positives completely.
 - **Dashboard won't start** — TunTop needs Administrator rights. Right-click `Run_Helper.ps1` → Run as Administrator.
 - **Page renders wrong — lots of `???????????` instead of the boxes/panels** — the
   console font can't draw the Unicode glyphs. Fix: **right-click the title bar at

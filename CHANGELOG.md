@@ -2,6 +2,27 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.9] - 2026-09-06
+
+### Fixed
+- **The app no longer freezes after stop / blocks restart or exit** - [T]
+  (stop on a worker), [Q] (inline teardown screen) and the exit atexit path
+  could all run their route sweeps CONCURRENTLY: two PowerShell sweeps
+  fighting over the route table while both waited on the same helper, which
+  froze the UI for the whole overlap ("after stopping the program becomes
+  unresponsive and I can't start it again or exit"). A teardown lock now
+  serialises every stop path; [Q] and exit wait out an in-flight stop
+  worker; [S] during a stop reports "still in progress" instead of
+  launching a helper into the middle of a teardown.
+- **[P] SOCKS-port change no longer freezes the dashboard** - the stop +
+  relaunch now runs on a background thread like every other restart.
+- **Third-party VPN clients are found for [V] / geo-via-VPN** - clients that
+  neither appear in Get-VpnConnection nor install a 0.0.0.0/0 default route
+  (e.g. "VPN Client Adapter - VPN") were invisible to the VPN lookup, so
+  geo-via-VPN fell back to the physical adapter. The lookup now scans
+  VPN-pattern adapters (pptp/l2tp/sstp/ikev2/vpn/wan miniport) for their
+  most-specific Alive route as a final fallback (helper + dashboard copies).
+
 ## [1.0.8] - 2026-09-06
 
 ### Fixed

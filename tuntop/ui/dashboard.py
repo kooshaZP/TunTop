@@ -1789,6 +1789,16 @@ class BTopTui:
         self._bypass_restart_active = False
         self._restart_lock = threading.Lock()
 
+        # Teardown serialisation: [T] runs stop() on a worker; [Q], the
+        # atexit handler and the SOCKS-port dialog run teardown paths too.
+        # Without a gate, a second teardown could run CONCURRENTLY with an
+        # in-flight one (double PowerShell sweeps fighting over the route
+        # table, both waiting on the same helper, the UI thread blocked
+        # behind the worker) - the user-visible result was "after stopping,
+        # the app is unresponsive and I can't start it again or exit".
+        self._teardown_lock = threading.Lock()
+        self._stopping = threading.Event()   # set while ANY stop/teardown runs
+
         # Live-reconfiguration support
         self._iface_cache = None        # cached (interface, gateway) for live bypass-route adds
         # Dedup map for [net] connection log lines: key -> last-seen timestamp.
@@ -3849,18 +3859,30 @@ class BTopTui:
         self.log_lines.append(
             f"[*] Changing SOCKS port {old_port} -> {new_port}; tun2socks has to restart "
             "for this (no live hot-swap), so the tunnel will briefly drop...")
-        self.stop()
-        self.ns.port = new_port
-        self.checks = build_checks(self.ns)
-        self.speed_hist = []
-        self.rx_hist = []
-        self.tx_hist = []
-        self.ping_samples = []
-        self.baseline_bytes = [None]
-        self._last_raw_rx = None
-        self._last_raw_tx = None
-        self.launch()
-        self.log_lines.append(f"[+] Restarted with SOCKS port {new_port}")
+
+        def _port_restart():
+            # Full teardown + relaunch OFF the UI thread: stop() can take
+            # tens of seconds (helper wait + route sweeps) and doing it
+            # inline froze the dashboard for the whole duration.
+            try:
+                self.stop()
+            except Exception as e:
+                self._blog(f"[!] stop during port change failed: {e}")
+            self.ns.port = new_port
+            try:
+                self.checks = build_checks(self.ns)
+            except Exception as e:
+                self._blog(f"[!] health-check rebuild failed: {e}")
+            self.speed_hist = []
+            self.rx_hist = []
+            self.tx_hist = []
+            self.ping_samples = []
+            self.baseline_bytes = [None]
+            self._last_raw_rx = None
+            self._last_raw_tx = None
+            self.launch()
+            self._blog(f"[+] Restarted with SOCKS port {new_port}")
+        threading.Thread(target=_port_restart, daemon=True).start()
 
     def _write_watchdog_state(self):
         """Snapshot the session's route-relevant state into the watchdog's
@@ -4446,6 +4468,14 @@ class BTopTui:
             self._checks_scroll = 0   # a fresh scan shows its newest rows
             return True
         elif key == 's':
+            if self._stopping.is_set():
+                # A stop worker is mid-sweep (routes/wintun). Starting NOW
+                # would race it: the new helper's routes could be deleted by
+                # the finisher, or the TUN grabbed mid-teardown. Wait it out.
+                self.log_lines.append(
+                    "[*] Stop still in progress (route sweep) - press [S] "
+                    "again in a few seconds.")
+                return True
             if not self.proc or self.proc.poll() is not None:
                 self.launch()
             else:
@@ -6074,7 +6104,13 @@ class BTopTui:
             # never keep the process alive past exit.
             self.recovery.pause("app exiting")
             self.recovery.shutdown()
-            self.stop()
+            if self._stopping.is_set():
+                # [T]'s worker is mid-teardown - let it finish instead of
+                # fighting it (double sweeps = the post-stop freeze).
+                while self._stopping.is_set():
+                    time.sleep(0.2)
+            else:
+                self.stop()
             self._restore_console_mode()
 
     def launch(self):
@@ -6838,6 +6874,14 @@ class BTopTui:
         if self._shutting_down:
             return
         self._shutting_down = True
+        # [T] pressed seconds ago? Let its stop worker finish FIRST - running
+        # two teardowns concurrently is what froze the app ("unresponsive
+        # after stop, can't start or exit").
+        if self._stopping.is_set():
+            self._shutdown_stage = "Waiting for the running stop to finish..."
+            self._draw_shutdown()
+            while self._stopping.is_set():
+                time.sleep(0.2)
         # The [Q] path does NOT go through stop() - pause recovery (this is
         # a user-initiated quit, never a crash to repair) and drive the
         # machine into STOPPING so the UI/telemetry see the teardown phase.
@@ -7037,6 +7081,22 @@ class BTopTui:
         # progress bar) and sets `_cleanup_done`; don't repeat that work here.
         if self._cleanup_done:
             return
+        # One teardown at a time (see _teardown_lock in __init__): a second
+        # concurrent call - [Q] while [T]'s worker is sweeping, the exit
+        # atexit racing the worker - used to double-run the PowerShell sweeps
+        # and freeze the app. Instead: mark, serialise, and re-check.
+        if self._stopping.is_set():
+            with self._teardown_lock:
+                pass    # wait for the in-flight teardown to finish
+            return
+        self._stopping.set()
+        try:
+            with self._teardown_lock:
+                self._stop_locked()
+        finally:
+            self._stopping.clear()
+
+    def _stop_locked(self):
         # User-initiated stop: pause recovery FIRST so the machine's walk
         # down (STOPPING/STOPPED) is never mistaken for a crash to repair.
         self.recovery.pause("stop requested")

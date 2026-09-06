@@ -612,6 +612,18 @@ if ($null -eq $best) {
         if ($r) { $best = $r; break }
     }
 }
+if ($null -eq $best) {
+    # Third-party VPN clients Get-VpnConnection does not expose at all
+    # (e.g. "VPN Client Adapter - VPN"): scan VPN-pattern interface aliases
+    # for ANY Alive IPv4 route, not just a default route.
+    $best = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun' -and
+            $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
+        } |
+        Sort-Object { ($_.DestinationPrefix -split '/')[1] -as [int] } -Descending,
+            RouteMetric, InterfaceMetric | Select-Object -First 1
+}
 if ($null -eq $best) { exit 1 }
 $best | Select-Object NextHop, InterfaceAlias, InterfaceIndex | ConvertTo-Json -Compress
 """
