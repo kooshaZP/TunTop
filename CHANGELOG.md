@@ -28,6 +28,20 @@ All notable changes to TunTop are documented here.
   both binaries embedded, `--help` exits 0, non-admin boot reaches the
   elevation hint.
 
+### Added
+- **Truecolor backgrounds for every theme** - the TUI now paints its own
+  background instead of showing the terminal default through every padded
+  space. Each of the 7 palettes ([M] to cycle) carries a matching dark bg
+  (cool near-black blue, amber deep brown, matrix green-black, ...); the
+  background is armed before each frame/overlay, re-armed by every colour
+  span end (bg-aware `_R` reset), and painted over the whole screen on
+  full repaints, diff rows, list/input overlays and the shutdown screen.
+  Quitting still restores the terminal's own default.
+- **`--font FACE` / `--font-size N`** - pick the console font explicitly
+  (classic conhost only; Windows Terminal keeps its profile font). With no
+  flags the old auto behaviour stays: keep the current font if TrueType,
+  else the Consolas/Lucida fallback chain.
+
 ### Changed
 - **The event log and the health-check panel each get their own scroll, and
   the mouse decides which one is ACTIVE**: moving the cursor over a visible

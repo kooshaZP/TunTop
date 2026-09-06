@@ -194,7 +194,8 @@ class _INPUT_RECORD(ctypes.Structure):
 
 DIM = "\033[2m"
 BRIGHT = "\033[1m"
-RESET = "\033[0m"
+RESET = "\033[0m"   # [0m clears everything; spans that should keep the
+                    # theme bg use _R (below) instead
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -210,6 +211,27 @@ P_INACT   = "\033[38;2;60;75;100m"     # panel border (inactive / dim)
 P_ACTIVE  = "\033[38;2;140;190;255m"    # bright accent line
 BG_DARK   = "\033[48;2;15;17;22m"      # subtle bg fill
 
+# ─── Active background (theme-driven) ────────────────────────────────────
+# The terminal's own background shows through every padded space, so the
+# "background" of the TUI = (a) arm the theme bg before the frame, (b) keep
+# it armed ACROSS the Resets that end every colour span, (c) paint spaces
+# over the screen when truly resetting. RESET therefore re-arms the bg of
+# the ACTIVE theme instead of full-resetting to the terminal default.
+_ACTIVE_BG = ""   # set by _arm_bg(); "" = terminal default (bg off)
+
+
+def _arm_bg():
+    """Arm the ACTIVE theme's background; returns the SGR (may be empty).
+    Also refreshes _R so every later span end re-arms THIS theme's bg."""
+    global _ACTIVE_BG, _R
+    _ACTIVE_BG = THEMES[ACTIVE_THEME].get("bg", "")
+    _R = "\033[0m" + _ACTIVE_BG
+    return _ACTIVE_BG
+
+
+_R = "\033[0m"   # refreshed by _arm_bg(); spans ending in _R keep the bg
+
+
 # ─── Themes ──────────────────────────────────────────────────────────────────
 # Swappable named palettes. Each palette provides a default border set
 # (light/active/inact) plus a distinct *accent* colour per panel so the
@@ -221,6 +243,7 @@ BG_DARK   = "\033[48;2;15;17;22m"      # subtle bg fill
 THEMES = [
     {  # 0 - cool (default)
         "name": "cool",
+        "bg":      "\033[48;2;15;17;22m",
         "light":   "\033[38;2;100;140;200m",
         "active":  "\033[38;2;140;190;255m",
         "inact":   "\033[38;2;60;75;100m",
@@ -232,6 +255,7 @@ THEMES = [
     },
     {  # 1 - amber / high-contrast "degraded"
         "name": "amber",
+        "bg":      "\033[48;2;26;20;8m",
         "light":   "\033[38;2;180;130;40m",
         "active":  "\033[38;2;255;190;80m",
         "inact":   "\033[38;2;110;80;25m",
@@ -243,6 +267,7 @@ THEMES = [
     },
     {  # 2 - muted / low-colour
         "name": "muted",
+        "bg":      "\033[48;2;18;18;18m",
         "light":   "\033[38;2;120;120;120m",
         "active":  "\033[38;2;185;185;185m",
         "inact":   "\033[38;2;80;80;80m",
@@ -254,6 +279,7 @@ THEMES = [
     },
     {  # 3 - matrix / green phosphor
         "name": "matrix",
+        "bg":      "\033[48;2;6;14;8m",
         "light":   "\033[38;2;60;150;90m",
         "active":  "\033[38;2;120;255;140m",
         "inact":   "\033[38;2;35;90;55m",
@@ -265,6 +291,7 @@ THEMES = [
     },
     {  # 4 - ice / cyan
         "name": "ice",
+        "bg":      "\033[48;2;8;16;22m",
         "light":   "\033[38;2;90;170;200m",
         "active":  "\033[38;2;150;230;255m",
         "inact":   "\033[38;2;55;105;125m",
@@ -276,6 +303,7 @@ THEMES = [
     },
     {  # 5 - dracula / purple-pastel
         "name": "dracula",
+        "bg":      "\033[48;2;24;24;34m",
         "light":   "\033[38;2;98;114;164m",
         "active":  "\033[38;2;189;147;249m",
         "inact":   "\033[38;2;68;71;90m",
@@ -287,6 +315,7 @@ THEMES = [
     },
     {  # 6 - nord / frosty blue-green
         "name": "nord",
+        "bg":      "\033[48;2;30;34;40m",
         "light":   "\033[38;2;76;86;106m",
         "active":  "\033[38;2;136;192;208m",
         "inact":   "\033[38;2;46;52;64m",
@@ -335,10 +364,10 @@ def _apply_glyphs(unicode_on):
         PROGRESS_EMPTY, PROGRESS_MED, PROGRESS_FULL, PROGRESS_W = "-", "=", "#", "#"
         DOT_GLYPH = "o"
     SPLINE = " .:-=+*#@"
-    DOT_OK   = GREEN + DOT_GLYPH + RESET
-    DOT_WARN = YELLOW + DOT_GLYPH + RESET
-    DOT_FAIL = RED + DOT_GLYPH + RESET
-    DOT_IDLE = GRAY + DOT_GLYPH + RESET
+    DOT_OK   = GREEN + DOT_GLYPH + _R
+    DOT_WARN = YELLOW + DOT_GLYPH + _R
+    DOT_FAIL = RED + DOT_GLYPH + _R
+    DOT_IDLE = GRAY + DOT_GLYPH + _R
 
 
 def _detect_terminal_host():
@@ -394,6 +423,13 @@ def _admin():
         return False
 
 
+# User font preference (set from --font/--font-size in main(); empty =
+# keep the existing auto behaviour: current font if TrueType, else the
+# Consolas/Lucida/... fallback chain).
+USER_FONT = ""
+USER_FONT_SIZE = 0
+
+
 def _set_unicode_font():
     """Switch the console to a TrueType font (Consolas/...) that can actually
     draw the Unicode box/block glyphs. With an elevated cmd.exe the default
@@ -440,7 +476,32 @@ def _set_unicode_font():
         # previously fall through to the ASCII fallback if SetCurrentConsoleFontEx
         # didn't return exactly True, even though it was perfectly capable.
         if cur.FontFamily & 0x04:  # TMPF_TRUETYPE
-            _unicode_setup_ok = True
+            # Already TrueType - but a user font REQUEST still applies
+            # (they explicitly asked for a face/size, not just glyphs).
+            if not USER_FONT and USER_FONT_SIZE <= 0:
+                _unicode_setup_ok = True
+                return
+            want_size = USER_FONT_SIZE if USER_FONT_SIZE > 0 else cur.dwFontSize.Y
+            if USER_FONT:
+                cand = [(USER_FONT, want_size)]
+            else:
+                cand = [(cur.FaceName or "Consolas", want_size)]
+            for face, size in cand:
+                newf = CONSOLE_FONT_INFOEX()
+                newf.cbSize = ctypes.sizeof(newf)
+                newf.nFont = 0
+                newf.dwFontSize = ctypes.COORD(0, size)
+                newf.FontFamily = 0x36  # FF_MODERN | TMPF_TRUETYPE ...
+                newf.FontWeight = 400
+                newf.FaceName = face
+                if k32.SetCurrentConsoleFontEx(h, False, ctypes.byref(newf)):
+                    chk = CONSOLE_FONT_INFOEX()
+                    chk.cbSize = ctypes.sizeof(chk)
+                    if k32.GetCurrentConsoleFontEx(h, False, ctypes.byref(chk)) \
+                            and (chk.FontFamily & 0x04 or chk.FaceName == face):
+                        _unicode_setup_ok = True
+                        return
+            _unicode_setup_ok = True   # request failed; stay on current font
             return
         # Keep the current size; if it's unset, pick a sane default.
         if cur.dwFontSize.Y == 0:
@@ -448,12 +509,15 @@ def _set_unicode_font():
         # Iterating family bits too: SetCurrentConsoleFontEx silently keeps the
         # current (Raster) font unless a TrueType family bit is requested, so the
         # named font must be paired with a TrueType-capable FontFamily value.
+        _faces = ([USER_FONT] if USER_FONT else []) + \
+            ["Consolas", "Lucida Console", "DejaVu Sans Mono", "Courier New"]
+        _size = USER_FONT_SIZE if USER_FONT_SIZE > 0 else cur.dwFontSize.Y
         for family in (0x36, 0x04):
-            for face in ("Consolas", "Lucida Console", "DejaVu Sans Mono", "Courier New"):
+            for face in _faces:
                 new = CONSOLE_FONT_INFOEX()
                 new.cbSize = ctypes.sizeof(new)
                 new.nFont = 0
-                new.dwFontSize = cur.dwFontSize
+                new.dwFontSize = ctypes.COORD(0, _size)
                 new.FontFamily = family
                 new.FontWeight = 400
                 new.FaceName = face
@@ -1325,11 +1389,11 @@ def _format_log_line(raw):
         dst_disp = f"{dst}:{dport}" if dport else dst
         parts = []
         if tag:
-            parts.append(f"{DIM}[{tag}]{RESET} ")
-        parts.append(f"{col}{proto_disp}{RESET}")
-        parts.append(f" {DIM}{src_disp:>21}{RESET}")
-        parts.append(f" {DIM}->{RESET} ")
-        parts.append(f"{DIM}{dst_disp:>21}{RESET}")
+            parts.append(f"{DIM}[{tag}]{_R} ")
+        parts.append(f"{col}{proto_disp}{_R}")
+        parts.append(f" {DIM}{src_disp:>21}{_R}")
+        parts.append(f" {DIM}->{_R} ")
+        parts.append(f"{DIM}{dst_disp:>21}{_R}")
         return "".join(parts)
 
     # Plain tagged helper lines ("[+] ...", "[!] ...", "[*] ...", "[MONITOR] ..",
@@ -1350,8 +1414,8 @@ def _format_log_line(raw):
                 tcol = YELLOW
         if tcol:
             if body:
-                return f"{BRIGHT}{tcol}[{tag}]{RESET} {body}"
-            return f"{BRIGHT}{tcol}[{tag}]{RESET}"
+                return f"{BRIGHT}{tcol}[{tag}]{_R} {body}"
+            return f"{BRIGHT}{tcol}[{tag}]{_R}"
     return raw
 
 
@@ -1375,7 +1439,7 @@ def _bar_stops(frac, width, stops, full=None, empty=None):
     return ui_text.bar_stops(frac, width, stops,
                              full if full is not None else PROGRESS_FULL,
                              empty if empty is not None else PROGRESS_EMPTY,
-                             P_INACT, RESET)
+                             P_INACT, _R)
 
 
 def _bar(frac, width, full=None, empty=None, gradient=True):
@@ -1386,7 +1450,7 @@ def _bar(frac, width, full=None, empty=None, gradient=True):
     return ui_text.bar(frac, width,
                        full if full is not None else PROGRESS_FULL,
                        empty if empty is not None else PROGRESS_EMPTY,
-                       P_INACT, RESET, gradient)
+                       P_INACT, _R, gradient)
 
 
 def _spark(values, width, mode=None):
@@ -1406,19 +1470,19 @@ def _panel(lines, title=None, width=60, active=True):
     # Top
     if title:
         centre = f" {title} "
-        L.append(f"{pad_border}{BOX_LC}{centre.center(width - 2, BOX_MID)}{BOX_RC}{RESET}")
+        L.append(f"{pad_border}{BOX_LC}{centre.center(width - 2, BOX_MID)}{BOX_RC}{_R}")
     else:
-        L.append(f"{pad_border}{BOX_LC}{sep}{BOX_RC}{RESET}")
+        L.append(f"{pad_border}{BOX_LC}{sep}{BOX_RC}{_R}")
 
     # Body
     for row in lines:
         text = str(row).replace("\033[", "ESC[")  # protect embedded ANSI
         # Strip ANSI to get visible width
         visible = len(re.sub(r'\x1b\[[^m]*m', '', str(row)))
-        L.append(f"{pad_border}{BOX_V} {_pad(text, width - 2)} {BOX_V}{RESET}")
+        L.append(f"{pad_border}{BOX_V} {_pad(text, width - 2)} {BOX_V}{_R}")
 
     # Bottom
-    L.append(f"{pad_border}{BOX_BL}{hsep}{BOX_BS}{BOX_BR}{RESET}")
+    L.append(f"{pad_border}{BOX_BL}{hsep}{BOX_BS}{BOX_BR}{_R}")
     return "\n".join(L)
 
 
@@ -2352,30 +2416,31 @@ class BTopTui:
             return fill * (pad // 2) + text + fill * (pad - pad // 2)
 
         def _row(content):
-            return f"{acc}{BOX_V} {_hpad(content, w - 3)}{acc}{BOX_V}{RESET}"
+            return f"{acc}{BOX_V} {_hpad(content, w - 3)}{acc}{BOX_V}{_R}"
 
         def _frame(buf):
             typed = "".join(buf)
             lines = [
-                f"{acc}{BOX_LC}{BRIGHT}{_center(f' {title} ', w - 2)}{BOX_RC}{RESET}",
+                f"{acc}{BOX_LC}{BRIGHT}{_center(f' {title} ', w - 2)}{BOX_RC}{_R}",
                 _row(""),
-                _row(f"  {BRIGHT}{prompt}{RESET}"),
-                _row(f"  {GREEN}>{RESET} {typed}{WHITE}\u2588{RESET}"),
+                _row(f"  {BRIGHT}{prompt}{_R}"),
+                _row(f"  {GREEN}>{_R} {typed}{WHITE}\u2588{_R}"),
                 _row(""),
             ]
             for ex in (examples or []):
-                lines.append(_row(f"  {GRAY}e.g.{RESET} {DIM}{ex}{RESET}"))
+                lines.append(_row(f"  {GRAY}e.g.{_R} {DIM}{ex}{_R}"))
             if examples:
                 lines.append(_row(""))
             chips = "   ".join(
-                f"{GREEN}[{k}]{RESET} {GRAY}{v}{RESET}"
+                f"{GREEN}[{k}]{_R} {GRAY}{v}{_R}"
                 for k, v in (("Enter", "confirm"), ("Esc", "cancel"),
                              ("right-click", "paste")))
             lines.append(_row(f"  {chips}"))
-            lines.append(f"{pal['inact']}{BOX_BL}{BOX_BS * (w - 2)}{BOX_BR}{RESET}")
+            lines.append(f"{pal['inact']}{BOX_BL}{BOX_BS * (w - 2)}{BOX_BR}{_R}")
             return "\033[?25l\033[2J\033[H" + "\n".join(lines)
 
-        sys.stdout.write(_frame([]))
+        _arm_bg()
+        sys.stdout.write(_frame([]) + _ACTIVE_BG)
         sys.stdout.flush()
         # Temporarily enable QuickEdit so paste works; restore on exit.
         saved_mode = None
@@ -3097,13 +3162,14 @@ class BTopTui:
             return fill * (pad // 2) + text + fill * (pad - pad // 2)
 
         def _row(content):
-            return f"{acc}{BOX_V} {_hpad(content, w - 3)}{acc}{BOX_V}{RESET}"
+            return f"{acc}{BOX_V} {_hpad(content, w - 3)}{acc}{BOX_V}{_R}"
 
-        sys.stdout.write("\033[?25l\033[2J\033[H")
+        _arm_bg()   # overlay paint: keep the theme bg armed
+        sys.stdout.write("\033[?25l\033[2J\033[H" + _ACTIVE_BG)
         lines = [
-            f"{acc}{BOX_LC}{BRIGHT}{_center(f' {title} ', w - 2)}{BOX_RC}{RESET}",
+            f"{acc}{BOX_LC}{BRIGHT}{_center(f' {title} ', w - 2)}{BOX_RC}{_R}",
             _row(f"{GRAY}  {len(labels)} entr{'y' if len(labels) == 1 else 'ies'}"
-                 f"{RESET}{GRAY} - highlight one, press Enter{RESET}"),
+                 f"{_R}{GRAY} - highlight one, press Enter{_R}"),
             _row(BOX_MID * (w - 5)),
         ]
         visible = labels[top:top + avail]
@@ -3114,9 +3180,9 @@ class BTopTui:
                 # Filled background chip + bright text for the selected row.
                 lines.append(_row(
                     f"\033[48;2;45;70;110m{WHITE}{BRIGHT} \u25b8 {num} {lab}"
-                    f"{' ' * 2}\033[49m"))
+                    f"{' ' * 2}{_R}"))
             else:
-                lines.append(_row(f"{GRAY}{num}{RESET}  {lab}"))
+                lines.append(_row(f"{GRAY}{num}{_R}  {lab}"))
             # Clickable row: the three header lines above are fixed, so the
             # screen row of entry i is 3 + i. A click resolves to 'sel:<idx>'
             # (the picker loop selects; clicking the already-selected row
@@ -3127,14 +3193,14 @@ class BTopTui:
             lines.append(_row(""))
         lines.append(_row(BOX_MID * (w - 5)))
         chips = "   ".join(
-            f"{GREEN}[{k}]{RESET} {GRAY}{v}{RESET}"
+            f"{GREEN}[{k}]{_R} {GRAY}{v}{_R}"
             for k, v in (("\u2191/\u2193 PgUp/PgDn", "move"),
                          ("Home/End", "first/last"),
                          ("Enter", verb),
                          ("Click", "select / confirm"),
                          ("Esc", "cancel")))
         lines.append(_row(f"  {chips}"))
-        lines.append(f"{pal['inact']}{BOX_BL}{BOX_BS * (w - 2)}{BOX_BR}{RESET}")
+        lines.append(f"{pal['inact']}{BOX_BL}{BOX_BS * (w - 2)}{BOX_BR}{_R}")
         sys.stdout.write("\n".join(lines))
         sys.stdout.flush()
 
@@ -3553,7 +3619,7 @@ class BTopTui:
         names = list(data.keys())
         labels = [
             f"{n}  {GRAY}({data[n].get('server') and ', '.join(data[n]['server'])}"
-            f" · :{data[n].get('port')}){RESET}"
+            f" · :{data[n].get('port')}){_R}"
             for n in names
         ]
         size = _get_window_size() or (80, 24)
@@ -4739,6 +4805,7 @@ class BTopTui:
         self._checks_region = None
         self._log_region = None
         pal = theme()   # active palette for this frame (switchable with [M])
+        _arm_bg()       # keep the theme background armed across every _R
 
         state = self.state
         passed = sum(1 for _, _, ok, _ in self.results if ok)
@@ -4785,17 +4852,17 @@ class BTopTui:
         # `accent` overrides the default border/title colour so each panel can
         # carry its own distinct accent (see THEMES). The title text itself is
         # brightened with BRIGHT for legibility.
-        # Titles often embed their own colour codes that end in RESET (e.g. the
-        # green ▼ DOWNLOAD label in THROUGHPUT). After such a RESET every later
+        # Titles often embed their own colour codes that end in _R (e.g. the
+        # green ▼ DOWNLOAD label in THROUGHPUT). After such a _R every later
         # character would fall back to the terminal default (white fill dashes,
-        # white closing corner) - so RESET is re-armed with the border colour.
+        # white closing corner) - so _R is re-armed with the border colour.
         def _recolor(body, col):
-            return body.replace(RESET, RESET + col)
+            return body.replace(_R, _R + col)
 
         def _top(title, accent=None):
             col = accent if accent else pal["active"]
             body = _recolor(_acenter(title, IW, BOX_MID), col)
-            return f"{col}{BOX_LC}{BRIGHT}{body}{col}{BOX_RC}{RESET}"
+            return f"{col}{BOX_LC}{BRIGHT}{body}{col}{BOX_RC}{_R}"
 
         # ── Helper: symmetric side-border row (always w visible chars) ─
         def _row(content, color=None, hscroll=0, accent=None):
@@ -4805,12 +4872,12 @@ class BTopTui:
             # log line, or health detail can be scrolled into view with the
             # Left/Right arrow keys instead of silently overrunning the border.
             inner = _hpad(content, IW - 1, hscroll)
-            return f"{c}{BOX_V} {inner}{c}{BOX_V}{RESET}"
+            return f"{c}{BOX_V} {inner}{c}{BOX_V}{_R}"
 
         # ── Helper: symmetric bottom border (always W visible chars) ───
         def _bot(accent=None):
             col = accent if accent else pal["inact"]
-            return f"{col}{BOX_BL}{BOX_BS * IW}{BOX_BR}{RESET}"
+            return f"{col}{BOX_BL}{BOX_BS * IW}{BOX_BR}{_R}"
 
         # ── Width-parameterised variants (for the side-by-side wide layout) ──
         # Same as the above but build at an arbitrary panel width so two panels
@@ -4819,20 +4886,20 @@ class BTopTui:
             col = accent if accent else pal["active"]
             iw = width - 2
             body = _recolor(_acenter(title, iw, BOX_MID), col)
-            return f"{col}{BOX_LC}{BRIGHT}{body}{col}{BOX_RC}{RESET}"
+            return f"{col}{BOX_LC}{BRIGHT}{body}{col}{BOX_RC}{_R}"
 
         def _roww(content, width, hscroll=0, accent=None):
             c = accent if accent else pal["light"]
             inner = _hpad(content, width - 3, hscroll)
-            return f"{c}{BOX_V} {inner}{c}{BOX_V}{RESET}"
+            return f"{c}{BOX_V} {inner}{c}{BOX_V}{_R}"
 
         def _botw(width, accent=None):
             col = accent if accent else pal["inact"]
-            return f"{col}{BOX_BL}{BOX_BS * (width - 2)}{BOX_BR}{RESET}"
+            return f"{col}{BOX_BL}{BOX_BS * (width - 2)}{BOX_BR}{_R}"
 
         def _blankw(width, accent=None):
             col = accent if accent else pal["light"]
-            return f"{col}{BOX_V}{' ' * (width - 2)}{BOX_V}{RESET}"
+            return f"{col}{BOX_V}{' ' * (width - 2)}{BOX_V}{_R}"
 
         # ── Status bar (top) ───────────────────────────────────────────
         # Styled like the TUN CONFIG panel: coloured [ STATE ] badge (clickable),
@@ -4854,14 +4921,14 @@ class BTopTui:
         else:
             badge_color = YELLOW
         pairs = [
-            ("MODE", WHITE + mode + RESET),
-            ("PROXY", CYAN + f"127.0.0.1:{self.ns.port}" + RESET),
+            ("MODE", WHITE + mode + _R),
+            ("PROXY", CYAN + f"127.0.0.1:{self.ns.port}" + _R),
             ("VPN BP", (GREEN if vpn_bp_on else YELLOW)
-                       + ("on" if vpn_bp_on else "off") + RESET),
+                       + ("on" if vpn_bp_on else "off") + _R),
         ]
         if getattr(self.ns, "geoip", None):
             gcode = str(getattr(self.ns, "geoip_code", "cn")).upper()
-            pairs.append(("GEO", BRIGHT + gcode + RESET))
+            pairs.append(("GEO", BRIGHT + gcode + _R))
         if getattr(self.ns, "proxy2_port", None):
             # Second pipe status - only rendered when --proxy2-port is set, so
             # the bar looks unchanged for anyone not using the feature. The
@@ -4872,11 +4939,11 @@ class BTopTui:
                               TunnelState.DEGRADED.value)
             pairs.append(("PROXY2", (GREEN if p2_up else YELLOW)
                           + f"127.0.0.1:{self.ns.proxy2_port} "
-                          + ("up" if p2_up else "down") + RESET))
+                          + ("up" if p2_up else "down") + _R))
         if getattr(self.ns, "vless_over_vpn", False) and self._vpn_status:
             vpn_ok = self._vpn_status != "NOT CONNECTED"
             pairs.append(("VPN", (GREEN if vpn_ok else YELLOW)
-                                 + self._vpn_status + RESET))
+                                 + self._vpn_status + _R))
 
         L.append(_top("TUNTOP  -  NETWORK MONITOR"))
         status_row = len(L)
@@ -4884,17 +4951,17 @@ class BTopTui:
         # Content starts 2 columns in (border + one space); the badge is the
         # first item. Briefly highlight it when the user just clicked it.
         badge_disp = self._flash_wrap(
-            status_row, 2, 2 + len(badge), f"{badge_color}{BRIGHT}{badge}{RESET}")
-        sep = f"{GRAY} \u00b7 {RESET}"
+            status_row, 2, 2 + len(badge), f"{badge_color}{BRIGHT}{badge}{_R}")
+        sep = f"{GRAY} \u00b7 {_R}"
         status_text = badge_disp + sep + sep.join(
-            f"{GRAY}{k}{RESET} {v}" for k, v in pairs)
+            f"{GRAY}{k}{_R} {v}" for k, v in pairs)
         if not self._show_help:
             # Help is hidden: the rest of the status bar becomes a click
             # hotspot that re-shows the footer (the mouse path back - the
             # badge hotspot is mapped FIRST, so it still wins its region),
             # and the dim hint makes the affordance discoverable.
             status_text += sep + (f"{DIM}help hidden - click here "
-                                  f"or press [H] to show it{RESET}")
+                                  f"or press [H] to show it{_R}")
             self._click_map.append((status_row, 2 + len(badge), w, "h"))
         L.append(_row(status_text))
         self._click_map.append((status_row, 2, 2 + len(badge), "toggle"))
@@ -4955,54 +5022,54 @@ class BTopTui:
 
         def _kv(label, value):
             """Aligned 'LABEL  value' row: dim fixed-width key, coloured value."""
-            return f"{GRAY}{label:<10}{RESET}{value}"
+            return f"{GRAY}{label:<10}{_R}{value}"
 
         srv_txt = ", ".join(self.ns.server)
         tun = [
-            _kv("SERVER", f"{BRIGHT}{srv_txt}{RESET}"),
+            _kv("SERVER", f"{BRIGHT}{srv_txt}{_R}"),
         ]
         if resolved:
             # Avoid echoing an identical duplicate of SERVER - say so instead.
             if all(r in self.ns.server for r in resolved) and len(resolved) <= len(self.ns.server):
-                tun.append(_kv("RESOLVED", f"{GRAY}(same as server){RESET}"))
+                tun.append(_kv("RESOLVED", f"{GRAY}(same as server){_R}"))
             else:
-                tun.append(_kv("RESOLVED", f"{CYAN}{', '.join(resolved)}{RESET}"))
+                tun.append(_kv("RESOLVED", f"{CYAN}{', '.join(resolved)}{_R}"))
         else:
-            tun.append(_kv("RESOLVED", f"{GRAY}-{RESET}"))
-        tun.append(_kv("PROXY", f"{CYAN}127.0.0.1:{self.ns.port}{RESET}"
-                                f"{GRAY} socks5{RESET}"))
+            tun.append(_kv("RESOLVED", f"{GRAY}-{_R}"))
+        tun.append(_kv("PROXY", f"{CYAN}127.0.0.1:{self.ns.port}{_R}"
+                                f"{GRAY} socks5{_R}"))
         _d4 = getattr(self.ns, "dns4", None)
         _d6 = getattr(self.ns, "dns6", None)
         if _d4 and _d6:
-            _dns_txt = f"{CYAN}{_d4}{RESET}{GRAY} / {RESET}{CYAN}{_d6}{RESET}"
+            _dns_txt = f"{CYAN}{_d4}{_R}{GRAY} / {_R}{CYAN}{_d6}{_R}"
         elif _d4:
-            _dns_txt = f"{CYAN}{_d4}{RESET}{GRAY} (v4 only){RESET}"
+            _dns_txt = f"{CYAN}{_d4}{_R}{GRAY} (v4 only){_R}"
         elif _d6:
-            _dns_txt = f"{GRAY}(default {_cfgdef.DNS4}){RESET} / {CYAN}{_d6}{RESET}"
+            _dns_txt = f"{GRAY}(default {_cfgdef.DNS4}){_R} / {CYAN}{_d6}{_R}"
         else:
-            _dns_txt = (f"{CYAN}{_cfgdef.DNS4} / {_cfgdef.DNS6}{RESET}"
-                        f"{GRAY} (defaults){RESET}")
+            _dns_txt = (f"{CYAN}{_cfgdef.DNS4} / {_cfgdef.DNS6}{_R}"
+                        f"{GRAY} (defaults){_R}")
         tun.append(_kv("DNS", f"{_dns_txt}"
-                              f"{GRAY} · endpoint TCP/{getattr(self.ns, 'endpoint_port', 443)}{RESET}"))
-        tun.append(_kv("EDIT", f"{GREEN}[A]{RESET} add "
-                               f"{GREEN}[X]{RESET} remove "
-                               f"{GRAY}· instant, no restart{RESET}"))
-        tun.append(_kv("", f"{GREEN}[P]{RESET} port  "
-                           f"{GREEN}[N]{RESET} dns  "
-                           f"{GREEN}[E]{RESET} ep-port"))
+                              f"{GRAY} · endpoint TCP/{getattr(self.ns, 'endpoint_port', 443)}{_R}"))
+        tun.append(_kv("EDIT", f"{GREEN}[A]{_R} add "
+                               f"{GREEN}[X]{_R} remove "
+                               f"{GRAY}· instant, no restart{_R}"))
+        tun.append(_kv("", f"{GREEN}[P]{_R} port  "
+                           f"{GREEN}[N]{_R} dns  "
+                           f"{GREEN}[E]{_R} ep-port"))
 
         # Right column body: everything routed DIRECT (not through the TUN).
         bl = []
-        bl.append(f"{BRIGHT}{pal['endpoint']}ROUTED DIRECT{RESET}"
-                  f"{GRAY} - these never enter the tunnel{RESET}")
+        bl.append(f"{BRIGHT}{pal['endpoint']}ROUTED DIRECT{_R}"
+                  f"{GRAY} - these never enter the tunnel{_R}")
         if getattr(self.ns, "vless_over_vpn", False):
-            vpn_val = f"{GREEN}ON{RESET}{GRAY} · VLESS rides Windows VPN{RESET}"
+            vpn_val = f"{GREEN}ON{_R}{GRAY} · VLESS rides Windows VPN{_R}"
             vpn_dot = DOT_OK
         elif getattr(self.ns, "no_vpn_bypass", False):
-            vpn_val = f"{YELLOW}OFF{RESET}{GRAY} · VPN traffic IS tunneled{RESET}"
+            vpn_val = f"{YELLOW}OFF{_R}{GRAY} · VPN traffic IS tunneled{_R}"
             vpn_dot = DOT_WARN
         else:
-            vpn_val = f"{GREEN}ON{RESET}{GRAY} · VPN endpoints stay direct{RESET}"
+            vpn_val = f"{GREEN}ON{_R}{GRAY} · VPN endpoints stay direct{_R}"
             vpn_dot = DOT_OK
         bl.append(" " + vpn_dot + " " + _kv("VPN", vpn_val))
         if getattr(self.ns, "geoip", None):
@@ -5016,11 +5083,11 @@ class BTopTui:
             else:
                 geo_egress, geo_dot = "direct via wifi/physical", DOT_OK
             code = str(getattr(self.ns, "geoip_code", "cn")).upper()
-            geo_val = f"{BRIGHT}{code}{RESET}{GRAY} · {geo_egress}{RESET}"
+            geo_val = f"{BRIGHT}{code}{_R}{GRAY} · {geo_egress}{_R}"
             bl.append(" " + geo_dot + " " + _kv("GEO", geo_val))
         else:
             bl.append(" " + DOT_IDLE + " " +
-                      _kv("GEO", f"{GRAY}none configured{RESET}"))
+                      _kv("GEO", f"{GRAY}none configured{_R}"))
 
         # ALL bypass targets - direct, proxy2 and vpn - so the second proxy's
         # entries are visible in the panel (they used to silently disappear
@@ -5030,7 +5097,7 @@ class BTopTui:
                   + self._bypass_resolved_list("vpn"))
         rule = BOX_MID * 3
         bl.append(f" {GRAY}{rule} added live {rule}"
-                  f"{RESET} {GRAY}([A]/[X]){RESET}")
+                  f"{_R} {GRAY}([A]/[X]){_R}")
         if extras:
             for it in extras:
                 if it["status"] == "ok" and it["ips"]:
@@ -5039,10 +5106,10 @@ class BTopTui:
                     dot = DOT_WARN
                 else:
                     dot = DOT_FAIL
-                bl.append(f"   {dot} {BRIGHT}{it['entry']}{RESET}  {it['detail']}")
+                bl.append(f"   {dot} {BRIGHT}{it['entry']}{_R}  {it['detail']}")
         else:
             bl.append(f"   {DOT_IDLE} {GRAY}none yet"
-                      f"{RESET} {GRAY}- [A] routes a host/IP around the tunnel{RESET}")
+                      f"{_R} {GRAY}- [A] routes a host/IP around the tunnel{_R}")
 
         metrics_hidden = "metrics" in self._hidden
         endpoint_hidden = "endpoint" in self._hidden
@@ -5064,7 +5131,7 @@ class BTopTui:
                 bar_str = _bar(c[3], bw) if show_bar else ""
                 # Dim key + bright coloured value (same kv style as TUN CONFIG).
                 metrics_body.append(
-                    f"{GRAY}{c[1]}{RESET} {c[0]}{BRIGHT}{c[2]}{RESET}"
+                    f"{GRAY}{c[1]}{_R} {c[0]}{BRIGHT}{c[2]}{_R}"
                     + (f" {bar_str}" if bar_str else ""))
             # Clicking a panel's TITLE bar toggles that panel (same as [1]..[6]).
             self._click_map.append((len(L), 0, w, "1"))
@@ -5106,7 +5173,7 @@ class BTopTui:
                     acc = pal["endpoint"]
                     # Re-arm the accent before each wall - the column content
                     # ends in RESET and would otherwise leave white walls.
-                    L.append(f"{acc}{BOX_V}{A}{acc}{BOX_V}{B}{acc}{BOX_V}{RESET}")
+                    L.append(f"{acc}{BOX_V}{A}{acc}{BOX_V}{B}{acc}{BOX_V}{_R}")
                 L.append(_botw(w, pal["endpoint"]))
             else:
                 self._click_map.append((len(L), 0, w, "3"))
@@ -5167,7 +5234,7 @@ class BTopTui:
             if gp_show:
                 def _gkv(label, text):
                     # Same aligned kv style as the TUN CONFIG panel.
-                    return f"{GRAY}{label:<8}{RESET}{text}"
+                    return f"{GRAY}{label:<8}{_R}{text}"
                 bw = max(6, IW - 24)
                 # ── Live-activity extras (so the panel never looks stuck) ──
                 # Spinner driven by wall-clock (animates every frame even when
@@ -5189,17 +5256,17 @@ class BTopTui:
                     _elapsed = max(0, int(time.time() - start_ts))
                 else:
                     _elapsed = 0
-                phase += f"{GRAY}   elapsed {_elapsed:3d}s{RESET}" \
+                phase += f"{GRAY}   elapsed {_elapsed:3d}s{_R}" \
                     if start_ts else ""
                 _geolines = [
-                    _gkv("Phase", f"{BRIGHT}{phase}{RESET}"),
-                    _gkv("Codes", f"{BRIGHT}{', '.join(gp_codes)}{RESET}"),
-                    _gkv("File", f"{CYAN}{file_frac * 100:5.1f}%{RESET}  "
+                    _gkv("Phase", f"{BRIGHT}{phase}{_R}"),
+                    _gkv("Codes", f"{BRIGHT}{', '.join(gp_codes)}{_R}"),
+                    _gkv("File", f"{CYAN}{file_frac * 100:5.1f}%{_R}  "
                                  f"{_bar(file_frac, bw)}"),
-                    _gkv("Routes", f"{GREEN}{inst_frac * 100:5.1f}%{RESET}  "
+                    _gkv("Routes", f"{GREEN}{inst_frac * 100:5.1f}%{_R}  "
                                    f"{_bar(inst_frac, bw)}"),
-                    _gkv("Loaded", f"{BRIGHT}{gp_loaded}{RESET}"
-                                   f"{GRAY} / {gp_total} routes{RESET}"),
+                    _gkv("Loaded", f"{BRIGHT}{gp_loaded}{_R}"
+                                   f"{GRAY} / {gp_total} routes{_R}"),
                 ]
                 L.append(_topw("GEO BYPASS LOADING", w, pal["health"]))
                 for _b in _geolines:
@@ -5365,7 +5432,7 @@ class BTopTui:
                             glyph = "\u2580" if frac >= 0.5 else "\u2584"
                             chars.append(f"{col}{glyph}")
                         elif idle_mark and row_i == 0:
-                            chars.append(f"{P_INACT}{idle_mark}{RESET}")
+                            chars.append(f"{P_INACT}{idle_mark}{_R}")
                         else:
                             chars.append(" ")
                         continue
@@ -5393,10 +5460,10 @@ class BTopTui:
                         if idle_mark and row_i == 0:
                             # Baseline zero-line: keeps an idle chart visibly
                             # "alive" instead of four blank rows.
-                            chars.append(f"{P_INACT}{idle_mark}{RESET}")
+                            chars.append(f"{P_INACT}{idle_mark}{_R}")
                         else:
                             chars.append(" ")
-                rows.append("".join(chars) + RESET)
+                rows.append("".join(chars) + _R)
             return rows
 
         def _grow(content):
@@ -5408,7 +5475,7 @@ class BTopTui:
             # RESET (the per-column colouring does that), so re-arm the accent
             # before the closing wall or it renders default-white.
             acc = pal["throughput"]
-            return f"{acc}{BOX_V}{content}{acc}{BOX_V}{RESET}"
+            return f"{acc}{BOX_V}{content}{acc}{BOX_V}{_R}"
 
         # Stretch/truncate each series to exactly `graph_w` columns so the
         # chart always spans the full inner width edge-to-edge. The time axis
@@ -5440,10 +5507,10 @@ class BTopTui:
             peak_mib = peak_ref / 1024
             self._click_map.append((len(L), 0, w, "4"))
             _spark_rx = _spark(rx_snap)
-            _title_bits = [f"{GREEN}\u25bc DOWNLOAD{RESET}  /  "
-                           f"{CYAN}\u25b2 UPLOAD{RESET}"]
+            _title_bits = [f"{GREEN}\u25bc DOWNLOAD{_R}  /  "
+                           f"{CYAN}\u25b2 UPLOAD{_R}"]
             if _spark_rx:
-                _title_bits.append(f"{GREEN}{_spark_rx}{RESET}")
+                _title_bits.append(f"{GREEN}{_spark_rx}{_R}")
             L.append(_top("   ".join(_title_bits), pal["throughput"]))
             # Upload (cyan glow, ▲) on top - baseline at the middle divider, fills up.
             for gl in reversed(_area(up, up_stops[-1], up_stops[0],
@@ -5452,7 +5519,7 @@ class BTopTui:
                                      pulse=overall_mood in ("flowing", "surge"))):
                 L.append(_grow(gl))
             # Faint divider between the two directions (keeps them readable).
-            L.append(f"{P_INACT}{BOX_V}{BOX_MID * graph_w}{BOX_V}{RESET}")
+            L.append(f"{P_INACT}{BOX_V}{BOX_MID * graph_w}{BOX_V}{_R}")
             # Download (green glow, ▼) on the bottom - 0 at the BOTTOM of this
             # section, filling UPWARD, exactly like upload. Each direction is its own
             # area chart with its baseline at its own base (0 at the bottom),
@@ -5476,12 +5543,12 @@ class BTopTui:
             _pct_r = min(100.0, cur_rx / max(peak_ref, 1e-9) * 100)
             _pct_t = min(100.0, cur_tx / max(peak_ref, 1e-9) * 100)
             L.append(_row(
-                f"{GREEN}\u25bc {down_k:6.2f}{DIM}%{_pct_r:3.0f}{RESET}"
-                f"{DIM} avg {_avg_r:5.1f} peak {pdown_k:6.2f}{RESET}   "
-                f"{CYAN}\u25b2 {up_k:6.2f}{DIM}%{_pct_t:3.0f}{RESET}"
-                f"{DIM} avg {_avg_t:5.1f} peak {pup_k:6.2f}{RESET}   "
+                f"{GREEN}\u25bc {down_k:6.2f}{DIM}%{_pct_r:3.0f}{_R}"
+                f"{DIM} avg {_avg_r:5.1f} peak {pdown_k:6.2f}{_R}   "
+                f"{CYAN}\u25b2 {up_k:6.2f}{DIM}%{_pct_t:3.0f}{_R}"
+                f"{DIM} avg {_avg_t:5.1f} peak {pup_k:6.2f}{_R}   "
                 f"{DIM}total {total_mb:7.1f} MiB   "
-                f"scale {peak_mib:.2f} MiB/s  [G] {gmode}{RESET}"))
+                f"scale {peak_mib:.2f} MiB/s  [G] {gmode}{_R}"))
             L.append(_bot(pal["throughput"]))
 
 
@@ -5515,9 +5582,9 @@ class BTopTui:
             if not self.results:
                 # No checks run yet - don't pad to a fixed height, just show a short
                 # hint so the panel collapses instead of eating a full page of blanks.
-                L.append(_row(DIM + "  Press [C] Scan to run the health-check suite" + RESET))
+                L.append(_row(DIM + "  Press [C] Scan to run the health-check suite" + _R))
             else:
-                sep_line = f"{pal['light']}{BOX_V} {BOX_MID * (IW - 1)}{BOX_V}{RESET}"
+                sep_line = f"{pal['light']}{BOX_V} {BOX_MID * (IW - 1)}{BOX_V}{_R}"
                 L.append(sep_line)
 
                 check_rows = self.results[start:end]
@@ -5538,12 +5605,12 @@ class BTopTui:
 
                 for num, name, ok, detail in check_rows:
                     if ok:
-                        mark = GREEN + "\u2714" + RESET        # ✔ green check
+                        mark = GREEN + "\u2714" + _R        # ✔ green check
                         name_col = GREEN + BRIGHT
                         det_col = DIM
                         border = P_LIGHT
                     else:
-                        mark = RED + "\u2717" + RESET          # ✗ red cross
+                        mark = RED + "\u2717" + _R          # ✗ red cross
                         name_col = RED + BRIGHT
                         det_col = RED
                         border = RED                          # failed rows get a red frame
@@ -5551,7 +5618,7 @@ class BTopTui:
                     name_part = f"{name_plain:<{n_w}}"         # pad the plain text only
                     det_part = detail
                     L.append(_row(
-                        f"{mark} {name_col}{name_part}{RESET} {det_col}{det_part}{RESET}",
+                        f"{mark} {name_col}{name_part}{_R} {det_col}{det_part}{_R}",
                         hscroll=self._checks_hscroll, color=border,
                     ))
 
@@ -5559,7 +5626,7 @@ class BTopTui:
                     for _ in range(page_size - len(check_rows)):
                         L.append(_row(""))
 
-                footer_sep = f"{pal['health']}{BOX_V} {BOX_MID * (IW - 1)}{BOX_V}{RESET}"
+                footer_sep = f"{pal['health']}{BOX_V} {BOX_MID * (IW - 1)}{BOX_V}{_R}"
                 L.append(footer_sep)
                 # Scroll indicator in the log's style: range shown / total,
                 # with a dim "auto-follow" marker when at the newest rows.
@@ -5632,7 +5699,7 @@ class BTopTui:
             for entry in visible:
                 formatted = _format_log_line(entry)
                 if formatted == entry:
-                    formatted = f"{DIM}{entry}{RESET}"
+                    formatted = f"{DIM}{entry}{_R}"
                 L.append(_row(formatted, hscroll=self._log_hscroll))
             # Keep the panel a fixed height so the border doesn't jump while scrolling.
             for _ in range(max(0, v - len(visible))):
@@ -5674,8 +5741,8 @@ class BTopTui:
                 br = label.find("]")
                 desc = label[br + 1:].strip() if br != -1 else ""
                 chip = (f"\033[48;2;55;68;92m\033[38;2;225;232;255m"
-                        f" {keychar} \033[0m")
-                seg = chip + f"{DIM}{desc}{RESET}"
+                        f" {keychar} {_R}")
+                seg = chip + f"{DIM}{desc}{_R}"
                 seg_vis = len(re.sub(r'\x1b\[[^m]*m', '', seg))
                 # Click-map offsets use the rendered (visible) width so they line
                 # up with the chips the user actually sees.  The row is drawn via
@@ -5774,14 +5841,20 @@ class BTopTui:
 
         out = []
         if needs_full:
-            # Hide the cursor, clear, home, then paint every line.
+            # Hide the cursor, clear, home, then paint every line. Right
+            # after the clear the screen shows the TERMINAL's default bg, so
+            # immediately flood it with the theme background: enough spaces
+            # to cover the visible window (worst case 200x60), then home.
+            _bg_flood = _ACTIVE_BG + " " * (200 * 60) if _ACTIVE_BG else ""
             out.append("\033[?25l\033[2J\033[H")
+            if _bg_flood:
+                out.append(_bg_flood + "\033[H")
             out.append("\033[?2026h")  # begin synchronized output
             out.append("\n".join(L))
             out.append("\033[?2026l")  # end synchronized output
             out.append("\033[H")
         else:
-            out.append("\033[?25l")
+            out.append("\033[?25l" + _ACTIVE_BG)
             out.append("\033[?2026h")  # begin synchronized update
             out.append("\033[H")
             for i, line in enumerate(L):
@@ -5789,8 +5862,9 @@ class BTopTui:
                     # Move to row i+1, clear it, write the new content. The
                     # trailing \r returns the cursor to column 1 of this row so a
                     # stray auto-wrap can never bleed into the next positioned
-                    # write and shift the frame.
-                    out.append(f"\033[{i + 1};1H\033[2K{line}\r")
+                    # write and shift the frame. \033[2K wipes to the TERMINAL
+                    # default bg, so re-arm the theme bg before the new text.
+                    out.append(f"\033[{i + 1};1H\033[2K{_ACTIVE_BG}{line}\r")
             out.append("\033[?2026l")  # end synchronized update
             out.append("\033[H")
         sys.stdout.write("".join(out))
@@ -6759,6 +6833,7 @@ class BTopTui:
                                    "shutdown complete - routes verified clear")
 
     def _draw_shutdown(self):
+        _arm_bg()   # keep the theme bg armed on the teardown screen too
         """Render the full-screen teardown screen: a CHECKLIST of cleanup steps
         (✔ done / ▸ running / ◦ pending), an icy cyan->mint gradient bar with
         percentage + step counter, and a status footer. Self-contained (does
@@ -6795,39 +6870,40 @@ class BTopTui:
 
         def _row(content, accent=None):
             c = accent if accent else pal["light"]
-            return f"{c}{BOX_V} {_hpad(content, cols - 3)}{c}{BOX_V}{RESET}"
+            return f"{c}{BOX_V} {_hpad(content, cols - 3)}{c}{BOX_V}{_R}"
 
         lines = [
-            f"{acc}{BOX_LC}{BRIGHT}{_acenter(' SHUTTING DOWN ', cols - 2, BOX_MID)}{BOX_RC}{RESET}",
+            f"{acc}{BOX_LC}{BRIGHT}{_acenter(' SHUTTING DOWN ', cols - 2, BOX_MID)}{BOX_RC}{_R}",
             _row(""),
         ]
         if items:
-            marks = {"ok":   (GREEN + "\u2714" + RESET),
-                     "run":  (pal["throughput"] + "\u25b8" + RESET),
-                     "fail": (RED + "\u2717" + RESET),
-                     "pending": (GRAY + "\u25cb" + RESET)}
+            marks = {"ok":   (GREEN + "\u2714" + _R),
+                     "run":  (pal["throughput"] + "\u25b8" + _R),
+                     "fail": (RED + "\u2717" + _R),
+                     "pending": (GRAY + "\u25cb" + _R)}
             cols_style = {"ok": GRAY, "run": BRIGHT + WHITE,
                           "fail": RED, "pending": GRAY}
             for label, st in items:
-                mark = marks.get(st, GRAY + "\u25cb" + RESET)
-                body = cols_style.get(st, GRAY) + label + RESET
+                mark = marks.get(st, GRAY + "\u25cb" + _R)
+                body = cols_style.get(st, GRAY) + label + _R
                 lines.append(_row(f"  {mark} {body}"))
             lines.append(_row(""))
         else:
             lines.append(_row(stage))
             lines.append(_row(""))
-        lines.append(_row(f"  {bar}  {BRIGHT}{pct:3d}%{RESET}"
-                          + (f"{GRAY}   {step_txt}{RESET}" if step_txt else "")))
+        lines.append(_row(f"  {bar}  {BRIGHT}{pct:3d}%{_R}"
+                          + (f"{GRAY}   {step_txt}{_R}" if step_txt else "")))
         lines.append(_row(""))
         warn = any(st == "fail" for _l, st in items)
         if warn:
             lines.append(_row(f"{YELLOW}Some steps failed - rerun the app once to "
-                              f"re-clean.{RESET}"))
+                              f"re-clean.{_R}"))
         else:
             lines.append(_row(f"{GRAY}Keep this window open until it reaches "
-                              f"100%.{RESET}"))
-        lines.append(f"{pal['inact']}{BOX_BL}{BOX_BS * (cols - 2)}{BOX_BR}{RESET}")
-        sys.stdout.write("\033[2J\033[H" + "\n".join(lines) + "\n")
+                              f"100%.{_R}"))
+        lines.append(f"{pal['inact']}{BOX_BL}{BOX_BS * (cols - 2)}{BOX_BR}{_R}")
+        _flood = _ACTIVE_BG + " " * (200 * 60) + "\033[H" if _ACTIVE_BG else ""
+        sys.stdout.write("\033[2J\033[H" + _flood + "\n".join(lines) + "\n")
         sys.stdout.flush()
 
     def _stop_async(self):
@@ -6957,6 +7033,12 @@ def main():
     ap.add_argument("--dns6", default=None, metavar="IP",
                     help="IPv6 DNS server for the Wintun adapter "
                          "(default: none, unless no DNS was chosen at all)")
+    ap.add_argument("--font", default="", metavar="FACE",
+                    help="console font face, e.g. Cascadia Code "
+                         "(classic conhost only; Windows Terminal keeps "
+                         "its profile font)")
+    ap.add_argument("--font-size", type=int, default=0, metavar="N",
+                    help="console font height in pixels-ish units (e.g. 18)")
     ap.add_argument("--unicode", action="store_true",
                     help="Force Unicode box/block glyphs even if auto-detection is unsure")
     ap.add_argument("--ascii", action="store_true",
@@ -7008,6 +7090,9 @@ def main():
     # PowerShell console render them, so the probe below has to run after it,
     # not before (the previous version decided glyphs first and enabled ANSI
     # second, which meant the decision never saw the fix-up's result).
+    global USER_FONT, USER_FONT_SIZE
+    USER_FONT = (args.font or "").strip()
+    USER_FONT_SIZE = max(0, int(args.font_size or 0))
     _enable_ansi()
     # Resize the console so the full dashboard fits on one screen.
     _resize_console()
