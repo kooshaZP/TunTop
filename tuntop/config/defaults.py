@@ -19,5 +19,6 @@ TUN6 = "fd00:dead:beef::1"
 DEFAULT_SOCKS_PORT = 10808
 DEFAULT_ENDPOINT_PORT = 443
 
-# Default geoip country code to bypass through the physical adapter.
-DEFAULT_GEOIP_CODE = "cn"
+# Default geoip country code: NONE. Nothing is bypassed by country until
+# the user picks a code ([F] Geo Manager / --geoip-code / a profile).
+DEFAULT_GEOIP_CODE = ""

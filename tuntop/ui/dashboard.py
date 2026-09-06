@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """btop-style dashboard for v2ray TUN monitoring.
 
 A separate, self-contained TUI inspired by btop/btop+ - panel-based layout,
@@ -1219,7 +1219,7 @@ def build_checks(ns):
     # actionable failure now that [W] can download it.
     _geo = getattr(ns, "geoip", None)
     if _geo:
-        _geo_code = getattr(ns, "geoip_code", "cn")
+        _geo_code = getattr(ns, "geoip_code", "") or "(not set)"
         def _geo_check(g=_geo, c=_geo_code):
             if os.path.isfile(g):
                 try:
@@ -3639,6 +3639,13 @@ class BTopTui:
     # the tunnel so it takes effect - one key to switch setups.
 
     def _profile_file(self):
+        """Profiles store: NEXT TO TunTop.exe when frozen (survives across
+        runs - a onefile __file__ is a throwaway _MEIPASS dir that vanishes
+        on exit, which made saved profiles disappear with the window), next
+        to the package when run from source (historical location)."""
+        if getattr(_sys, "frozen", False):
+            return profiles.profile_file(
+                os.path.dirname(os.path.abspath(_sys.executable)))
         return profiles.profile_file(os.path.dirname(os.path.abspath(__file__)))
 
     def _profile_snapshot(self):
@@ -4137,7 +4144,12 @@ class BTopTui:
                 "--geoip-code) and (re)start, or pick it in the launch menu.")
             return
         target = target or self._geo_target()
-        code = (getattr(self.ns, "geoip_code", None) or "cn")
+        code = (getattr(self.ns, "geoip_code", None) or "").strip().lower()
+        if not code:
+            self.log_lines.append(
+                "[!] No country code configured - press [F] and choose "
+                "'2=Change code' first.")
+            return
         self.log_lines.append(
             f"[*] Re-applying geoip bypass '{code}' live from {geo} "
             f"(via {target}) ...")
@@ -4975,7 +4987,7 @@ class BTopTui:
                        + ("on" if vpn_bp_on else "off") + _R),
         ]
         if getattr(self.ns, "geoip", None):
-            gcode = str(getattr(self.ns, "geoip_code", "cn")).upper()
+            gcode = (str(getattr(self.ns, "geoip_code", "")).upper() or "-")
             pairs.append(("GEO", BRIGHT + gcode + _R))
         if getattr(self.ns, "proxy2_port", None):
             # Second pipe status - only rendered when --proxy2-port is set, so
@@ -5130,7 +5142,7 @@ class BTopTui:
                 geo_egress, geo_dot = "tunneled via wintun (vpn-as-geo)", DOT_WARN
             else:
                 geo_egress, geo_dot = "direct via wifi/physical", DOT_OK
-            code = str(getattr(self.ns, "geoip_code", "cn")).upper()
+            code = (str(getattr(self.ns, "geoip_code", "")).upper() or "-")
             geo_val = f"{BRIGHT}{code}{_R}{GRAY} · {geo_egress}{_R}"
             bl.append(" " + geo_dot + " " + _kv("GEO", geo_val))
         else:
@@ -6111,7 +6123,7 @@ class BTopTui:
             geo_ready = False
         if geo_ready:
             cmd += ["--geoip", self.ns.geoip]
-            if getattr(self.ns, "geoip_code", "cn") != "cn":
+            if getattr(self.ns, "geoip_code", None):
                 cmd += ["--geoip-code", self.ns.geoip_code]
         if getattr(self.ns, "geoip_via_vpn", False) and self._geo_target() == "direct":
             cmd.append("--geoip-via-vpn")
@@ -7266,8 +7278,8 @@ def main():
     ap.add_argument("--geoip", default=None, metavar="PATH",
                     help="Path to v2rayN geoip.dat; bypass every CIDR of --geoip-code "
                          "(e.g. cn = bypass mainland traffic through the TUN)")
-    ap.add_argument("--geoip-code", default="cn", metavar="CC",
-                    help="Country code inside geoip.dat to bypass (default cn)")
+    ap.add_argument("--geoip-code", default="", metavar="CC",
+                    help="Country code inside geoip.dat to bypass (default: none - set via [F] Geo Manager or a profile)")
     ap.add_argument("--geoip-via-vpn", action="store_true",
                     help="Tunnel the geoip country ranges via wintun (mode 3 / "
                          "vpn-as-geo) instead of bypassing them through the "
@@ -7397,7 +7409,7 @@ def main():
         # never touches those).
         if getattr(args, "geoip", None) and os.path.isfile(args.geoip):
             _wd_cmd += ["--geoip", args.geoip,
-                        "--geoip-code", getattr(args, "geoip_code", "cn")]
+                        "--geoip-code", getattr(args, "geoip_code", "")]
         subprocess.Popen(_wd_cmd,
                          stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL,

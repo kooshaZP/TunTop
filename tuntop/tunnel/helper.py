@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 tuntop/helper.py
 
@@ -2416,8 +2416,8 @@ def main():
                          "sing-box and Clash); "
                          "install bypass routes for every CIDR of --geoip-code "
                          "(e.g. cn = bypass mainland traffic through the TUN)")
-    ap.add_argument("--geoip-code", default="cn", metavar="CC",
-                     help="Country code inside the geoip file to bypass (default cn)")
+    ap.add_argument("--geoip-code", default="", metavar="CC",
+                     help="Country code inside the geoip file to bypass (required with --geoip)")
     ap.add_argument("--geoip-via-vpn", action="store_true",
                      help="Route the geoip country ranges THROUGH the tunnel (wintun) "
                           "instead of bypassing them via the physical adapter. Use this "
@@ -2812,7 +2812,10 @@ def main():
         # split-defaults, so the country routes win the lookup whenever they
         # land. The tunnel comes up immediately; country routes stream in
         # behind it (watch the GEO panel fill up).
-        code = args.geoip_code
+        code = (args.geoip_code or "").strip().lower()
+        if not code:
+            print("[!] --geoip given without --geoip-code - no country bypass installed.")
+            return
         print(f"[*] Loading geoip file bypass for code '{code}' from {args.geoip} ... (background)")
         try:
             # Emit a [GEO-PARSE] marker as the file is decoded so the dashboard

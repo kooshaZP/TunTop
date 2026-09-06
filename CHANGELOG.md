@@ -1,6 +1,24 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to TunTop are documented here.
+
+## [1.0.7] - 2026-09-06
+
+### Changed
+- **No country is bypassed by default** - the geo-bypass code defaulted to
+  `cn` (a leftover from the original China-use case), so every fresh start
+  hinted at - and any geoip run silently assumed - mainland-China bypass.
+  The default is now EMPTY: nothing is bypassed by country until the user
+  picks a code ([F] Geo Manager -> 2=Change code, `--geoip-code`, or a
+  profile). The helper refuses an empty code explicitly instead of guessing.
+
+### Fixed
+- **Saved profiles survive the window closing (exe)** - the profiles store
+  lived next to `dashboard.py`, which inside the onefile exe is the throwaway
+  `_MEIPASS` extraction dir that is DELETED on exit: profiles only lived as
+  long as the window. The store (`MyTunTopProfile.json`) now sits next to
+  `TunTop.exe` itself (source runs keep the historical location), the same
+  stable-per-install spot geoip.dat and the control file already use.
 
 ## [1.0.6] - 2026-09-06
 

@@ -26,7 +26,7 @@ class Profile:
     proxy2_port: Optional[int] = None                     # None = feature off
     proxy2_server: list = field(default_factory=list)     # proxy2's own upstream
     geoip: Optional[str] = None
-    geoip_code: str = "cn"
+    geoip_code: str = ""   # empty = no country bypass
     geoip_target: Optional[str] = None  # direct | proxy2 | winvpn (None = legacy flags)
     vless_over_vpn: bool = False
     no_vpn_bypass: bool = False

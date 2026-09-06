@@ -43,7 +43,7 @@ def snapshot_from_args(ns) -> dict:
         "proxy2_port": getattr(ns, "proxy2_port", None),
         "proxy2_server": list(getattr(ns, "proxy2_server", []) or []),
         "geoip": getattr(ns, "geoip", None),
-        "geoip_code": getattr(ns, "geoip_code", "cn"),
+        "geoip_code": getattr(ns, "geoip_code", ""),
         "geoip_target": getattr(ns, "geoip_target", None),
         "vless_over_vpn": bool(getattr(ns, "vless_over_vpn", False)),
         "no_vpn_bypass": bool(getattr(ns, "no_vpn_bypass", False)),

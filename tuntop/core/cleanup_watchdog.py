@@ -1,4 +1,4 @@
-﻿"""Detached cleanup watchdog - the safety net under EVERY exit path.
+"""Detached cleanup watchdog - the safety net under EVERY exit path.
 
 Normal teardown ([Q], Ctrl+C, a window close that finishes within its
 5-second slot, atexit) removes the Wintun adapter, its routes and every
@@ -329,7 +329,7 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
 def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
                              marker_path: str = MARKER_FILE, log=None,
                              probes=None, geoip: str = None,
-                             geoip_code: str = "cn") -> bool:
+                             geoip_code: str = "") -> bool:
     """The watchdog's whole decision, in one testable function.
 
     Returns True when an unclean exit of session `pid` was detected and
@@ -410,8 +410,8 @@ def main(argv=None) -> int:
                          "route whose prefix matches --geoip-code's CIDRs is "
                          "swept too (they live on the PHYSICAL adapter, which "
                          "the Wintun teardown never touches)")
-    ap.add_argument("--geoip-code", default="cn", metavar="CC",
-                    help="country code inside --geoip to sweep (default cn)")
+    ap.add_argument("--geoip-code", default="", metavar="CC",
+                    help="country code inside --geoip to sweep (required with --geoip)")
     ap.add_argument("--helper-pid", type=int, default=None,
                     help="tunnel helper PID (from the session marker)")
     ap.add_argument("--marker", default=MARKER_FILE)
@@ -443,7 +443,7 @@ def main(argv=None) -> int:
         hosts = list(dict.fromkeys(
             hosts + [h for h in (state.get("hosts") or []) if h]))
         geoip = state.get("geoip") or args.geoip
-        geoip_code = state.get("geoip_code") or args.geoip_code
+        geoip_code = state.get("geoip_code") or args.geoip_code or ""
         sweep_after_unclean_exit(args.pid, hosts=hosts,
                                  helper_pid=helper_pid,
                                  marker_path=args.marker,
