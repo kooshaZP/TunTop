@@ -114,6 +114,54 @@ Right-click `Run_Helper.ps1` → **Run with PowerShell** → confirm the UAC pro
 
 Press **[S]** to start the tunnel, **[C]** to run a health scan, **[L]** for a leak test.
 
+### Running the standalone `TunTop.exe` (no Python needed)
+
+1. **Download** `TunTop.exe` (and `checksums.txt`) from the
+   [latest release](https://github.com/kooshaZP/TunTop/releases/latest) into any
+   folder — `Desktop\TunTop\` for example. The exe already contains
+   `tun2socks` and `wintun.dll`; nothing else is bundled, and Python is **not**
+   required.
+2. **(Optional) verify it:** `certutil -hashfile TunTop.exe SHA256` and compare
+   with `checksums.txt`. If your antivirus deletes it, see
+   [Troubleshooting](#troubleshooting) — restore + exclude, then continue.
+3. **Run it:** double-click `TunTop.exe` → confirm the **UAC prompt** (the
+   dashboard manages routes and a TUN adapter, so admin is mandatory). A
+   btop-style dashboard opens. Missing files are fetched automatically on
+   first start (tun2socks / wintun if somehow absent, and the **geoip**
+   database in the background — progress shows in the event log).
+4. **Point it at your proxy** — the dashboard asks for a SOCKS5 inbound at
+   `127.0.0.1:10808` (the v2rayN default). Start that proxy client first.
+5. **Press `[S]`** — the tunnel comes up: Wintun adapter, routes, DNS. The
+   header badge flips to **RUNNING**. Press **[C]** for a health scan and
+   **[L]** for a leak test.
+
+#### Changing servers and settings live (no restart)
+
+The dashboard edits a RUNNING tunnel in place:
+
+- **[U] Servers** — switch the VLESS upstream server live: pick from the list
+  (arrow keys / mouse, Enter to apply). Add/edit entries first if the list is
+  empty or wrong.
+- **[E] Endpoint** — change the endpoint port (e.g. 443) live.
+- **[P] Port** — change the local SOCKS5 port live.
+- **[N] DNS** — change the tunnel DNS servers live.
+- **[A] / [X]** — add / remove a bypass IP instantly (route a site or server
+  DIRECT, outside the tunnel) and choose the target: direct / proxy2 / VPN.
+- **[F] Geo Manager** — country-level bypass: press **[W]** inside it to
+  download/update the geoip database, then apply a country code (e.g. `cn`) so
+  those sites route DIRECT while everything else stays in the tunnel.
+- **[Z] Proxies** — add/change/remove a second proxy hop (proxy2) at runtime.
+- **[V] / [Y]** — ride-another-VPN mode and its bypass list.
+- **[O] / [I]** — save the whole setup to a profile / load it back.
+
+Everything you change is logged in the event log panel (bottom). Press **[T]**
+to stop the tunnel (routes are swept and verified), **[Q]** to quit.
+
+> The exe requests the **Cascadia Mono SemiLight** font at startup so the
+> box-drawing glyphs render. If your console ignores it and you see
+> `???????????`, see [Troubleshooting](#troubleshooting) for the
+> right-click → Properties → Font fix.
+
 ## How it works
 
 ```mermaid
