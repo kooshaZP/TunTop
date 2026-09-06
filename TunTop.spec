@@ -22,7 +22,14 @@ a = Analysis(
     pathex=[ROOT],
     binaries=binaries,
     datas=[],
-    hiddenimports=["tuntop"],
+    hiddenimports=["tuntop",
+                   # Spawned as child PROCESSES of the exe (via the
+                   # --helper-child / --watchdog-child re-entry flags in
+                   # dashboard.main()), not imported on the dashboard's
+                   # static import graph - without these pins PyInstaller
+                   # may leave them out of the bundle entirely.
+                   "tuntop.tunnel.helper",
+                   "tuntop.core.cleanup_watchdog"],
     hookspath=[],
     runtime_hooks=[],
     excludes=[],

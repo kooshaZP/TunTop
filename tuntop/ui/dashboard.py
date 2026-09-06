@@ -126,6 +126,33 @@ if getattr(_sys, "frozen", False):
 else:
     _DEFAULT_GEOIP_PATH = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "geoip.dat")
+if getattr(_sys, "frozen", False):
+    _DEFAULT_GEOIP_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(_sys.executable)), "geoip.dat")
+else:
+    _DEFAULT_GEOIP_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "geoip.dat")
+
+
+def _control_file_path():
+    """Path of the helper's live-reconfig control file, identical in EVERY
+    process that shares this install.
+
+    Source runs keep the historical in-package location (dashboard.py is in
+    tuntop/ui/, helper.py in tuntop/tunnel/ - both resolve to the same file).
+    A frozen exe CANNOT use a __file__-relative path: PyInstaller onefile
+    extracts each process into its own throwaway _MEIPASS dir, so the
+    dashboard and the helper child would otherwise point at two DIFFERENT
+    files and the [N] live-DNS handoff would silently do nothing. The file
+    lives NEXT TO TunTop.exe when frozen (stable across runs, like
+    _DEFAULT_GEOIP_PATH above)."""
+    if getattr(_sys, "frozen", False):
+        return os.path.join(
+            os.path.dirname(os.path.abspath(_sys.executable)),
+            ".tuntop_control.json")
+    return os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "tunnel", ".tuntop_control.json"))
 
 
 def _snap_parse_done(geo_parse, code):
@@ -3851,9 +3878,7 @@ class BTopTui:
         """Write the helper's live-reconfig control file (the exact path the
         helper polls in its monitor loop). Currently carries the DNS choice,
         so a running tunnel re-binds its DNS without a restart."""
-        path = os.path.normpath(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "tunnel", ".tuntop_control.json"))
+        path = _control_file_path()
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({"dns4": getattr(self.ns, "dns4", None),
@@ -6023,11 +6048,29 @@ class BTopTui:
         self.recovery.resume()
         self.logs.put("[*] Start requested - launching tunnel helper...")
         import sys as _sys
-        # helper.py ships in the tuntop/tunnel package, one level up from this
-        # ui module, not alongside dashboard.py.
-        cmd = [_sys.executable, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tunnel", "helper.py"),
-               "--server", *self.ns.server, "--port", str(self.ns.port),
-               "--tun2socks", self.ns.tun2socks]
+        if getattr(_sys, "frozen", False):
+            # Frozen exe: sys.executable IS TunTop.exe, not python - spawning
+            # "<exe> tuntop/tunnel/helper.py ..." made the exe re-launch
+            # itself and its own argparse reject the script path
+            # ("unrecognized arguments: ...\Temp\tunnel\helper.py"). Re-enter
+            # the exe in helper-child mode instead; main() dispatches the
+            # process to the bundled tuntop.tunnel.helper module.
+            cmd = [_sys.executable, "--helper-child",
+                   "--server", *self.ns.server, "--port", str(self.ns.port),
+                   "--tun2socks", self.ns.tun2socks]
+        else:
+            # helper.py ships in the tuntop/tunnel package, one level up from
+            # this ui module, not alongside dashboard.py.
+            cmd = [_sys.executable,
+                   os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                "tunnel", "helper.py"),
+                   "--server", *self.ns.server, "--port", str(self.ns.port),
+                   "--tun2socks", self.ns.tun2socks]
+        # Explicit control-file handoff: the live-reconfig path must be
+        # IDENTICAL in both processes (onefile gives each its own _MEIPASS,
+        # so the helper's __file__-relative default would point at a
+        # different, never-written file).
+        cmd += ["--control-file", _control_file_path()]
         # DNS selection: pass ONLY what the user actually chose. Nothing
         # chosen -> the helper applies both of its defaults (v4 + v6); a
         # v4-only choice -> the helper sets IPv4 DNS only, without injecting
@@ -7123,6 +7166,22 @@ def _bootstrap_binaries(exe_dir, want_tun2socks=False, want_wintun=False):
 
 
 def main():
+    # ── Frozen child-process dispatch (PyInstaller onefile) ────────────
+    # The tunnel helper and the cleanup watchdog run as SEPARATE processes,
+    # but a onefile exe cannot "run a script": sys.executable is TunTop.exe,
+    # not python, so spawning "<exe> helper.py ..." made the exe's own
+    # argparse reject the script path. The dashboard re-invokes ITSELF with
+    # an internal child-mode flag (deliberately NOT advertised in --help);
+    # the flag is stripped here and the matching module's main() takes over
+    # the process.
+    for _child_flag, _child_mod in (
+            ("--helper-child", "tuntop.tunnel.helper"),
+            ("--watchdog-child", "tuntop.core.cleanup_watchdog")):
+        if _child_flag in sys.argv:
+            sys.argv.remove(_child_flag)
+            import importlib
+            sys.exit(importlib.import_module(_child_mod).main() or 0)
+
     ap = argparse.ArgumentParser(
     description="btop-style dashboard for v2ray TUN monitoring.",
     formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -7290,9 +7349,17 @@ def main():
             os.path.dirname(os.path.abspath(__file__))),
             "core", "cleanup_watchdog.py")
         _hosts_arg = ",".join(_startup_hosts)
-        _wd_cmd = [sys.executable, _watchdog_script,
-                   "--pid", str(os.getpid()),
-                   "--hosts", _hosts_arg]
+        if getattr(_sys, "frozen", False):
+            # Same onefile constraint as the helper child: a onefile exe
+            # cannot exec a script path, so re-enter the exe and let main()'s
+            # child dispatch run tuntop.core.cleanup_watchdog.
+            _wd_cmd = [sys.executable, "--watchdog-child",
+                       "--pid", str(os.getpid()),
+                       "--hosts", _hosts_arg]
+        else:
+            _wd_cmd = [sys.executable, _watchdog_script,
+                       "--pid", str(os.getpid()),
+                       "--hosts", _hosts_arg]
         # Hand over the geo config so an unclean exit sweep can also clear
         # geo bypass routes on the PHYSICAL adapter (the Wintun teardown
         # never touches those).
@@ -7323,12 +7390,13 @@ def main():
             # launch knows it starts from a clean slate.
             startup_recovery.clear_marker()
     atexit.register(_atexit_all)
-    if args.ascii:
-        _apply_glyphs(False)
-    elif args.unicode:
-        _apply_glyphs(True)
-    else:
-        _apply_glyphs(_probe_unicode_support())
+    # Unicode glyphs are the default everywhere (CHANGELOG 1.0.4): the conhost
+    # font/codepage fix-up in _enable_ansi() has already run by now, so a
+    # classic console can draw them. The old default path still ran the legacy
+    # terminal probe here and silently downgraded the frozen exe to ASCII
+    # whenever the probe guessed wrong (isatty / terminal-host heuristics).
+    # Unicode is now on unless the user explicitly opts out.
+    _apply_glyphs(not (args.ascii or os.environ.get("BTOP_ASCII")))
 
     try:
         def _ctrl(ct):

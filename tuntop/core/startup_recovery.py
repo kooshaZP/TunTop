@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -38,6 +39,14 @@ from tuntop.network.dns import _resolve_cached
 #: CWD; deleted only after a verified clean teardown).
 MARKER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            ".last_run.json")
+if getattr(sys, "frozen", False):
+    # Frozen exe: __file__ sits in a THROWAWAY per-run extraction dir
+    # (PyInstaller onefile), so a marker written there can never be found by
+    # the next run - nor by the watchdog child, which gets its own extraction
+    # dir. Park the marker next to TunTop.exe instead: stable across runs and
+    # identical for every process launched from the same exe.
+    MARKER_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(sys.executable)), ".last_run.json")
 
 
 # ── Crash marker ────────────────────────────────────────────────────────

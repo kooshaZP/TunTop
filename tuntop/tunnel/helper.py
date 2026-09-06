@@ -2438,7 +2438,18 @@ def main():
     ap.add_argument("--live-bypass", action="store_true",
                     help="Add bypass routes for --bypass-ip/--server to an ALREADY-running "
                          "TUN without starting or restarting tun2socks. No restart needed.")
+    ap.add_argument("--control-file", default=None, metavar="PATH",
+                    help="Live-reconfig control file the dashboard writes (currently "
+                         "DNS changes). Default: .tuntop_control.json next to this file. "
+                         "The frozen exe passes an explicit shared path because each "
+                         "onefile process extracts into its own temp dir.")
     args = ap.parse_args()
+
+    # Explicit control-file handoff (frozen exe): must be applied BEFORE
+    # _baseline_control_file() below baselines the file's mtime.
+    if args.control_file:
+        global CONTROL_FILE
+        CONTROL_FILE = args.control_file
 
     # Live bypass mode: resolve hosts and add their bypass routes to a TUN that
     # is already up, WITHOUT touching tun2socks.  This is the "add or resolve

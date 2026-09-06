@@ -13,6 +13,7 @@ diagnostics_*.txt
 crash_*.txt
 *.log
 .last_run.json
+.tuntop_control.json
 
 # --- caches ---------------------------------------------------------------
 __pycache__/

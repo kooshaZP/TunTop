@@ -2,6 +2,35 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.5] - 2026-09-06
+
+### Fixed
+- **The frozen exe can actually launch its tunnel helper now** - the
+  dashboard spawned the helper as `python.exe tuntop/tunnel/helper.py`,
+  but in the exe `sys.executable` IS TunTop.exe, so TunTop re-launched
+  itself with the helper's script path as an argument and its own argparse
+  refused: `error: unrecognized arguments: ...\Temp\tunnel\helper.py`.
+  The exe now re-enters ITSELF with an internal `--helper-child` flag and
+  runs the bundled `tuntop.tunnel.helper` module in that child process.
+  The cleanup watchdog had the identical defect (spawned as
+  `python.exe .../cleanup_watchdog.py`) - same fix via `--watchdog-child`.
+  Both modules are now explicit `hiddenimports` in `TunTop.spec`, so they
+  are guaranteed to be inside the exe.
+- **Unicode glyphs are genuinely the default in the exe** - the default
+  path still ran the legacy terminal probe after the font/codepage fix-up
+  and silently downgraded to ASCII whenever the probe guessed wrong
+  (isatty/terminal-host heuristics). Unicode is now on unless the user
+  opts out with `--ascii` or `BTOP_ASCII=1` - exactly what the 1.0.4
+  notes already claimed.
+- **The live-DNS handoff and the crash marker survive the exe's onefile
+  sandbox** - both were `__file__`-relative, but onefile gives every
+  process its own throwaway `_MEIPASS` dir: the helper child would have
+  polled a control file the dashboard never wrote ([N] live DNS would
+  silently do nothing), and the watchdog a crash marker that vanishes
+  every run. The control file is now handed to the helper explicitly
+  (`--control-file`) and the marker resolves NEXT TO TunTop.exe when
+  frozen, so both processes agree on the same file.
+
 ## [1.0.4] - 2026-09-06
 
 ### Added
