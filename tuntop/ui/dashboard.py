@@ -117,8 +117,15 @@ CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TunTop_cra
 # Where a downloaded geoip database lands when none is configured ([W] key /
 # missing-file auto-download on start). Next to the package so it survives
 # alongside the .geo_cache that keys off the file's mtime+size.
-_DEFAULT_GEOIP_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "geoip.dat")
+# Default geoip.dat location: next to dashboard.py when run from source;
+# NEXT TO THE EXE when frozen (the _MEIPASS extraction dir is a throwaway
+# temp sandbox - a database downloaded there would vanish every run).
+if getattr(_sys, "frozen", False):
+    _DEFAULT_GEOIP_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(_sys.executable)), "geoip.dat")
+else:
+    _DEFAULT_GEOIP_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "geoip.dat")
 
 
 def _snap_parse_done(geo_parse, code):
@@ -426,10 +433,24 @@ def _admin():
 
 
 # User font preference (set from --font/--font-size in main(); empty =
-# keep the existing auto behaviour: current font if TrueType, else the
-# Consolas/Lucida/... fallback chain).
+# the built-in default below). The exe defaults to Cascadia Mono SemiLight
+# (ships with Windows 11 / Windows Terminal, a TrueType cut with full
+# box-drawing coverage); if that face is not installed the chain falls
+# back to plain Cascadia Mono, then Consolas - glyphs stay Unicode either
+# way because ALL fallbacks are TrueType.
 USER_FONT = ""
 USER_FONT_SIZE = 0
+DEFAULT_FONT_CHAIN = [
+    "Cascadia Mono SemiLight",   # semilight cut (registered family name)
+    "Cascadia Mono",             # regular Cascadia mono
+    "Consolas",                  # Windows builtin
+    "Lucida Console",
+]
+
+
+def _font_weight(face: str) -> int:
+    """GDI weight for the requested face (SemiLight = 350)."""
+    return 350 if "semilight" in face.lower() else 400
 
 
 def _set_unicode_font():
@@ -485,16 +506,17 @@ def _set_unicode_font():
                 return
             want_size = USER_FONT_SIZE if USER_FONT_SIZE > 0 else cur.dwFontSize.Y
             if USER_FONT:
-                cand = [(USER_FONT, want_size)]
+                faces = [USER_FONT]
             else:
-                cand = [(cur.FaceName or "Consolas", want_size)]
-            for face, size in cand:
+                # Preferred chain first, then whatever is already active.
+                faces = DEFAULT_FONT_CHAIN + [cur.FaceName or "Consolas"]
+            for face in faces:
                 newf = CONSOLE_FONT_INFOEX()
                 newf.cbSize = ctypes.sizeof(newf)
                 newf.nFont = 0
-                newf.dwFontSize = ctypes.COORD(0, size)
+                newf.dwFontSize = ctypes.COORD(0, want_size)
                 newf.FontFamily = 0x36  # FF_MODERN | TMPF_TRUETYPE ...
-                newf.FontWeight = 400
+                newf.FontWeight = _font_weight(face)
                 newf.FaceName = face
                 if k32.SetCurrentConsoleFontEx(h, False, ctypes.byref(newf)):
                     chk = CONSOLE_FONT_INFOEX()
@@ -511,8 +533,7 @@ def _set_unicode_font():
         # Iterating family bits too: SetCurrentConsoleFontEx silently keeps the
         # current (Raster) font unless a TrueType family bit is requested, so the
         # named font must be paired with a TrueType-capable FontFamily value.
-        _faces = ([USER_FONT] if USER_FONT else []) + \
-            ["Consolas", "Lucida Console", "DejaVu Sans Mono", "Courier New"]
+        _faces = [USER_FONT] if USER_FONT else list(DEFAULT_FONT_CHAIN)
         _size = USER_FONT_SIZE if USER_FONT_SIZE > 0 else cur.dwFontSize.Y
         for family in (0x36, 0x04):
             for face in _faces:
@@ -521,7 +542,7 @@ def _set_unicode_font():
                 new.nFont = 0
                 new.dwFontSize = ctypes.COORD(0, _size)
                 new.FontFamily = family
-                new.FontWeight = 400
+                new.FontWeight = _font_weight(face)
                 new.FaceName = face
                 if k32.SetCurrentConsoleFontEx(h, False, ctypes.byref(new)):
                     # Re-read the *now-active* font and trust its TrueType bit,
@@ -5882,6 +5903,17 @@ class BTopTui:
             f"[*] Terminal: {_detect_terminal_host()}  "
             f"Glyphs: {'unicode' if USE_UNICODE else 'ascii'}  "
             f"Mouse: {'on' if self._mouse_ok else 'off (keyboard only)'}")
+        # AUTO-FETCH the geoip database when it is missing (the released
+        # exe must download its own working files; the PS1 launcher used
+        # to be the only path that did this). Background thread - the UI
+        # stays responsive and the log shows progress; [W] still force-
+        # updates later.
+        _geo_dest = getattr(self.ns, "geoip", None) or _DEFAULT_GEOIP_PATH
+        if not os.path.isfile(_geo_dest):
+            if self._start_geo_download():
+                self.log_lines.append(
+                    f"[*] Geoip database not found - downloading to "
+                    f"{_geo_dest} (background).")
         # One delayed mouse retry: right after an elevated relaunch the input
         # handle can briefly report unusable; a second attempt ~2s in recovers
         # those cases without touching working setups.
@@ -6998,6 +7030,98 @@ class BTopTui:
 
 # ─── Main ───────────────────────────────────────────────────────────────────
 
+# ── Frozen-exe binary bootstrap ──────────────────────────────────────────────
+# Same official sources Run_Helper.ps1 uses. Each archive is streamed to a
+# temp file, the wanted member extracted, and the result left for the
+# SHA-256 integrity check to judge (no trust is placed in the download
+# itself). Tun2socks ships as a zip whose root contains the exe; wintun
+# ships as wintun/bin/amd64/wintun.dll inside its bundle.
+
+_TUN2SOCKS_URL = ("https://github.com/xjasonlyu/tun2socks/releases/"
+                  "download/v2.7.0/tun2socks-windows-amd64-v3.zip")
+_WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+
+
+def _download_to(url, dest):
+    """Stream `url` to `dest` with a coarse progress print. Returns dest."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "TunTop/1.0"})
+    last = [0]
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        with open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(262144)
+                if not chunk:
+                    break
+                f.write(chunk)
+                if f.tell() - last[0] >= (1 << 20):
+                    last[0] = f.tell()
+                    if total:
+                        print(f"\r    {f.tell() / 1048576:.1f} / "
+                              f"{total / 1048576:.1f} MB",
+                              end="", flush=True)
+                    else:
+                        print(f"\r    {f.tell() / 1048576:.1f} MB",
+                              end="", flush=True)
+    print()  # newline after the progress line
+    return dest
+
+
+
+def _bootstrap_binaries(exe_dir, want_tun2socks=False, want_wintun=False):
+    """Download missing vendored binaries into `exe_dir`. Returns a dict of
+    {name: path} for everything fetched. Raises on any failure (caller
+    falls back to the integrity refusal with its clear message)."""
+    import tempfile
+    import zipfile
+    got = {}
+    os.makedirs(exe_dir, exist_ok=True)
+
+    def _fetch_zip(url, member_pred, out_path, name):
+        tmpf = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        tmpf.close()
+        try:
+            _download_to(url, tmpf.name)
+            with zipfile.ZipFile(tmpf.name) as zf:
+                members = [n for n in zf.namelist() if member_pred(n)]
+                if not members:
+                    raise FileNotFoundError(f"{name} not found inside {url}")
+                # Prefer an exact root-level match when several exist.
+                members.sort(key=lambda n: (n.count("/"), len(n)))
+                with zf.open(members[0]) as srcf, \
+                        open(out_path, "wb") as outf:
+                    while True:
+                        chunk = srcf.read(262144)
+                        if not chunk:
+                            break
+                        outf.write(chunk)
+        finally:
+            try:
+                os.unlink(tmpf.name)
+            except OSError:
+                pass
+        return out_path
+
+    if want_tun2socks:
+        out = os.path.join(exe_dir, "tun2socks-windows-amd64-v3.exe")
+        _fetch_zip(_TUN2SOCKS_URL,
+                   lambda n: n.lower().endswith(".exe")
+                   and "tun2socks" in n.lower(),
+                   out, "tun2socks exe")
+        got["tun2socks-windows-amd64-v3.exe"] = out
+
+    if want_wintun:
+        out = os.path.join(exe_dir, "wintun.dll")
+        _fetch_zip(_WINTUN_URL,
+                   lambda n: n.lower().replace("\\", "/")
+                   == "wintun/bin/amd64/wintun.dll",
+                   out, "wintun.dll")
+        got["wintun.dll"] = out
+
+    return got
+
+
 def main():
     ap = argparse.ArgumentParser(
     description="btop-style dashboard for v2ray TUN monitoring.",
@@ -7075,6 +7199,33 @@ def main():
 
     if not _admin():
             sys.exit("[!] Run this as Administrator (use Run_Helper.bat).")
+
+    # ── Bootstrap missing binaries (frozen exe) ────────────────────────
+    # The exe embeds tun2socks + wintun (v1.0.3+), but a user may have
+    # been handed a bare exe, or files may sit elsewhere. If either is
+    # MISSING, fetch the official builds into the exe's folder (same
+    # sources Run_Helper.ps1 uses) and re-point args.tun2socks there.
+    # Integrity verification below still enforces the pinned hashes -
+    # a bad download refuses to start exactly as before.
+    if getattr(_sys, "frozen", False) and not args.trust_binaries:
+        _exe_dir = os.path.dirname(os.path.abspath(_sys.executable))
+        _need_t2 = not os.path.isfile(args.tun2socks)
+        _need_wt = not os.path.isfile(os.path.join(_exe_dir, "wintun.dll"))
+        if _need_t2 or _need_wt:
+            print("[i] Missing runtime binaries - downloading "
+                  "(tun2socks v2.7.0 / wintun 0.14.1)...")
+            try:
+                _got = _bootstrap_binaries(
+                    _exe_dir, want_tun2socks=_need_t2, want_wintun=_need_wt)
+                for _n, _p in _got.items():
+                    print(f"[+] Downloaded: {_n} -> {_p}")
+                if _need_t2:
+                    args.tun2socks = os.path.join(
+                        _exe_dir, "tun2socks-windows-amd64-v3.exe")
+            except Exception as e:
+                print(f"[!] Binary download failed: {e} - continuing to "
+                      "the integrity check (it will refuse if still "
+                      "missing).")
 
     # ── Binary integrity (tuntop/integrity.py) ─────────────────────────
     # tun2socks.exe / wintun.dll run inside this ADMIN process: a swapped

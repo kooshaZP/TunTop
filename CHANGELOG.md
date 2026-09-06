@@ -4,6 +4,20 @@ All notable changes to TunTop are documented here.
 
 ## [1.0.4] - 2026-09-06
 
+### Added
+- **Cascadia Mono SemiLight is the default console font** (Windows 11's
+  terminal face): the frozen exe requests it at startup and falls back
+  through Cascadia Mono -> Consolas -> Lucida Console; `--font` still
+  overrides. SemiLight gets its proper GDI weight (350).
+- **The exe downloads its own missing files**: at startup a frozen exe
+  missing tun2socks/wintun (bare-exe handoff) fetches the official
+  tun2socks v2.7.0 / wintun 0.14.1 builds into its own folder - the
+  SHA-256 integrity gate still judges the result, so a bad download
+  refuses to start exactly as before. The geoip database auto-downloads
+  in the background when missing (previously launcher-only), and its
+  default location in a frozen exe is now NEXT TO TunTop.exe instead of
+  the throwaway _MEIPASS temp dir, so the download persists across runs.
+
 ### Changed
 - **Unicode glyphs are the default** in the standalone exe (and everywhere
   else): box-drawing/block glyphs render without passing `--unicode`. The
