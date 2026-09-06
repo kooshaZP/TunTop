@@ -1,4 +1,4 @@
-# PyInstaller spec for building the standalone TunTop.exe.
+﻿# PyInstaller spec for building the standalone TunTop.exe.
 #
 #   pyinstaller --clean --noconfirm TunTop.spec
 #
@@ -43,8 +43,10 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,   # UPX packing is the #1 AV false-positive trigger for
+                 # onefile builds; keep the payload unpacked.
     runtime_tmpdir=None,
     console=True,
-    icon=None,
+    icon="assets/tuntop.ico",
+    version="tuntop_version_info.txt",
 )

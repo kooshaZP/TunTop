@@ -1,4 +1,4 @@
-# TunTop
+﻿# TunTop
 
 [![CI](https://github.com/kooshaZP/TunTop/actions/workflows/ci.yml/badge.svg)](https://github.com/kooshaZP/TunTop/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/kooshaZP/TunTop/blob/main/LICENSE)
@@ -195,6 +195,18 @@ tests/                     <- 170+ tests across 5 tiers
 
 ## Troubleshooting
 
+- **Antivirus deletes / blocks `TunTop.exe`** — false positive. TunTop is an unsigned
+  open-source exe; Windows Defender and other AVs heuristically flag unsigned
+  VPN/network tools. Fixes, in order of preference:
+  1. Restore it from Defender protection history and add an exclusion for the
+     TunTop folder (Windows Security → Virus & threat protection → Exclusions).
+  2. Verify the download first: `certutil -hashfile TunTop.exe SHA256` and compare
+     with `checksums.txt` from the release — then exclude with confidence.
+  3. Or skip the exe entirely: run `Run_Helper.bat` (Python source), which AVs
+     treat as plain scripts.
+  The build reduces false positives where it can: no UPX packing, full version
+  info resource, a real icon — but only a code-signing certificate (paid) fully
+  eliminates them.
 - **Dashboard won't start** — TunTop needs Administrator rights. Right-click `Run_Helper.ps1` → Run as Administrator.
 - **Health scan fails** — press `[D]` to export diagnostics (config, routes, logs, last scan) and attach it to an issue.
 - **Traffic leaks** — run `[L]` to compare direct vs tunneled exit IP, and confirm v2rayN's SOCKS5 inbound is listening on the port TunTop uses (`[P]`).

@@ -5,6 +5,13 @@ All notable changes to TunTop are documented here.
 ## [1.0.4] - 2026-09-06
 
 ### Added
+- **Antivirus false-positive hardening for the exe**: UPX packing disabled
+  (the single biggest heuristic trigger for PyInstaller onefile builds),
+  a full Windows version-info resource (name/company/description/1.0.4),
+  and a real multi-resolution icon (Bootstrap Icons `shield-lock`, MIT).
+  Unsigned exes can still be flagged - README Troubleshooting now has the
+  Defender restore/exclusion steps and the `certutil -hashfile` check
+  against `checksums.txt`.
 - **Cascadia Mono SemiLight is the default console font** (Windows 11's
   terminal face): the frozen exe requests it at startup and falls back
   through Cascadia Mono -> Consolas -> Lucida Console; `--font` still

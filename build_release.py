@@ -1,4 +1,4 @@
-"""Build a distributable TunTop release.
+﻿"""Build a distributable TunTop release.
 
 Usage:  python build_release.py
         python build_release.py --version 1.0.0
@@ -50,6 +50,7 @@ EXCLUDE_PATTERNS = {
     "crash_*.txt",
     ".last_run.json",
     ".cleanup_watchdog_state.json",
+    "tuntop_version_info.txt",   # PyInstaller resource spec, not runtime
     ".geo_cache",
 }
 
