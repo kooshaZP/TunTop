@@ -49,6 +49,7 @@ EXCLUDE_PATTERNS = {
     "*.log",
     "crash_*.txt",
     ".last_run.json",
+    ".cleanup_watchdog_state.json",
     ".geo_cache",
 }
 
