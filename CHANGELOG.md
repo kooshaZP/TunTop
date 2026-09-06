@@ -2,6 +2,33 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.8] - 2026-09-06
+
+### Fixed
+- **[F] Geo Manager: "3 = vpn" egress now actually applies** - the live
+  re-apply worker only recognised the "proxy2" and "direct" targets, so a
+  Windows-VPN egress silently fell through to the physical-adapter branch:
+  the user saw normal physical traffic and geo-via-VPN did nothing. A real
+  `winvpn` branch now looks up the connected VPN's default route and installs
+  the country routes there; without a connected VPN it reports clearly
+  instead of pretending.
+- **Split-tunnel VPNs work with [V] / geo-via-VPN** - the VPN lookup
+  REQUIRED a 0.0.0.0/0 route on the VPN adapter; VPN clients that install
+  only on-link/split routes (no default route) were rejected, so
+  vless-over-vpn exited at startup and geo-via-VPN found nothing. The lookup
+  (helper + dashboard routing copies) now falls back to the most-specific
+  Alive route on the connected VPN's adapter.
+
+### Changed
+- **[V]** logs what the mode needs (a connected Windows VPN; split-tunnel
+  VPNs supported) instead of a bare on/off line.
+
+### Build
+- **build_release.py survives AV quarantine of dist/TunTop.exe**: a versioned
+  backup copy (TunTop-<ver>.exe) is written the moment the build lands, and
+  a vanished exe now prints exact Defender restore/exclusion steps instead
+  of a bare None.
+
 ## [1.0.7] - 2026-09-06
 
 ### Changed

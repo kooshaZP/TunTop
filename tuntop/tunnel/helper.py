@@ -561,6 +561,15 @@ def get_vpn_ipv4_default(vpn_interface=None):
 $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias '{ps_quote(vpn_interface)}' -ErrorAction SilentlyContinue |
     Sort-Object RouteMetric, InterfaceMetric |
     Select-Object -First 1 NextHop, InterfaceAlias, InterfaceIndex
+if ($null -eq $r) {{
+    # No default route on the adapter (split-tunnel / on-link-only VPN):
+    # fall back to the most-specific Alive route it DOES have.
+    $r = Get-NetRoute -AddressFamily IPv4 -InterfaceAlias '{ps_quote(vpn_interface)}' -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.State -eq 'Alive' }} |
+        Sort-Object {{ ($_.DestinationPrefix -split '/')[1] -as [int] }} -Descending,
+            RouteMetric, InterfaceMetric |
+        Select-Object -First 1 NextHop, InterfaceAlias, InterfaceIndex
+}}
 if ($null -eq $r) {{ exit 1 }}
 $r | ConvertTo-Json -Compress
 """)
@@ -589,6 +598,19 @@ if ($null -eq $best) {
             $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
         } |
         Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
+}
+if ($null -eq $best) {
+    # Split-tunnel / on-link-only VPNs: a connected VPN client whose adapter
+    # installs NO 0.0.0.0/0 (e.g. only a /32 on-link or a small split list).
+    # Match the CONNECTED Get-VpnConnection names against ANY Alive IPv4
+    # route (most-specific first) instead of requiring a default route.
+    foreach ($n in $names) {
+        $r = Get-NetRoute -AddressFamily IPv4 -InterfaceAlias $n -ErrorAction SilentlyContinue |
+            Where-Object { $_.State -eq 'Alive' } |
+            Sort-Object { ($_.DestinationPrefix -split '/')[1] -as [int] } -Descending,
+                RouteMetric, InterfaceMetric | Select-Object -First 1
+        if ($r) { $best = $r; break }
+    }
 }
 if ($null -eq $best) { exit 1 }
 $best | Select-Object NextHop, InterfaceAlias, InterfaceIndex | ConvertTo-Json -Compress

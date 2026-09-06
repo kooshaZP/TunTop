@@ -3401,6 +3401,11 @@ class BTopTui:
         self.log_lines.append(
             f"[*] vless-over-vpn: {'OFF' if cur else 'ON'} "
             f"({'direct transport' if cur else 'VLESS rides the Windows VPN'}).")
+        if not cur:
+            self.log_lines.append(
+                "[i] Requires a CONNECTED Windows VPN; the helper re-checks it "
+                "on the restart (split-tunnel VPNs without a default route are "
+                "supported).")
         self._apply_launch_change("vless-over-vpn toggled")
 
     def _toggle_vpn_bypass(self):
@@ -4210,7 +4215,27 @@ class BTopTui:
         self._remove_geo_routes_for(cidrs)
         self._live_geo_added = []
         self._geo_applied_target = None
-        if target == "proxy2":
+        if target == "winvpn":
+            # Route the country ranges out through a CONNECTED Windows VPN.
+            # (This branch was MISSING: [F] -> 3=vpn sets geoip_target="winvpn",
+            # but the worker only recognised "proxy2"/"direct", so a winvpn
+            # request fell into the physical-adapter else below - the user saw
+            # normal physical traffic and "geo via VPN" did nothing.)
+            vpn4 = _get_vpn_ipv4_default(getattr(self.ns, "vpn_interface", None))
+            vpn6 = _get_vpn_ipv6_default(getattr(self.ns, "vpn_interface", None))
+            if not vpn4:
+                self._blog(
+                    "[!] geoip via Windows VPN requested but no connected Windows "
+                    "VPN route was found - nothing applied. Connect the VPN "
+                    "(or set [I] --vpn-interface) and press [F] -> 1 again.")
+                return
+            g_iface, g_gw = vpn4[0], vpn4[1]
+            v6iface = v6gw = None
+            if vpn6:
+                v6iface, v6gw = vpn6[0], vpn6[1]
+            self._blog(
+                f"[*] geoip:{code} routed via connected Windows VPN ({g_iface}).")
+        elif target == "proxy2":
             # Route the country ranges through the SECOND proxy hop (wintun2),
             # exactly how proxy2-tagged bypass entries are routed.
             if not getattr(self.ns, "proxy2_port", None):

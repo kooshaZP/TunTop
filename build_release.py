@@ -1,4 +1,4 @@
-﻿"""Build a distributable TunTop release.
+"""Build a distributable TunTop release.
 
 Usage:  python build_release.py
         python build_release.py --version 1.0.0
@@ -107,7 +107,35 @@ def build_exe() -> str | None:
     subprocess.run([sys.executable, "-m", "PyInstaller", "--clean",
                     "--noconfirm", spec], check=True, cwd=ROOT)
     exe = os.path.join(DIST, "TunTop.exe")
-    return exe if os.path.isfile(exe) else None
+    if not os.path.isfile(exe):
+        # Antivirus heuristics routinely quarantine a FRESH unsigned onefile
+        # exe within seconds of it landing on disk. Tell the user exactly
+        # what happened and how to get the artifact back - the build itself
+        # succeeded (PyInstaller exited 0 and the exe existed briefly).
+        print(
+            "  ! dist/TunTop.exe is missing right after the build. An AV"
+            " (Defender)\n"
+            "    most likely quarantined it. Restore it:\n"
+            "      Windows Security -> Virus & threat protection -> Protection"
+            " history\n"
+            "      -> TunTop.exe -> Actions -> Restore\n"
+            "    then add a folder exclusion for dist/ BEFORE rebuilding:"
+            "\n"
+            "      Add-MpPreference -ExclusionPath"
+            " '<repo>\\dist'   (admin PowerShell)\n"
+            "    The published GitHub-Release exe is unaffected (built on CI).")
+        return None
+    # Copy to a versioned sibling immediately: AV scanners key on the
+    # just-written onefile image; the copy is a second on-disk artifact
+    # that often survives even when the original is quarantined.
+    version = get_version()
+    keep = os.path.join(DIST, f"TunTop-{version}.exe")
+    try:
+        shutil.copy2(exe, keep)
+        print(f"  * Kept backup copy: {keep}")
+    except OSError as e:
+        print(f"  ! Could not write backup copy: {e}")
+    return exe
 
 
 def build_zip(version: str) -> str:
