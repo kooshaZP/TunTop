@@ -2,6 +2,18 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.3] - 2026-09-05
+
+### Added
+- **Truecolor backgrounds for every theme** - the TUI paints its own
+  background instead of the terminal default showing through every padded
+  space. All 7 palettes ([M] cycles) carry a matching dark bg; armed before
+  each frame/overlay/shutdown screen, re-armed by every colour-span end,
+  flooded on full repaints and diff rows; quitting restores the terminal
+  default. Shipped in the standalone exe.
+- **`--font FACE` / `--font-size N`** - explicit console font (classic
+  conhost; Windows Terminal keeps its profile font by design).
+
 ## [1.0.2] - 2026-09-05
 
 ### Fixed
