@@ -2,6 +2,19 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.14] - 2026-09-07
+
+### Added
+- **geoip.dat startup bootstrap** - the geo database now gets the same
+  treatment as tun2socks/wintun: on first run of the packaged exe it is
+  downloaded (v2fly source, SHA-256 verified, atomic install) into the
+  exe's own folder BEFORE the dashboard opens, and `--geoip` defaults to
+  that file. Geo features work on the very first run with no manual step.
+- **geoip auto-update** - at dashboard start, if the configured geoip.dat
+  is older than 14 days it is refreshed once per session in the
+  background (same SHA-256-verified pipeline); stale databases can no
+  longer silently misroute. [W] still force-updates on demand.
+
 ## [1.0.13] - 2026-09-07
 
 ### Fixed

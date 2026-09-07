@@ -126,12 +126,6 @@ if getattr(_sys, "frozen", False):
 else:
     _DEFAULT_GEOIP_PATH = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "geoip.dat")
-if getattr(_sys, "frozen", False):
-    _DEFAULT_GEOIP_PATH = os.path.join(
-        os.path.dirname(os.path.abspath(_sys.executable)), "geoip.dat")
-else:
-    _DEFAULT_GEOIP_PATH = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "geoip.dat")
 
 
 def _control_file_path():
@@ -6170,6 +6164,24 @@ class BTopTui:
                 self.log_lines.append(
                     f"[*] Geoip database not found - downloading to "
                     f"{_geo_dest} (background).")
+        else:
+            # Auto-UPDATE: geoip databases rotate continuously (new ranges,
+            # withdrawn prefixes); a months-old file silently misroutes. If
+            # the configured file is older than _GEOIP_MAX_AGE_DAYS, refresh
+            # it once per session in the background ([W] semantics), then
+            # keep using the file in place.
+            try:
+                _age_days = (time.time() - os.path.getmtime(_geo_dest)) / 86400.0
+                if _age_days >= _GEOIP_MAX_AGE_DAYS and \
+                        not getattr(self, "_geo_autoupdate_done", False):
+                    self._geo_autoupdate_done = True
+                    if self._start_geo_download(force=True):
+                        self.log_lines.append(
+                            f"[*] Geoip database is {_age_days:.0f} days old "
+                            f"(> {_GEOIP_MAX_AGE_DAYS}) - updating in the "
+                            "background.")
+            except OSError:
+                pass    # file vanished/rotated mid-check - next tick retries
         # One delayed mouse retry: right after an elevated relaunch the input
         # handle can briefly report unusable; a second attempt ~2s in recovers
         # those cases without touching working setups.
@@ -7395,6 +7407,12 @@ class BTopTui:
 _TUN2SOCKS_URL = ("https://github.com/xjasonlyu/tun2socks/releases/"
                   "download/v2.7.0/tun2socks-windows-amd64-v3.zip")
 _WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+# v2fly geoip database: same source Run_Helper.ps1 and [W] use. Downloaded
+# at startup (like tun2socks/wintun) when missing, parked next to the exe,
+# and auto-refreshed in the background when older than _GEOIP_MAX_AGE.
+GEOIP_DAT_URL = ("https://github.com/v2fly/geoip/releases/"
+                 "latest/download/geoip.dat")
+_GEOIP_MAX_AGE_DAYS = 14
 
 
 def _download_to(url, dest):
@@ -7475,6 +7493,28 @@ def _bootstrap_binaries(exe_dir, want_tun2socks=False, want_wintun=False):
         got["wintun.dll"] = out
 
     return got
+
+
+def _bootstrap_geoip(exe_dir):
+    """Download the v2fly geoip database into `exe_dir` BEFORE the UI
+    starts - the same treatment the vendored binaries get. Uses the
+    battle-tested download_geoip (streaming, .part temp + atomic replace,
+    SHA-256 verified against the release's .sha256sum). Returns the path
+    on success; raises on failure (caller continues without geo - the
+    dashboard's in-UI auto-download remains the fallback)."""
+    dest = os.path.join(exe_dir, "geoip.dat")
+    from tuntop.geo.geoip import download_geoip
+    last = [0]
+
+    def _prog(done, total):
+        if total and done - last[0] >= (4 << 20):
+            last[0] = done
+            print(f"    {done * 100 // total}%  ({done / 1048576:.1f} MB)")
+
+    size = download_geoip(dest, url=GEOIP_DAT_URL, progress=_prog)
+    print(f"[+] Downloaded: geoip.dat -> {dest} "
+          f"({size / 1048576:.1f} MB, SHA-256 verified)")
+    return dest
 
 
 def main():
@@ -7629,6 +7669,27 @@ def main():
                 print(f"[!] Binary download failed: {e} - continuing to "
                       "the integrity check (it will refuse if still "
                       "missing).")
+
+    # ── Bootstrap the geoip database (frozen exe) ──────────────────────
+    # geoip.dat gets the SAME startup treatment as tun2socks/wintun:
+    # missing -> downloaded into the exe's folder BEFORE the dashboard
+    # opens, so [F]/geo-bypass work on the very first run with no manual
+    # [W]. When no --geoip path is configured, args.geoip is pointed at
+    # the exe-dir file so every geo feature uses it by default.
+    if getattr(_sys, "frozen", False):
+        _exe_dir = os.path.dirname(os.path.abspath(_sys.executable))
+        if not getattr(args, "geoip", None):
+            args.geoip = os.path.join(_exe_dir, "geoip.dat")
+        if not os.path.isfile(args.geoip):
+            print("[i] Geoip database not found - downloading (v2fly)...")
+            try:
+                _bootstrap_geoip(_exe_dir)
+            except Exception as e:
+                # Never fatal: the dashboard's own auto-download (and [W])
+                # remain as fallbacks; geo features just stay unavailable
+                # until one of them succeeds.
+                print(f"[!] Geoip download failed: {e} - the dashboard "
+                      "will retry in the background.")
 
     # ── Binary integrity (tuntop/integrity.py) ─────────────────────────
     # tun2socks.exe / wintun.dll run inside this ADMIN process: a swapped
