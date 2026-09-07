@@ -2,6 +2,27 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.12] - 2026-09-07
+
+### Fixed
+- **[T] stop freeze, round 2**: the 1.0.11 VPN telemetry sampled
+  `get_vpn_status()` (2 PowerShell spawns) every 4s with no gate while a
+  stop was running - the route sweep competed with constant PowerShell
+  spawns and a VPN-arrival event could re-install routes mid-sweep.
+  Sampling, arrival re-apply, and the bypass resolver are now all skipped
+  while a teardown is in flight.
+- **[S] during a stop now QUEUES the start**: the tunnel launches
+  automatically the moment the sweep finishes (previously the UI said
+  "press [S] again in a few seconds", which read as frozen when the sweep
+  took longer than expected).
+- Exit path waits at most 30s on an in-flight teardown and never fires a
+  queued start during [Q]/exit.
+
+### Changed
+- `get_vpn_status()` uses ONE PowerShell spawn instead of two per sample
+  (halves process churn on machines with slow AV-scanned PowerShell
+  starts).
+
 ## [1.0.11] - 2026-09-06
 
 ### Fixed
