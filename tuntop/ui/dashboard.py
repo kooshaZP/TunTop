@@ -1329,11 +1329,29 @@ def get_ping(port, dns):
 
 
 def get_vpn_status():
+    """Name of the CONNECTED Windows VPN, or None. Get-VpnConnection covers
+    built-in VPN connections; third-party clients (their adapters often named
+    like 'VPN Client Adapter - VPN') are caught by the adapter fallback, so
+    the dashboard shows the same VPN the helper's route lookup finds."""
     ok, out = _ps(
         "@(@(Get-VpnConnection -AllUserConnection -EA SilentlyContinue) + "
         "@(Get-VpnConnection -EA SilentlyContinue)) | "
         "? ConnectionStatus -eq 'Connected' | Select-Object -First 1 | % {$_.Name}")
-    return out.strip() if ok else None
+    if ok:
+        name = out.strip()
+        if name:
+            return name
+    ok2, out2 = _ps(
+        "(Get-NetAdapter -EA SilentlyContinue | "
+        "? {$_.Status -eq 'Up' -and $_.InterfaceAlias -ne 'wintun' -and "
+        "$_.InterfaceDescription -notmatch 'Wintun' -and "
+        "$_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'} | "
+        "Select-Object -First 1).InterfaceAlias")
+    if ok2:
+        name = out2.strip()
+        if name:
+            return name
+    return None
 
 
 # ─── Drawing primitives ─────────────────────────────────────────────────────
@@ -1891,10 +1909,29 @@ class BTopTui:
                     if len(self.ping_samples) > 8:
                         self.ping_samples.pop(0)
 
-        # VPN - every 5 s
-        if getattr(self.ns, "vless_over_vpn", False) and now - self._vpn_cache_ts >= 4.0:
-            self._vpn_cache_ts = now
-            self._vpn_status = get_vpn_status()
+        # VPN - every 4 s. Sample whenever ANY VPN-dependent feature cares:
+        # [V] vless-over-vpn, geo-via-VPN, or VPN-bypass display. The status
+        # feeds the top-bar chip (red on disconnect) and the live adapter name.
+        if getattr(self.ns, "vless_over_vpn", False) or \
+                getattr(self.ns, "geoip", None) or \
+                not getattr(self.ns, "no_vpn_bypass", False):
+            if now - self._vpn_cache_ts >= 4.0:
+                self._vpn_cache_ts = now
+                self._vpn_status = get_vpn_status()
+        # VPN ARRIVAL reconciliation (every ~10s): the moment a Windows VPN
+        # appears, everything that wanted it but found nothing at apply time
+        # is re-applied - [vpn]-tagged bypass entries stuck at "[route
+        # pending]" and geo-via-VPN requests that aborted with "no connected
+        # Windows VPN". Disappearance needs no action: the VPN's own routes
+        # vanish with the adapter; the pending-state machinery re-fires on
+        # its own the next time the VPN connects.
+        if now - getattr(self, "_vpn_recon_ts", 0.0) >= 10.0:
+            self._vpn_recon_ts = now
+            vpn_up = bool(self._vpn_status)
+            was_up = getattr(self, "_vpn_was_up", False)
+            self._vpn_was_up = vpn_up
+            if vpn_up and not was_up:
+                self._on_vpn_arrived()
 
     def _telemetry_worker(self):
         """Background loop: sample speed/ping/vpn off the main thread so the
@@ -3448,6 +3485,38 @@ class BTopTui:
             f"[*] VPN endpoint bypass: {'ENABLED' if cur else 'DISABLED'} "
             f"({'VPN traffic IS tunneled' if cur else 'VPN endpoints stay direct'}).")
         self._apply_launch_change("vpn-bypass toggled")
+
+    def _on_vpn_arrived(self):
+        """A Windows VPN just CONNECTED (telemetry noticed the transition).
+        Everything that wanted the VPN but found nothing at apply time is
+        re-applied now: [vpn]-tagged bypass entries sitting at "[route
+        pending]" and a geo-via-VPN request that aborted with "no connected
+        Windows VPN". Runs on the telemetry thread; every step is idempotent
+        and non-fatal (the resolver's own retry loop is the safety net)."""
+        try:
+            name = self._vpn_status or "VPN"
+            self._blog(f"[*] Windows VPN connected ({name}) - "
+                       "re-applying VPN-routed settings...")
+            # 1) Pending [vpn] bypass entries: force a re-resolve + route
+            #    install by resetting their 'next' due time.
+            state, _cache = self._bypass_stores("vpn")
+            with self._bypass_res_lock:
+                for entry, st in state.items():
+                    st["next"] = 0.0
+            # 2) geo-via-VPN: if the current geo target is winvpn but the
+            #    routes were never applied (previous attempt aborted),
+            #    re-run the apply with the persisted code.
+            if self._geo_target() == "winvpn" and \
+                    getattr(self, "_geo_applied_target", None) != "winvpn" and \
+                    getattr(self.ns, "geoip", None):
+                code = str(getattr(self.ns, "geoip_code", "") or "")
+                if code:
+                    threading.Thread(
+                        target=self._reapply_geo_bypass_worker,
+                        args=(self.ns.geoip, code, "winvpn"),
+                        daemon=True).start()
+        except Exception as e:
+            self._blog(f"[!] VPN-arrival re-apply failed: {e}")
 
     def _edit_servers(self):
         val = self._read_line(
@@ -5084,10 +5153,27 @@ class BTopTui:
             pairs.append(("PROXY2", (GREEN if p2_up else YELLOW)
                           + f"127.0.0.1:{self.ns.proxy2_port} "
                           + ("up" if p2_up else "down") + _R))
-        if getattr(self.ns, "vless_over_vpn", False) and self._vpn_status:
-            vpn_ok = self._vpn_status != "NOT CONNECTED"
-            pairs.append(("VPN", (GREEN if vpn_ok else YELLOW)
-                                 + self._vpn_status + _R))
+        # VPN chip: rendered whenever a VPN-dependent feature is active - in
+        # VLESS-over-VPN mode it's REQUIRED (red when no VPN is connected),
+        # otherwise it's informational (shows the live connection/adapter
+        # name so the user can see which egress the VPN-bypass routes use).
+        _vpn_mode_on = getattr(self.ns, "vless_over_vpn", False)
+        _vpn_info_on = (getattr(self.ns, "geoip", None) is not None
+                        and not getattr(self.ns, "no_vpn_bypass", False)) \
+                       or getattr(self.ns, "geoip_via_win_vpn", False) \
+                       or self._geo_target() == "winvpn"
+        if _vpn_mode_on or _vpn_info_on:
+            if self._vpn_status:
+                # Connected: GREEN + live name (connection name if
+                # Get-VpnConnection knows it, else the adapter alias).
+                pairs.append(("VPN", GREEN + BRIGHT + self._vpn_status + _R))
+            else:
+                # Dropped/absent: RED - in VLESS-over-VPN mode this is an
+                # error state (the transport has no egress); in bypass mode
+                # it warns that VPN endpoints are currently unreachable.
+                pairs.append(("VPN", RED
+                              + ("DOWN" if not _vpn_mode_on
+                                 else "NOT CONNECTED") + _R))
 
         L.append(_top("TUNTOP  -  NETWORK MONITOR"))
         status_row = len(L)
@@ -5206,15 +5292,29 @@ class BTopTui:
         bl = []
         bl.append(f"{BRIGHT}{pal['endpoint']}ROUTED DIRECT{_R}"
                   f"{GRAY} - these never enter the tunnel{_R}")
+        # Live VPN name for the bypass row: the telemetry worker refreshes
+        # self._vpn_status every ~4s while any VPN-dependent feature is on;
+        # fall back to a one-shot lookup when nothing else sampled it yet.
+        _live_vpn = self._vpn_status
+        if _live_vpn is None and not getattr(self.ns, "vless_over_vpn", False):
+            _live_vpn = "NOT CONNECTED"
+        _vpn_state_col = GREEN if (_live_vpn and _live_vpn != "NOT CONNECTED") \
+            else RED
+        _vpn_name = (f"{GRAY} · {_R}{_vpn_state_col}{_live_vpn}{_R}"
+                     if _live_vpn else "")
         if getattr(self.ns, "vless_over_vpn", False):
-            vpn_val = f"{GREEN}ON{_R}{GRAY} · VLESS rides Windows VPN{_R}"
-            vpn_dot = DOT_OK
+            vpn_val = (f"{GREEN}ON{_R}{GRAY} · VLESS rides Windows VPN{_R}"
+                       + _vpn_name)
+            vpn_dot = DOT_OK if (_live_vpn and _live_vpn != "NOT CONNECTED") \
+                else DOT_FAIL
         elif getattr(self.ns, "no_vpn_bypass", False):
             vpn_val = f"{YELLOW}OFF{_R}{GRAY} · VPN traffic IS tunneled{_R}"
             vpn_dot = DOT_WARN
         else:
-            vpn_val = f"{GREEN}ON{_R}{GRAY} · VPN endpoints stay direct{_R}"
-            vpn_dot = DOT_OK
+            vpn_val = (f"{GREEN}ON{_R}{GRAY} · VPN endpoints stay direct{_R}"
+                       + _vpn_name)
+            vpn_dot = DOT_OK if (_live_vpn and _live_vpn != "NOT CONNECTED") \
+                else DOT_WARN
         bl.append(" " + vpn_dot + " " + _kv("VPN", vpn_val))
         if getattr(self.ns, "geoip", None):
             _gt = self._geo_target()

@@ -185,7 +185,7 @@ def _get_egress_for(ip):
 $r = Find-NetRoute -RemoteIPAddress '{ps_quote(ip)}' -ErrorAction SilentlyContinue
 if ($r) {{
     $r = @($r) | Where-Object {{ $_.InterfaceAlias -ne 'wintun' }} |
-        Sort-Object {{ ($_.DestinationPrefix -split '/')[1] -as [int] }} -Descending, RouteMetric, InterfaceMetric |
+        Sort-Object -Property @{{Expression={{ ($_.DestinationPrefix -split '/')[1] -as [int] }}; Descending=$true}}, RouteMetric, InterfaceMetric |
         Select-Object -First 1
 }}
 if (-not $r) {{
@@ -222,7 +222,7 @@ if ($null -eq $r) {{
     # fall back to the most-specific Alive route it DOES have.
     $r = Get-NetRoute -AddressFamily IPv4 -InterfaceAlias '{ps_quote(vpn_interface)}' -ErrorAction SilentlyContinue |
         Where-Object {{ $_.State -eq 'Alive' }} |
-        Sort-Object {{ ($_.DestinationPrefix -split '/')[1] -as [int] }} -Descending,
+        Sort-Object -Property @{{Expression={{ ($_.DestinationPrefix -split '/')[1] -as [int] }}; Descending=$true}},
             RouteMetric, InterfaceMetric |
         Select-Object -First 1 NextHop, InterfaceAlias
 }}
@@ -250,7 +250,7 @@ if ($null -eq $best) {
     foreach ($n in $names) {
         $r = Get-NetRoute -AddressFamily IPv4 -InterfaceAlias $n -ErrorAction SilentlyContinue |
             Where-Object { $_.State -eq 'Alive' } |
-            Sort-Object { ($_.DestinationPrefix -split '/')[1] -as [int] } -Descending,
+            Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true},
                 RouteMetric, InterfaceMetric | Select-Object -First 1
         if ($r) { $best = $r; break }
     }
@@ -264,7 +264,7 @@ if ($null -eq $best) {
             $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun' -and
             $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
         } |
-        Sort-Object { ($_.DestinationPrefix -split '/')[1] -as [int] } -Descending,
+        Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true},
             RouteMetric, InterfaceMetric | Select-Object -First 1
 }
 if ($null -eq $best) { exit 1 }

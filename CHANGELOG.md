@@ -2,6 +2,34 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.11] - 2026-09-06
+
+### Fixed
+- **VPN egress lookups silently always failed (root cause)** - every
+  PowerShell route lookup that needed "most-specific route first" used
+  `Sort-Object { ... } -Descending,` with a trailing comma - a PARSE ERROR
+  in Windows PowerShell 5.1 (a trailing comma cannot follow a switch
+  parameter). The lookup returned nothing, so [V] VLESS-over-VPN reported
+  "no active Windows VPN" with the VPN up, [F] geo-via-VPN fell back to the
+  physical adapter, and [A] vpn-target bypass entries stayed "[route
+  pending]" forever. All sites (helper x4, dashboard routing copy x4)
+  rewritten to the parse-safe hashtable-property form
+  (`@{Expression=...;Descending=$true}, RouteMetric, InterfaceMetric`),
+  verified against the live routing table.
+
+### Added
+- **Live VPN chip in the top bar** - shows the connected VPN's
+  connection/adapter name (GREEN); turns RED "NOT CONNECTED"/"DOWN" when
+  the VPN drops. Visible whenever a VPN-dependent mode is on.
+- **Live VPN name on the BYPASS row** - "VPN ON · VPN endpoints stay
+  direct · Shirazu-VPN" with a red dot while disconnected.
+- **VPN-arrival auto-apply** - when a Windows VPN connects while TunTop is
+  running, pending [vpn] bypass entries and an unapplied geo-via-VPN
+  request are re-applied automatically (~10s detection cadence).
+- **Third-party VPN status** - get_vpn_status() now falls back to
+  VPN-pattern adapters (Get-VpnConnection misses clients like "VPN Client
+  Adapter - VPN"), matching what the route lookup finds.
+
 ## [1.0.10] - 2026-09-06
 
 ### Fixed
