@@ -2,6 +2,41 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.17] - 2026-09-07
+
+### Fixed
+- **Geo routes left on the system after an Alt+F4-style exit**: the
+  Ctrl-close fast path now (a) refreshes the watchdog sidecar FIRST, then
+  (b) deletes the tracked live routes AND (c) runs the batched
+  geo-CIDR sweep in the same ~5s window - geo routes the HELPER installed
+  at startup were never in the dashboard's live-route tracking, and they
+  sit on the physical adapter where the Wintun teardown cannot see them.
+  The detached watchdog still sweeps whatever the close window could not
+  finish. Its diary now also lands next to TunTop.exe when frozen
+  (it used to vanish into a throwaway extraction dir, making every
+  unclean-exit sweep undiagnosable).
+- **Dashboard unresponsive + typed keys echoed after the TUN dies
+  (VPN change)**: the per-frame console-mode watchdog now also covers
+  sessions WITHOUT mouse support (it restores the original input mode,
+  not just the mouse dashboard mode), and the tunnel-down transition
+  (STOPPED/FAILED) actively restores the input mode AND flushes the
+  console input buffer - the garbage keys typed while the app looked
+  dead can no longer leak into the UI ("adadassdasd" on the status bar).
+  The log points at [T] to start the tunnel again.
+
+### Added
+- **Profile management in the [I] picker**: **X** deletes a saved
+  profile (press twice to confirm; deleting the default also clears
+  auto-load), **D** marks/clears the **DEFAULT profile** - the default is
+  applied to the startup args automatically on every TunTop start, so
+  the saved setup comes up with zero keypresses. The default profile is
+  starred in the list.
+- **[E] server editor**: new mode choice - 1=REPLACE all servers (the old
+  behaviour) or 2=ADD to the current servers (dedup case-insensitive;
+  only the new servers get live host routes, existing ones untouched).
+- **[F] Geo Manager**: option 1 is now "Change geoip.dat location" (the
+  file path, verified to exist); Apply/Re-apply moved to option 5.
+
 ## [1.0.16] - 2026-09-07
 
 ### Fixed

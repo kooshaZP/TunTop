@@ -11,6 +11,7 @@ from tuntop.profiles import (
     profile_file, snapshot_from_args, load_store, save_snapshot,
     apply_to_args, export_profile, import_profile, secret_store,
     SecretStoreError, PROFILE_FILENAME,
+    DEFAULT_KEY, delete_profile, set_default_profile, get_default_profile,
 )
 
 
@@ -200,6 +201,78 @@ class TestSecretStore(unittest.TestCase):
                          os.name == "nt" and
                          __import__("tuntop.profiles", fromlist=["_HAS_WINCRED"])
                          ._HAS_WINCRED)
+
+class TestDefaultAndDelete(unittest.TestCase):
+    """The default (auto-load) profile marker and profile deletion -
+    v1.0.17: profiles can be deleted from the [I] picker and one profile
+    can be marked DEFAULT so it auto-loads on every start."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = profile_file(self.dir)
+
+    def _save(self, name, server="1.2.3.4"):
+        ok, _ = save_snapshot(self.path, name, {"server": [server],
+                                                "port": 10808})
+        self.assertTrue(ok)
+
+    def test_no_default_initially(self):
+        self._save("home")
+        self.assertIsNone(get_default_profile(self.path))
+
+    def test_set_and_clear_default(self):
+        self._save("home")
+        ok, _ = set_default_profile(self.path, "home")
+        self.assertTrue(ok)
+        self.assertEqual(get_default_profile(self.path), "home")
+        ok, msg = set_default_profile(self.path, None)
+        self.assertTrue(ok)
+        self.assertIsNone(get_default_profile(self.path))
+        self.assertIn("cleared", msg)
+
+    def test_default_must_exist(self):
+        ok, msg = set_default_profile(self.path, "ghost")
+        self.assertFalse(ok)
+        self.assertIn("does not exist", msg)
+
+    def test_default_survives_other_saves(self):
+        self._save("home")
+        set_default_profile(self.path, "home")
+        self._save("work", "5.6.7.8")
+        self.assertEqual(get_default_profile(self.path), "home")
+
+    def test_delete_removes_profile(self):
+        self._save("home")
+        self._save("work", "5.6.7.8")
+        ok, _ = delete_profile(self.path, "home")
+        self.assertTrue(ok)
+        data, err = load_store(self.path)
+        self.assertIsNone(err)
+        self.assertNotIn("home", data)
+        self.assertIn("work", data)
+
+    def test_delete_missing_is_a_noop(self):
+        ok, msg = delete_profile(self.path, "ghost")
+        self.assertFalse(ok)
+        self.assertIn("does not exist", msg)
+
+    def test_deleting_default_clears_auto_load(self):
+        self._save("home")
+        set_default_profile(self.path, "home")
+        ok, msg = delete_profile(self.path, "home")
+        self.assertTrue(ok)
+        self.assertIn("was the default", msg)
+        self.assertIsNone(get_default_profile(self.path))
+
+    def test_default_key_is_reserved(self):
+        ok, msg = save_snapshot(self.path, DEFAULT_KEY, {"server": []})
+        self.assertFalse(ok)
+        self.assertIn("reserved", msg)
+        # ...and can never be deleted/set as a "profile".
+        ok, _ = delete_profile(self.path, DEFAULT_KEY)
+        self.assertFalse(ok)
+        ok, _ = set_default_profile(self.path, DEFAULT_KEY)
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

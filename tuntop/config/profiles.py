@@ -71,6 +71,8 @@ def save_snapshot(path: str, name: str, snapshot: dict) -> tuple:
     name = (name or "").strip()
     if not name:
         return False, "[!] Empty profile name - not saved."
+    if name == DEFAULT_KEY:
+        return False, "[!] '_default' is a reserved name - not saved."
     try:
         data, err = load_store(path)
         if err and err != "missing":
@@ -82,6 +84,77 @@ def save_snapshot(path: str, name: str, snapshot: dict) -> tuple:
         return False, f"[!] Could not write profiles.json: {e}"
     return True, (f"[+] Profile '{name}' saved "
                   f"({len(data)} profile(s) total).")
+
+
+#: Store key holding the DEFAULT (auto-load) profile's name. Reserved -
+#: save_snapshot refuses it as a profile name.
+DEFAULT_KEY = "_default"
+
+
+def delete_profile(path: str, name: str) -> tuple:
+    """Remove one named profile from the store. Returns (ok, message) with
+    the message UI-ready. Deleting the DEFAULT profile also clears the
+    auto-load marker (there is nothing left to auto-load)."""
+    name = (name or "").strip()
+    if not name or name == DEFAULT_KEY:
+        return False, "[!] Invalid profile name - nothing deleted."
+    try:
+        data, err = load_store(path)
+        if err and err != "missing":
+            return False, f"[!] Could not read the profiles store: {err}"
+        if name not in data:
+            return False, f"[i] Profile '{name}' does not exist - nothing deleted."
+        del data[name]
+        cleared = False
+        if data.get(DEFAULT_KEY) == name:
+            data.pop(DEFAULT_KEY, None)
+            cleared = True
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        return False, f"[!] Could not write the profiles store: {e}"
+    msg = f"[+] Profile '{name}' deleted."
+    if cleared:
+        msg += " It was the default - auto-load is off now."
+    return True, msg
+
+
+def set_default_profile(path: str, name) -> tuple:
+    """Mark one stored profile as the DEFAULT: it is applied to the startup
+    args automatically on every TunTop start (no keypresses needed).
+    ``name=None`` clears the default. Returns (ok, message)."""
+    try:
+        data, err = load_store(path)
+        if err and err != "missing":
+            return False, f"[!] Could not read the profiles store: {err}"
+        name = (name or "").strip() or None
+        if name is None:
+            data.pop(DEFAULT_KEY, None)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            return True, "[i] Default profile cleared - no auto-load on start."
+        if name == DEFAULT_KEY or name not in data:
+            return False, (f"[!] Profile '{name}' does not exist - "
+                           "not set as default.")
+        data[DEFAULT_KEY] = name
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        return False, f"[!] Could not write the profiles store: {e}"
+    return True, (f"[+] Default profile set to '{name}' - it auto-loads "
+                  "on every start.")
+
+
+def get_default_profile(path: str):
+    """The DEFAULT profile's name, or None (also when the marker points at
+    a profile that no longer exists)."""
+    data, err = load_store(path)
+    if err:
+        return None
+    name = data.get(DEFAULT_KEY)
+    if isinstance(name, str) and name in data:
+        return name
+    return None
 
 
 def apply_to_args(ns, snap: dict, normalise_host=None) -> list:

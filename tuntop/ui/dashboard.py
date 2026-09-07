@@ -3540,9 +3540,22 @@ class BTopTui:
             self._blog(f"[!] VPN-arrival re-apply failed: {e}")
 
     def _edit_servers(self):
+        mode = self._read_line(
+            "1=REPLACE all servers   2=ADD to the current servers "
+            "(Esc=cancel):",
+            title="EDIT SERVERS  -  CHOOSE MODE",
+            examples=[f"current: {', '.join(self.ns.server)}",
+                      "2 keeps every existing server and adds the new one(s)",
+                      "applies on the next tunnel start (live re-route too)"])
+        m = (mode or "").strip()
+        if m not in ("1", "2"):
+            if mode:
+                self.log_lines.append("[i] Server edit cancelled.")
+            return
+        replace = (m == "1")
         val = self._read_line(
             "VLESS server IP(s)/hostname(s), comma or space separated:",
-            title="EDIT SERVERS",
+            title=("REPLACE SERVERS" if replace else "ADD SERVERS"),
             examples=[f"current: {', '.join(self.ns.server)}",
                       "1.2.3.4, example.com   (multiple are fine)",
                       "applies on the next tunnel start"])
@@ -3557,10 +3570,23 @@ class BTopTui:
             self.log_lines.append(f"[!] No usable host in {val!r} - servers unchanged.")
             return
         old_v4, old_v6 = list(self.endpoint_v4), list(self.endpoint_v6)
-        self.ns.server = hosts
+        if replace:
+            self.ns.server = hosts
+        else:
+            # ADD mode: keep every existing server, append the new ones
+            # (dedup case-insensitively on the lowercased host).
+            existing = {s.lower() for s in (self.ns.server or [])}
+            added = [h for h in hosts if h.lower() not in existing]
+            if not added:
+                self.log_lines.append(
+                    "[i] All entered servers are already in the list - "
+                    "nothing to add.")
+                return
+            self.ns.server = list(self.ns.server or []) + added
+            added_hosts = added
         # Re-resolve the endpoints for display/health immediately (best effort).
         self.endpoint_v4, self.endpoint_v6 = [], []
-        for srv in hosts:
+        for srv in self.ns.server:
             v4, v6 = _resolve(srv)
             for ip in v4:
                 if ip not in self.endpoint_v4:
@@ -3572,11 +3598,17 @@ class BTopTui:
             self.checks = build_checks(self.ns)
         except Exception as e:
             self.log_lines.append(f"[!] Health-check rebuild failed: {e}")
-        self.log_lines.append(f"[*] Servers set to: {', '.join(hosts)}.")
+        if replace:
+            self.log_lines.append(f"[*] Servers set to: {', '.join(hosts)}.")
+        else:
+            self.log_lines.append(f"[*] Servers now: {', '.join(self.ns.server)}.")
         # LIVE apply - the VLESS transport is reached by IP, so NO TUN restart
         # is needed: drop the old endpoints' host routes and install ones for
         # the new servers (keeps the proxy's own connection out of the TUN).
-        self._rehost_endpoint_routes(old_v4 + old_v6, hosts)
+        # ADD mode: nothing to delete - only the NEW servers get host routes.
+        self._rehost_endpoint_routes(
+            old_v4 + old_v6 if replace else [],
+            hosts if replace else added_hosts)
 
     def _rehost_endpoint_routes(self, old_ips, hosts):
         """Live server change: delete the old VLESS endpoints' /32-/128 host
@@ -3656,12 +3688,13 @@ class BTopTui:
         if cidrs:
             n_routes = f"  ~{len(cidrs)} country CIDRs"
         val = self._read_line(
-            f"1=Apply/Re-apply   2=Change code   3=Change egress   "
-            f"4=Remove geo bypass   Esc=cancel",
+            f"1=Change geoip.dat location   2=Change code   3=Change egress   "
+            f"4=Remove geo bypass   5=Apply/Re-apply   Esc=cancel",
             title=(f"GEO MANAGER  -  code {code} · egress {target} · "
                    f"file {'set' if geo else 'NOT set'}{n_routes}"),
-            examples=[f"current egress: {target}"
-                      + ("   (2 needs proxy2 [Z])" if target != "proxy2" else ""),
+            examples=[f"current geoip file: {geo or '-'}",
+                      f"current egress: {target}"
+                      + ("   (3 needs proxy2 [Z])" if target != "proxy2" else ""),
                       "Remove = delete every country route, live",
                       "the tunnel keeps running through all actions"])
         v = (val or "").strip()
@@ -3683,6 +3716,27 @@ class BTopTui:
             self.log_lines.append(
                 f"[*] Geo bypass code set to '{self.ns.geoip_code}'.")
             code = self.ns.geoip_code
+        if v == "1":
+            # Change WHERE the geoip database lives (the geoip.dat file the
+            # country CIDRs are decoded from) without applying anything.
+            new_path = self._read_line(
+                "Path to v2rayN geoip.dat (empty = cancel):",
+                title="GEO MANAGER  -  GEOIP FILE LOCATION",
+                examples=[f"current: {geo or '-'}",
+                          "C:\\Program Files\\v2rayN\\bin\\geoip.dat",
+                          "tip: [W] downloads geoip.dat next to TunTop.exe"])
+            if not new_path:
+                return
+            if not os.path.isfile(new_path):
+                self.log_lines.append(
+                    f"[!] File not found: {new_path} - geoip unchanged. "
+                    "(Tip: press [W] to download geoip.dat automatically.)")
+                return
+            self.ns.geoip = new_path
+            self.log_lines.append(
+                f"[*] Geoip file location set to: {new_path}. "
+                "Press 5 to apply it to the live routes.")
+            return
         if v == "3":
             t = self._read_line(
                 "Route geoip country traffic via: [Enter]=keep current, "
@@ -3707,14 +3761,15 @@ class BTopTui:
             if target != self._geo_target():
                 self._set_geo_target(target)
                 self.log_lines.append(f"[*] Geo egress target: {target}.")
-        if v == "1" or v == "2" or v == "3":
+        if v in ("2", "3", "5"):
             if getattr(self.ns, "geoip", None):
                 # A geo file is configured - apply/re-apply LIVE, no restart.
                 self._reapply_geo_bypass()
-            elif v != "1":
+            elif v != "5":
                 self.log_lines.append(
                     "[i] Country code/egress saved. No geoip file configured "
-                    "yet - press [W] to download geoip.dat, then Apply.")
+                    "yet - press 1 to set the geoip.dat location, [W] to "
+                    "download it, then 5 to Apply.")
             else:
                 path = self._read_line(
                     "Path to v2rayN geoip.dat (empty = cancel):",
@@ -3787,7 +3842,10 @@ class BTopTui:
         self.log_lines.append(msg)
 
     def _load_profile(self):
-        data, err = profiles.load_store(self._profile_file())
+        """[I] Profile picker: Enter loads, D marks/clears the DEFAULT
+        (auto-loaded on every start), X deletes (press X again to confirm)."""
+        pf = self._profile_file()
+        data, err = profiles.load_store(pf)
         if err == "missing":
             self.log_lines.append("[i] No profiles yet - save one with [O].")
             return
@@ -3797,12 +3855,24 @@ class BTopTui:
         if not data:
             self.log_lines.append("[i] profiles.json is empty - save one with [O].")
             return
-        names = list(data.keys())
-        labels = [
-            f"{n}  {GRAY}({data[n].get('server') and ', '.join(data[n]['server'])}"
-            f" · :{data[n].get('port')}){_R}"
-            for n in names
-        ]
+
+        def _labels(store):
+            dflt = profiles.get_default_profile(pf)
+            labels = []
+            for n in store.keys():
+                if n == profiles.DEFAULT_KEY:
+                    continue          # the auto-load marker, not a profile
+                srv = store[n].get("server")
+                meta = (f"{GRAY}({', '.join(srv) if srv else '-'}"
+                        f" · :{store[n].get('port')}){_R}")
+                star = f"{YELLOW}*{_R}" if n == dflt else " "
+                tag = f"{GREEN}  <default, auto-loads>{_R}" if n == dflt else ""
+                labels.append(f"{star} {n}  {meta}{tag}")
+            return labels
+
+        names = [n for n in data.keys() if n != profiles.DEFAULT_KEY]
+        labels = _labels(data)
+        pending_delete = None
         size = _get_window_size() or (80, 24)
         avail = max(5, min(28, size[1] - 8))
         sel, top = 0, 0
@@ -3810,7 +3880,12 @@ class BTopTui:
         try:
             while True:
                 top = max(0, min(sel - avail // 2, max(0, len(names) - avail)))
-                self._draw_list_overlay("LOAD PROFILE", labels, sel, top, avail,
+                title = ("LOAD PROFILE  -  Enter=load · D=default on/off · "
+                         "X=delete (press twice)")
+                if pending_delete:
+                    title = (f"DELETE '{pending_delete}'?  -  "
+                             "X again=confirm · other key=cancel")
+                self._draw_list_overlay(title, labels, sel, top, avail,
                                         verb="load")
                 k = self._read_nav_key()
                 if k is None or k == "esc":
@@ -3827,6 +3902,35 @@ class BTopTui:
                         continue
                 if k == "enter":
                     break
+                kk = k.lower() if isinstance(k, str) else k
+                if kk in ("x", "del"):
+                    name = names[sel]
+                    if pending_delete == name:
+                        ok, msg = profiles.delete_profile(pf, name)
+                        self.log_lines.append(msg)
+                        pending_delete = None
+                        data, _ = profiles.load_store(pf)
+                        names = [n for n in data.keys()
+                                 if n != profiles.DEFAULT_KEY]
+                        if not names:
+                            self.log_lines.append(
+                                "[i] No profiles left - save one with [O].")
+                            return
+                        sel = min(sel, len(names) - 1)
+                        labels = _labels(data)
+                    else:
+                        pending_delete = name
+                    continue
+                pending_delete = None
+                if kk == "d":
+                    name = names[sel]
+                    if profiles.get_default_profile(pf) == name:
+                        ok, msg = profiles.set_default_profile(pf, None)
+                    else:
+                        ok, msg = profiles.set_default_profile(pf, name)
+                    self.log_lines.append(msg)
+                    labels = _labels(data)
+                    continue
                 if k == "up":
                     sel = max(0, sel - 1)
                 elif k == "down":
@@ -6220,15 +6324,25 @@ class BTopTui:
                 # on the UI but the app doesn't respond"). A GetConsoleMode
                 # check per frame is effectively free; re-apply our mode and
                 # say so (once per incident) when a stomp is detected.
-                if self._mouse_ok and self._dash_mode is not None:
+                # _want_mode: the console input mode the dashboard needs -
+                # the mouse-enabled dashboard mode when mouse support is up,
+                # otherwise the original mode captured before the mouse was
+                # enabled. Covering the mouse-OFF case too matters because a
+                # stomp (a child process resetting the shared console mode)
+                # leaves echoed keys / dead input in EVERY session, not just
+                # mouse-enabled ones.
+                _want_mode = (self._dash_mode
+                              if self._mouse_ok and self._dash_mode is not None
+                              else self._orig_console_mode)
+                if self._stdin_handle is not None and _want_mode is not None:
                     try:
                         _k32 = ctypes.windll.kernel32
                         _m = ctypes.c_uint32()
                         if _k32.GetConsoleMode(self._stdin_handle,
                                                ctypes.byref(_m)) and \
-                                _m.value != self._dash_mode:
+                                _m.value != _want_mode:
                             _k32.SetConsoleMode(self._stdin_handle,
-                                                self._dash_mode)
+                                                _want_mode)
                             if not getattr(self, "_mode_stomp_logged", False):
                                 self.log_lines.append(
                                     "[i] Console input mode was changed by "
@@ -6263,6 +6377,28 @@ class BTopTui:
                                    TunnelState.FAILED.value):
                         self.logs.put("[!] TUN went DOWN - traffic leaves "
                                       "via the physical NIC until restarted.")
+                        # A tunnel death (VPN change, adapter churn) usually
+                        # means child processes just STOMPED the shared
+                        # console mode and buffered garbage keystrokes while
+                        # the app looked dead ("what I type shows on the UI
+                        # and doesn't work"). Restore the input mode and
+                        # FLUSH the buffer so the next keys reach the app.
+                        try:
+                            _k32 = ctypes.windll.kernel32
+                            _want = (self._dash_mode if self._mouse_ok
+                                     and self._dash_mode is not None
+                                     else self._orig_console_mode)
+                            if self._stdin_handle is not None:
+                                if _want is not None:
+                                    _k32.SetConsoleMode(self._stdin_handle,
+                                                        _want)
+                                _k32.FlushConsoleInputBuffer(
+                                    self._stdin_handle)
+                            self._mode_stomp_logged = False
+                        except Exception:
+                            pass
+                        self.logs.put("[i] Input restored - press [T] to "
+                                      "start the tunnel again.")
                     self._last_seen_state = st
 
                 # Drain log queue
@@ -7642,6 +7778,31 @@ def main():
 
     args = ap.parse_args()
 
+    # ── Default profile auto-load ────────────────────────────────────────
+    # A profile marked as DEFAULT in the store ([I] picker -> D) is applied
+    # to the startup args HERE, so the tunnel comes up with the saved setup
+    # with zero keypresses. Applied BEFORE the URL/host normalisation below
+    # so the profile's server/bypass entries get the exact same treatment
+    # as command-line ones.
+    try:
+        _pf_dir = (os.path.dirname(os.path.abspath(sys.executable))
+                   if getattr(sys, "frozen", False)
+                   else os.path.dirname(os.path.abspath(__file__)))
+        _pf_path = profiles.profile_file(_pf_dir)
+        _default_name = profiles.get_default_profile(_pf_path)
+        if _default_name:
+            _pstore, _perr = profiles.load_store(_pf_path)
+            if not _perr and _default_name in _pstore:
+                profiles.apply_to_args(args, _pstore[_default_name],
+                                       normalise_host=_host_from_url)
+                print(f"[*] Auto-loaded default profile '{_default_name}' "
+                      "(change or clear it in the [I] profile picker).")
+            else:
+                print(f"[!] Default profile '{_default_name}' is set but "
+                      "missing from the store - ignored.")
+    except Exception as _e:
+        print(f"[!] Default profile auto-load failed: {_e}")
+
     # Accept URLs / host:port anywhere a host is expected - a route needs a
     # bare host or IP, so normalise once, up front (the [A] key does the same).
     args.bypass_ip = [h for h in (_host_from_url(x) for x in (args.bypass_ip or [])) if h]
@@ -7826,7 +7987,18 @@ def main():
             # after this handler returns).
             try:
                 if app is not None:
+                    # Fresh sidecar FIRST so the detached watchdog sees the
+                    # latest live state even if we are killed mid-sweep.
+                    app._write_watchdog_state()
                     app._cleanup_live_routes()
+                    # _cleanup_live_routes only covers the routes THIS
+                    # process tracked - geo routes the HELPER installed at
+                    # startup are NOT in _live_geo_added, and they live on
+                    # the PHYSICAL adapter (invisible to _teardown_wintun).
+                    # Within the ~5s close budget, whatever part of the
+                    # batched CIDR sweep completes helps; the detached
+                    # watchdog sweeps the remainder either way.
+                    app._sweep_geo_leftovers()
             except Exception as e:
                 # Best-effort only - the OS is killing us; still surface why.
                 print(f"[!] Ctrl-cleanup failed: {e}")

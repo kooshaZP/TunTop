@@ -63,8 +63,17 @@ _ERROR_INVALID_PARAMETER = 87
 DEFAULT_GRACE_SECONDS = 3.0
 
 #: Watchdog diagnostics land next to the crash marker (best-effort).
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        ".cleanup_watchdog.log")
+#: Frozen exe: __file__ sits in a throwaway per-run extraction dir, so the
+#: diary is parked next to TunTop.exe instead (same rule as MARKER_FILE /
+#: STATE_FILE) - otherwise every sweep runs INVISIBLY and a leftover-routes
+#: report can never be diagnosed.
+if getattr(sys, "frozen", False):
+    LOG_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(sys.executable)),
+        ".cleanup_watchdog.log")
+else:
+    LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            ".cleanup_watchdog.log")
 
 #: Live-session state sidecar (written by the dashboard whenever bypass /
 #: geo state changes, deleted on clean teardown). Read at sweep time so
