@@ -435,6 +435,26 @@ def main(argv=None) -> int:
     ap.add_argument("--grace", type=float, default=DEFAULT_GRACE_SECONDS)
     args = ap.parse_args(argv)
 
+    # Eager-import EVERYTHING the sweeps need BEFORE waiting. The sweeps
+    # used to import tuntop.network.routing lazily (inside the sweep
+    # functions) and the frozen exe paid for it: the routing import chain
+    # (base64/json/tempfile -> base_library.zip) ran AFTER the parent died,
+    # and if the child's _MEI extraction dir had been wiped in between the
+    # whole sweep died with Errno 2 on base_library.zip (observed in the
+    # field: geo+LAN sweeps no-op'd, marker still cleared -> looked like
+    # "cleanup works" while routes stayed). Loading everything now means
+    # the sweep only needs RAM, not the filesystem.
+    try:
+        import tuntop.network.routing as _routing  # noqa: F401
+        import base64 as _b64  # noqa: F401
+        import tempfile as _tf  # noqa: F401
+        from tuntop.geoip import parse_geoip as _pg  # noqa: F401
+        from tuntop.startup_recovery import scan as _scan  # noqa: F401
+        from tuntop.startup_recovery import recover as _recover  # noqa: F401
+    except Exception as _e:
+        _log(f"watchdog: eager import failed ({_e}) - sweeps may fail; "
+             "continuing so startup recovery can still clean up")
+
     try:
         wait_for_exit(args.pid)
         # Grace: a clean exit may still be tearing routes down right now
@@ -469,6 +489,25 @@ def main(argv=None) -> int:
     except Exception as e:
         _log(f"watchdog: unexpected failure: {e}")
         return 1
+    # Consume the sidecar: it described THIS session's live state and the
+    # session is over. Only delete when it still names the swept pid - a
+    # session started while we swept has rewritten it and owns the file.
+    try:
+        _sc_path = os.path.join(os.path.dirname(os.path.abspath(args.marker)),
+                                os.path.basename(STATE_FILE))
+        if os.path.isfile(_sc_path):
+            with open(_sc_path, "r", encoding="utf-8") as _f:
+                _sc = json.load(_f)
+            if int(_sc.get("pid", -1) or -1) == int(args.pid):
+                os.unlink(_sc_path)
+    except Exception:
+        pass
+
+    # Also retire a state file that outlived its session WITHOUT a sweep
+    # (clean exit / newer session): a stale sidecar would feed an old
+    # session's geo config to a future sweep. startup_recovery's marker
+    # protocol already decides whether a sweep runs - the sidecar must
+    # never be the stale half of that decision.
     return 0
 
 

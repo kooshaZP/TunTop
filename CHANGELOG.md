@@ -2,6 +2,22 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.18] - 2026-09-07
+
+### Fixed
+- **Alt+F4 cleanup actually works now** - the watchdog's geo/LAN sweeps
+  imported `tuntop.network.routing` lazily, AFTER the dashboard died; in
+  the frozen exe the import chain reads `base_library.zip` out of the
+  per-run `_MEI` extraction dir, which was already gone -> both sweeps
+  died with Errno 2, the crash marker was still cleared, and every live
+  geo/LAN bypass route stayed on the system (field-observed: 2,028 IR
+  routes + 7 LAN routes left behind). All sweep dependencies are now
+  eager-imported before the watchdog starts waiting, so the sweep needs
+  no filesystem at run time.
+- **`.cleanup_watchdog_state.json` lifecycle** - the sidecar is now
+  deleted after the sweep that consumed it (pid-matched) and on clean
+  exits; it no longer lingers in the exe folder forever.
+
 ## [1.0.17] - 2026-09-07
 
 ### Fixed

@@ -7965,6 +7965,22 @@ def main():
             # Verified clean exit: the crash marker goes away, so the NEXT
             # launch knows it starts from a clean slate.
             startup_recovery.clear_marker()
+            # Retire the watchdog state sidecar with the session: the file
+            # describes THIS run's live state; a clean exit means there is
+            # nothing left for the watchdog to sweep, and the user should
+            # not find a stale .cleanup_watchdog_state.json in the folder.
+            try:
+                _wd_state = os.path.join(
+                    os.path.dirname(os.path.abspath(sys.executable))
+                    if getattr(sys, "frozen", False) else
+                    os.path.normpath(os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "..", "core")),
+                    ".cleanup_watchdog_state.json")
+                if os.path.isfile(_wd_state):
+                    os.unlink(_wd_state)
+            except Exception:
+                pass
     atexit.register(_atexit_all)
     # Unicode glyphs are the default everywhere (CHANGELOG 1.0.4): the conhost
     # font/codepage fix-up in _enable_ansi() has already run by now, so a
