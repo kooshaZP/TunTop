@@ -6,6 +6,13 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-informational)](#requirements)
 [![Dependencies](https://img.shields.io/badge/pip%20deps-zero-brightgreen)](#features)
 
+## Topics
+
+`windows` · `vpn` · `proxy` · `socks5` · `tun2socks` · `wintun` · `full-tunnel` · `v2rayn` · `xray` · `sing-box` · `clash` · `vless` · `vmess` · `trojan` · `shadowsocks` · `geoip` · `dns-leak-protection` · `tui` · `dashboard` · `network-monitor` · `routing` · `privacy` · `censorship-circumvention` · `python`
+
+> Tip: add the same words as repo **Topics** (repo page → ⚙ About → Topics) so
+> TunTop is discoverable in GitHub search and topic pages.
+
 **A Windows full-tunnel for any SOCKS5 proxy.**
 
 v2rayN, Xray, sing-box, Clash Meta — any proxy client with a local SOCKS5 inbound works. TunTop gives you system-wide routing.
@@ -46,13 +53,18 @@ cd TunTop
 
 Install any SOCKS5-capable proxy client — e.g. [v2rayN](https://github.com/2dust/v2rayN), Xray, sing-box, or Clash Meta — and enable its local SOCKS inbound (default `127.0.0.1:10808`).
 
-### 3. Set the server (the VLESS proxy origin)
+### 3. Set the server (the proxy origin)
 
 TunTop also needs the address of your proxy's **origin server** — the remote
-VLESS/Xray server your local SOCKS5 client (v2rayN, etc.) connects to. This is
-the one address that must **NOT** go through the tunnel itself: TunTop routes
-it around the TUN automatically, but you have to tell it where the origin is.
-Pick **one** of these ways:
+server your local proxy client (v2rayN, Xray, sing-box, ...) connects to.
+
+**The protocol does not matter.** VLESS, VMess, Trojan, Shadowsocks, naive,
+Reality, WS/gRPC transports — TunTop never talks to that server and never sees
+your client's config. The only thing it consumes is the local SOCKS5 inbound
+your client exposes; the origin address is needed for exactly one purpose: it
+is the one address that must **NOT** go through the tunnel itself. TunTop
+routes it around the TUN automatically, but you have to tell it where the
+origin is. Pick **one** of these ways:
 
 - **Edit `Run_Helper.ps1`** — set the `$Servers` line near the top:
 
@@ -69,11 +81,12 @@ Pick **one** of these ways:
   ```
 
 - **Live in the dashboard** — press `[U]` (Servers) and type the address(es),
-  comma or space separated. **A full share link works too**: pasting something
-  like `vless://uuid@203.0.113.10:443?type=ws...` or `https://example.com/...`
-  is fine — TunTop strips the scheme, UUID/userinfo, port and path and keeps
-  only the host. Changes made with `[U]` are resolved immediately and take
-  effect on the next tunnel start (`[S]`).
+  comma or space separated — or ADD them to the existing list. **A full share
+  link works too**: pasting something like `vless://uuid@203.0.113.10:443?type=ws...`,
+  `trojan://...`, `ss://...` or `https://example.com/...` is fine — TunTop
+  strips the scheme, UUID/userinfo, port and path and keeps only the host,
+  whatever the protocol. Changes made with `[U]` are resolved immediately and
+  take effect on the next tunnel start (`[S]`).
 
 **Why the origin never goes through the TUN:** for every address you list,
 TunTop resolves it (both IPv4 and IPv6) and installs explicit host routes
@@ -122,8 +135,7 @@ Press **[S]** to start the tunnel, **[C]** to run a health scan, **[L]** for a l
    `tun2socks` and `wintun.dll`; nothing else is bundled, and Python is **not**
    required.
 2. **(Optional) verify it:** `certutil -hashfile TunTop.exe SHA256` and compare
-   with `checksums.txt`. If your antivirus deletes it, see
-   [Troubleshooting](#troubleshooting) — restore + exclude, then continue.
+   with `checksums.txt`.
 3. **Run it:** double-click `TunTop.exe` → confirm the **UAC prompt** (the
    dashboard manages routes and a TUN adapter, so admin is mandatory). A
    btop-style dashboard opens. Missing files are fetched automatically on
@@ -139,9 +151,9 @@ Press **[S]** to start the tunnel, **[C]** to run a health scan, **[L]** for a l
 
 The dashboard edits a RUNNING tunnel in place:
 
-- **[U] Servers** — switch the VLESS upstream server live: pick from the list
-  (arrow keys / mouse, Enter to apply). Add/edit entries first if the list is
-  empty or wrong.
+- **[U] Servers** — switch/add the proxy origin server live: pick from the list
+  (arrow keys / mouse, Enter to apply), or replace / add addresses. The
+  origin's protocol is irrelevant — only its host/IP is used.
 - **[E] Endpoint** — change the endpoint port (e.g. 443) live.
 - **[P] Port** — change the local SOCKS5 port live.
 - **[N] DNS** — change the tunnel DNS servers live.
