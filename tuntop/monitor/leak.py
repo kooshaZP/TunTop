@@ -34,7 +34,11 @@ def as_check_result(status, message):
     fault (see the verdict table in tuntop/network/leak_probe.py).
     "same-exit" also passes: the direct leg's address differs from the
     tunnel exit's but belongs to the SAME network - both legs rode the
-    tunnel and the exit rotated its outbound address between connections."""
-    if status in ("inconclusive", "same-exit"):
+    tunnel and the exit rotated its outbound address between connections.
+    "v6-side" also passes: the forced-IPv4 re-probe matched the tunnel
+    exit, so IPv4 (what the TUN routes) does not leak; the plain direct
+    leg merely answered over a different family (native/VPN-provided
+    IPv6), which the detail message explains."""
+    if status in ("inconclusive", "same-exit", "v6-side"):
         return True, message
     return status == "ok", message

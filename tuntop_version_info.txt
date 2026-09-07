@@ -19,12 +19,12 @@ VSVersionInfo(
       StringTable('040904B0', [
         StringStruct('CompanyName', 'kooshaZP'),
         StringStruct('FileDescription', 'TunTop - VLESS full-tunnel VPN dashboard (tun2socks + Wintun)'),
-        StringStruct('FileVersion', '1.0.12'),
+        StringStruct('FileVersion', '1.0.13'),
         StringStruct('InternalName', 'TunTop'),
         StringStruct('LegalCopyright', '(c) 2026 kooshaZP. MIT licensed.'),
         StringStruct('OriginalFilename', 'TunTop.exe'),
         StringStruct('ProductName', 'TunTop'),
-        StringStruct('ProductVersion', '1.0.12'),
+        StringStruct('ProductVersion', '1.0.13'),
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])]),

@@ -2,6 +2,26 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.13] - 2026-09-07
+
+### Fixed
+- **Typed keys echo / app stops responding (intermittent)**: every
+  child process sharing the console (each `powershell.exe` the route
+  sweeps and telemetry spawn, the helper, AV scanners) can reset the
+  shared stdin handle's console mode to its own default (line + echo).
+  That stomp persists after the child exits: typed characters are then
+  echoed by the host's line discipline while the dashboard stops seeing
+  them normally. A per-frame console-mode watchdog now detects the stomp,
+  re-applies the dashboard's input mode, and logs it once.
+- **False "Tunnel leak test" failure with IPv6**: the direct probe leg
+  answered over IPv6 (native/VPN-provided v6, e.g. a WARP-class address)
+  while the tunnel leg exited over IPv4; the cross-family comparison
+  always failed and was reported as a LEAK. Mixed-family results now
+  trigger a forced-IPv4 re-probe: v4-vs-v4 matching passes with an
+  explicit "IPv6 leaves via a different path" note (new `v6-side`
+  verdict), a real v4 mismatch still fails, and a mute re-probe reports
+  inconclusive.
+
 ## [1.0.12] - 2026-09-07
 
 ### Fixed

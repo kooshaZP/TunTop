@@ -61,6 +61,7 @@ __all__ = ["run_leak_probe", "LEAK_TIMEOUT"]
 
 # How long one echo attempt may take, and therefore the practical upper
 # bound of the whole probe (both legs run concurrently).
+_LEAK_V4_TIMEOUT = 3.0
 LEAK_TIMEOUT = 5.0
 
 # Prefix length under which two different addresses count as "the same
@@ -174,6 +175,31 @@ def _fetch_direct(scheme, host, path, timeout):
     port = 443 if scheme == "https" else 80
     with socket.create_connection((host, port), timeout=timeout) as sock:
         return _http_get(sock, scheme, host, path, timeout)
+
+
+def _fetch_direct_v4(scheme, host, path, timeout):
+    """_fetch_direct constrained to IPv4: resolve the host's A record and
+    connect to it by literal IP (SNI/Host still the hostname).  Used when
+    the plain direct leg answers over a DIFFERENT family than the tunnel
+    leg - the TUN routes IPv4, so the honest comparison is v4 vs v4."""
+    port = 443 if scheme == "https" else 80
+    infos = [(ai[0], ai[4]) for ai in socket.getaddrinfo(host, port)
+             if ai[0] == socket.AF_INET]
+    if not infos:
+        raise OSError(f"{host}: no IPv4 address")
+    last = None
+    for _fam, sa in infos[:3]:
+        try:
+            with socket.create_connection((sa[0], port), timeout=timeout) as sock:
+                if scheme == "https":
+                    import ssl as _ssl
+                    ctx = _ssl.create_default_context()
+                    return _http_get(ctx.wrap_socket(sock, server_hostname=host),
+                                     scheme, host, path, timeout)
+                return _http_get(sock, scheme, host, path, timeout)
+        except OSError as e:
+            last = e
+    raise last or OSError(f"{host}: IPv4 connect failed")
 
 
 def _socks5_connect(socks_port, host, dst_port, timeout):
@@ -298,6 +324,36 @@ def _verdict(direct, tunnel, socks_port):
             f"belong to the SAME network (/{_PREFIX_LEN}): both legs exited "
             "through the tunnel; the exit server rotated its outbound address "
             "between the two connections. Your real IP was NOT exposed.")
+    # Mixed families (direct answered v6, tunnel exited v4 - or reverse):
+    # a cross-family /32 compare is ALWAYS False, which used to produce a
+    # bogus "LEAK" whenever the machine had native/VPN-provided IPv6. The
+    # TUN routes IPv4, so re-probe the direct leg forced to IPv4 and make
+    # the honest v4-vs-v4 comparison; the v6 divergence is reported as its
+    # own informational verdict.
+    try:
+        fam_d = ipaddress.ip_address(dip).version
+        fam_t = ipaddress.ip_address(tip).version
+    except ValueError:
+        fam_d = fam_t = 0
+    if fam_d != fam_t:
+        v4 = _race_leg(_fetch_direct_v4, _LEAK_V4_TIMEOUT)
+        if v4["ip"]:
+            if v4["ip"] == tip or _same_network(v4["ip"], tip):
+                return "v6-side", (
+                    f"no IPv4 leak - direct IPv4 egress {v4['ip']} rides the "
+                    f"tunnel exit {tip}. The plain direct leg answered over "
+                    f"IPv6 ({dip}), i.e. IPv6 leaves via a DIFFERENT path "
+                    "(native or VPN-provided v6 that the TUN does not route). "
+                    "IPv4-only clients leak nothing; to cover v6 too, block "
+                    "or route IPv6 as well.")
+            return "leak", (f"LEAK: direct IPv4 egress {v4['ip']} != tunnel "
+                            f"exit {tip} (re-probed v4-vs-v4 after the first "
+                            f"direct leg answered over v6 {dip}) - IPv4 "
+                            "traffic escapes the TUN.")
+        return "inconclusive", (
+            f"tunnel exit {tip}, direct leg answered over IPv6 ({dip}) and "
+            "the forced-IPv4 re-probe got no answer - leak state unknown "
+            "(the tunnel itself works)")
     return "leak", (f"LEAK: direct egress {dip} != tunnel exit {tip} - the two "
                     "addresses belong to DIFFERENT networks, so direct traffic "
                     "escapes outside the TUN and shows your real IP "

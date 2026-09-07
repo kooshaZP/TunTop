@@ -6179,6 +6179,37 @@ class BTopTui:
 
         try:
             while self.running:
+                # Console-MODE WATCHDOG: every child process that shares this
+                # console (each powershell.exe the sweeps spawn, the helper,
+                # AV scanners) initialises the shared stdin handle with ITS
+                # own default mode - line+echo - and that stomp PERSISTS
+                # after the child exits. Once stomped, typed keys are echoed
+                # by the host's line discipline and stop reaching the
+                # dashboard the way raw reads expect ("I type and it shows
+                # on the UI but the app doesn't respond"). A GetConsoleMode
+                # check per frame is effectively free; re-apply our mode and
+                # say so (once per incident) when a stomp is detected.
+                if self._mouse_ok and self._dash_mode is not None:
+                    try:
+                        _k32 = ctypes.windll.kernel32
+                        _m = ctypes.c_uint32()
+                        if _k32.GetConsoleMode(self._stdin_handle,
+                                               ctypes.byref(_m)) and \
+                                _m.value != self._dash_mode:
+                            _k32.SetConsoleMode(self._stdin_handle,
+                                                self._dash_mode)
+                            if not getattr(self, "_mode_stomp_logged", False):
+                                self.log_lines.append(
+                                    "[i] Console input mode was changed by "
+                                    "another process - re-applied the "
+                                    "dashboard's input mode (keys/mouse "
+                                    "should respond again).")
+                                self._mode_stomp_logged = True
+                        elif _m.value == self._dash_mode:
+                            self._mode_stomp_logged = False
+                    except Exception:
+                        pass
+
                 # Delayed mouse re-init (see _mouse_retry_at above).
                 if not self._mouse_ok and not self._mouse_retry_done and \
                         time.time() >= _mouse_retry_at:
