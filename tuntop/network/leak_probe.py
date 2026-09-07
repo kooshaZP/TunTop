@@ -164,6 +164,7 @@ def _http_get(sock, scheme, host, path, timeout):
            f"Host: {host}\r\n"
            f"User-Agent: {_UA}\r\n"
            "Accept: */*\r\n"
+           "Accept-Encoding: identity\r\n"
            "Connection: close\r\n\r\n").encode("ascii")
     sock.sendall(req)
     buf = b""
@@ -314,6 +315,44 @@ def _race_leg(fetcher, timeout):
     return out
 
 
+def _sequential_leg(fetcher, timeout):
+    """Thread-free fallback for _race_leg(): try the echo endpoints ONE BY
+    ONE (first validated IP wins, same discard rules).
+
+    Exists for environments where the thread pool itself is unavailable -
+    notably the frozen exe, whose FIRST `concurrent.futures.thread` import
+    happens inside the probe (module-level __getattr__ lazy import) and
+    decompresses a PYZ entry with zlib; a damaged/tampered archive raises
+    zlib.error ("Error -3 ... incorrect header check") exactly there, which
+    used to escape every per-endpoint handler and crash the [L] test."""
+    out = {"ip": None, "err": None, "ms": 0}
+    t0 = time.time()
+    for scheme, host, path in _ECHO_ENDPOINTS:
+        try:
+            body = fetcher(scheme, host, path, timeout)
+        except Exception as e:
+            if out["err"] is None:
+                out["err"] = f"{host}: {e}"
+            continue
+        ip = _valid_ip(body)
+        if ip:
+            out["ip"] = ip
+            break
+    out["ms"] = int((time.time() - t0) * 1000)
+    return out
+
+
+def _race_leg_or_sequential(fetcher, timeout):
+    """_race_leg(), but immune to a thread-pool failure outside the
+    per-endpoint handlers: if the executor cannot be created/used (frozen
+    exe lazy import failing, thread exhaustion, ...), retry the endpoints
+    sequentially. The leak probe must produce a VERDICT, never crash."""
+    try:
+        return _race_leg(fetcher, timeout)
+    except Exception:
+        return _sequential_leg(fetcher, timeout)
+
+
 def _verdict(direct, tunnel, socks_port):
     """Map (direct_leg, tunnel_leg) onto (status, message)."""
     dip, tip = direct["ip"], tunnel["ip"]
@@ -350,7 +389,7 @@ def _verdict(direct, tunnel, socks_port):
     except ValueError:
         fam_d = fam_t = 0
     if fam_d != fam_t:
-        v4 = _race_leg(_fetch_direct_v4, _LEAK_V4_TIMEOUT)
+        v4 = _race_leg_or_sequential(_fetch_direct_v4, _LEAK_V4_TIMEOUT)
         if v4["ip"]:
             if v4["ip"] == tip or _same_network(v4["ip"], tip):
                 return "v6-side", (
@@ -383,16 +422,27 @@ def run_leak_probe(socks_port, timeout=LEAK_TIMEOUT):
 
     The two legs are joined here with result(), but that is bounded:
     _race_leg() always returns within ~timeout + 2 regardless of whether
-    its worker threads are still stuck (see its timeout-bounding note)."""
+    its worker threads are still stuck (see its timeout-bounding note).
+
+    Resilience: a failure of the THREADING machinery itself (outside the
+    per-endpoint handlers _race_leg already has) - e.g. the frozen exe's
+    lazy `concurrent.futures.thread` import decompressing a damaged PYZ
+    entry (zlib.error "incorrect header check") - is caught here and both
+    legs are re-run SEQUENTIALLY, so [L] always returns a verdict."""
     socks_port = int(socks_port)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        f_direct = ex.submit(_race_leg, _fetch_direct, timeout)
-        f_tunnel = ex.submit(
-            _race_leg,
-            lambda s, h, p, t: _fetch_via_socks(socks_port, s, h, p, t),
-            timeout)
-        direct = f_direct.result()
-        tunnel = f_tunnel.result()
+
+    def _tunnel(scheme, host, path, t):
+        return _fetch_via_socks(socks_port, scheme, host, path, t)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            f_direct = ex.submit(_race_leg, _fetch_direct, timeout)
+            f_tunnel = ex.submit(_race_leg, _tunnel, timeout)
+            direct = f_direct.result()
+            tunnel = f_tunnel.result()
+    except Exception:
+        direct = _sequential_leg(_fetch_direct, timeout)
+        tunnel = _sequential_leg(_tunnel, timeout)
     status, message = _verdict(direct, tunnel, socks_port)
     return status, message, {"direct": direct, "tunnel": tunnel}
 

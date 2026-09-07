@@ -2,6 +2,22 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.16] - 2026-09-07
+
+### Fixed
+- **Leak test crashed: "error: Error -3 while decompressing data:
+  incorrect header check"** - the [L] test died on a `zlib.error` that
+  came from the threading machinery itself, not from any endpoint: in the
+  frozen exe the FIRST `concurrent.futures.thread` import happens inside
+  `run_leak_probe` (lazy module `__getattr__`), and PyInstaller's importer
+  zlib-decompresses the PYZ entry there - a damaged/tampered archive
+  raised exactly there, outside every per-endpoint handler. `run_leak_probe`
+  now catches a failed threaded race and re-runs BOTH legs SEQUENTIALLY
+  (thread-free), so the leak test always returns a verdict; the
+  mixed-family IPv4 re-probe inside the verdict uses the same resilient
+  wrapper. The echo requests also pin `Accept-Encoding: identity` so no
+  middlebox can compress the body the IP is parsed from.
+
 ## [1.0.15] - 2026-09-07
 
 ### Fixed

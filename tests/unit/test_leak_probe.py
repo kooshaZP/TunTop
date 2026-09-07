@@ -11,6 +11,8 @@ import os
 import time
 import threading
 import unittest
+import zlib
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
@@ -224,6 +226,104 @@ class TestRaceStragglerBound(unittest.TestCase):
         # The wait budget is timeout + 2; assert we returned close to it
         # instead of blocking for the (unbounded) hang duration.
         self.assertLess(dt, 4.0, f"race leg joined the hung thread ({dt:.1f}s)")
+
+class TestThreadedPathResilience(unittest.TestCase):
+    """Regression: the dashboard's [L] test crashed with
+    "error: Error -3 while decompressing data: incorrect header check"
+    (zlib.error) - the frozen exe's FIRST concurrent.futures.thread import
+    happens inside run_leak_probe (lazy module __getattr__) and PyInstaller's
+    importer zlib-decompresses the PYZ entry there; a damaged entry escaped
+    every per-endpoint handler. The probe must fall back to a thread-free
+    sequential probe and still return a verdict."""
+
+    def _broken_executor_ns(self):
+        class _BrokenThreadPool:
+            def __init__(self, *a, **k):
+                raise zlib.error(
+                    "Error -3 while decompressing data: incorrect header check")
+        return SimpleNamespace(futures=SimpleNamespace(
+            ThreadPoolExecutor=_BrokenThreadPool))
+
+    def test_per_endpoint_zlib_error_is_swallowed(self):
+        # A zlib.error raised by a single echo endpoint is just another
+        # endpoint failure - recorded as leg err, never propagated.
+        def zlib_fetch(scheme, host, path, timeout):
+            raise zlib.error("Error -3 while decompressing data: "
+                             "incorrect header check")
+        out = L._race_leg(zlib_fetch, timeout=1)
+        self.assertIsNone(out["ip"])
+        self.assertIn("incorrect header check", out["err"])
+
+    def test_run_leak_probe_survives_broken_executor(self):
+        # The whole threaded race failing (executor construction raises
+        # zlib.error) must fall back to the sequential probe, not crash.
+        def fake_direct(scheme, host, path, timeout):
+            return "9.9.9.9"
+
+        def fake_tunnel(socks_port, scheme, host, path, timeout):
+            return "1.1.1.1"
+
+        with mock.patch.object(L, "concurrent", self._broken_executor_ns()), \
+             mock.patch.object(L, "_fetch_direct", fake_direct), \
+             mock.patch.object(L, "_fetch_via_socks", fake_tunnel), \
+             mock.patch.object(L, "_ECHO_ENDPOINTS",
+                               [("https", "one.example", "/")]):
+            status, msg, legs = L.run_leak_probe(10808)
+        self.assertEqual(status, "leak")     # 9.9.9.9 != 1.1.1.1 -> real verdict
+        self.assertEqual(legs["direct"]["ip"], "9.9.9.9")
+        self.assertEqual(legs["tunnel"]["ip"], "1.1.1.1")
+
+    def test_verdict_reprobe_survives_race_failure(self):
+        # The mixed-family IPv4 re-probe inside _verdict uses the same
+        # resilient wrapper - a broken race must not crash the verdict.
+        with mock.patch.object(L, "_race_leg",
+                               side_effect=zlib.error("broken pool")), \
+             mock.patch.object(L, "_fetch_direct_v4",
+                               lambda s, h, p, t: "9.9.9.9"):
+            status, msg = L._verdict(_leg("2606:4700::1111"),
+                                     _leg("1.1.1.1"), 10808)
+        self.assertEqual(status, "leak")
+        self.assertIn("9.9.9.9", msg)
+
+    def test_sequential_leg_first_valid_ip_wins(self):
+        calls = []
+
+        def fake_fetch(scheme, host, path, timeout):
+            calls.append(host)
+            if host == "one.example":
+                raise OSError("blocked")
+            return "4.3.2.1"
+
+        with mock.patch.object(L, "_ECHO_ENDPOINTS",
+                               [("https", "one.example", "/"),
+                                ("http", "two.example", "/")]):
+            out = L._sequential_leg(fake_fetch, timeout=1)
+        self.assertEqual(out["ip"], "4.3.2.1")
+        self.assertEqual(calls, ["one.example", "two.example"])  # sequential
+
+    def test_http_get_requests_identity_encoding(self):
+        class _FakeSock:
+            def __init__(self):
+                self.sent = b""
+                self.response = (b"HTTP/1.1 200 OK\r\n"
+                                 b"Content-Type: text/plain\r\n"
+                                 b"\r\n1.2.3.4")
+
+            def settimeout(self, t):
+                pass
+
+            def sendall(self, data):
+                self.sent += data
+
+            def recv(self, n):
+                out, self.response = self.response, b""
+                return out
+
+        sock = _FakeSock()
+        body = L._http_get(sock, "http", "h.example", "/", timeout=1)
+        self.assertEqual(body, "1.2.3.4")
+        # Middleboxes must never gzip the echo body: ask for identity.
+        self.assertIn(b"Accept-Encoding: identity\r\n", sock.sent)
 
 
 if __name__ == "__main__":
