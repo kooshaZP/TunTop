@@ -1918,14 +1918,14 @@ class BTopTui:
             if now - self._vpn_cache_ts >= 4.0:
                 self._vpn_cache_ts = now
                 self._vpn_status = get_vpn_status()
-        # VPN ARRIVAL reconciliation (every ~10s): the moment a Windows VPN
+        # VPN ARRIVAL reconciliation (every ~5s): the moment a Windows VPN
         # appears, everything that wanted it but found nothing at apply time
         # is re-applied - [vpn]-tagged bypass entries stuck at "[route
         # pending]" and geo-via-VPN requests that aborted with "no connected
         # Windows VPN". Disappearance needs no action: the VPN's own routes
         # vanish with the adapter; the pending-state machinery re-fires on
         # its own the next time the VPN connects.
-        if now - getattr(self, "_vpn_recon_ts", 0.0) >= 10.0:
+        if now - getattr(self, "_vpn_recon_ts", 0.0) >= 5.0:
             self._vpn_recon_ts = now
             vpn_up = bool(self._vpn_status)
             was_up = getattr(self, "_vpn_was_up", False)

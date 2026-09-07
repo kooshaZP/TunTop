@@ -25,7 +25,7 @@ All notable changes to TunTop are documented here.
   direct · Shirazu-VPN" with a red dot while disconnected.
 - **VPN-arrival auto-apply** - when a Windows VPN connects while TunTop is
   running, pending [vpn] bypass entries and an unapplied geo-via-VPN
-  request are re-applied automatically (~10s detection cadence).
+  request are re-applied automatically (~5s detection cadence).
 - **Third-party VPN status** - get_vpn_status() now falls back to
   VPN-pattern adapters (Get-VpnConnection misses clients like "VPN Client
   Adapter - VPN"), matching what the route lookup finds.
