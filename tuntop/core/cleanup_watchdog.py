@@ -70,8 +70,16 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 #: geo state changes, deleted on clean teardown). Read at sweep time so
 #: bypasses the user added LIVE (dashboard [A]/[F] dialogs, after the
 #: watchdog was spawned with the startup args) are cleaned too.
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          ".cleanup_watchdog_state.json")
+if getattr(sys, "frozen", False):
+    # Frozen exe: the dashboard parks the sidecar next to TunTop.exe (its
+    # own __file__ lives in a throwaway extraction dir, and so does ours -
+    # this file's directory is NOT where the dashboard wrote it).
+    STATE_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(sys.executable)),
+        ".cleanup_watchdog_state.json")
+else:
+    STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              ".cleanup_watchdog_state.json")
 
 
 _LOG_SEEN: set = set()

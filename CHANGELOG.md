@@ -13,6 +13,18 @@ All notable changes to TunTop are documented here.
   echoed by the host's line discipline while the dashboard stops seeing
   them normally. A per-frame console-mode watchdog now detects the stomp,
   re-applies the dashboard's input mode, and logs it once.
+- **Routes left on the system after Alt+F4**: in the packaged exe the
+  watchdog's live-session sidecar (`.cleanup_watchdog_state.json`) was
+  written to and read from per-run PyInstaller extraction dirs - the
+  detached watchdog could never see the dashboard's live-added hosts
+  (bypass entries, geo config), so its post-unclean-exit sweep missed
+  them. Both sides now park the sidecar next to TunTop.exe (same rule as
+  the crash marker). The Ctrl-close handler also runs the fast batched
+  route deletes first, so a close that outruns its ~5s budget cannot cut
+  the important part short.
+- **CodeQL alerts**: explicit shared TLS context (TLS 1.2+ minimum,
+  system CAs, hostname verification) for the leak probe's echo fetches;
+  `permissions: contents: read` added to the CI workflow.
 - **False "Tunnel leak test" failure with IPv6**: the direct probe leg
   answered over IPv6 (native/VPN-provided v6, e.g. a WARP-class address)
   while the tunnel leg exited over IPv4; the cross-family comparison

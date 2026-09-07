@@ -3995,9 +3995,18 @@ class BTopTui:
         added - including bypasses and geo config chosen AFTER launch
         (the watchdog only got the startup args). Best-effort, tiny file."""
         try:
-            path = os.path.normpath(os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "..", "core", ".cleanup_watchdog_state.json"))
+            if getattr(sys, "frozen", False):
+                # Frozen exe: __file__ sits in a throwaway per-run extraction
+                # dir the watchdog child can never see (it extracts its own).
+                # Park the sidecar next to TunTop.exe - stable across runs,
+                # same rule as the crash marker in startup_recovery.
+                path = os.path.join(
+                    os.path.dirname(os.path.abspath(sys.executable)),
+                    ".cleanup_watchdog_state.json")
+            else:
+                path = os.path.normpath(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "core", ".cleanup_watchdog_state.json"))
             data = {
                 "pid": os.getpid(),
                 "hosts": list(dict.fromkeys(
@@ -7735,13 +7744,25 @@ def main():
 
     try:
         def _ctrl(ct):
+            # CTRL_CLOSE_EVENT (Alt+F4 / [X]) grants only ~5s before the OS
+            # hard-kills us. Order matters: the FAST batched netsh deletes of
+            # live routes run FIRST (they are what actually pollutes the
+            # table); the multi-second PowerShell teardown comes after and is
+            # allowed to be cut short - a killed _teardown_wintun is harmless
+            # (the adapter dies with the process tree), a killed route delete
+            # is not (routes outlive us). The detached watchdog sweeps the
+            # remainder either way (marker survives: atexit does not run
+            # after this handler returns).
             try:
                 if app is not None:
                     app._cleanup_live_routes()
             except Exception as e:
                 # Best-effort only - the OS is killing us; still surface why.
                 print(f"[!] Ctrl-cleanup failed: {e}")
-            _teardown_wintun()
+            try:
+                _teardown_wintun()
+            except Exception:
+                pass
             return False
         wf = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint32)
         # Keep the function pointer alive in module state so Python's GC can't

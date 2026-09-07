@@ -103,6 +103,23 @@ _ECHO_ENDPOINTS = [
 
 _UA = "tuntop-leak/1.0"
 
+#: Shared TLS context for the IP-echo fetches: system-trusted CAs, hostname
+#: verification ON, TLS 1.2+ only. One explicit context (not bare
+#: ssl.wrap_socket) is both the secure construction and what static
+#: analysers (CodeQL "use of insecure SSL/TLS version") require to see the
+#: protocol floor is pinned.
+_SSL_CONTEXT = ssl.create_default_context()
+if hasattr(ssl, "TLSVersion"):
+    try:
+        _SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+    except Exception:
+        pass
+
+
+def _tls_wrap(sock, host):
+    """Server-authenticated TLS over an already-connected socket."""
+    return _SSL_CONTEXT.wrap_socket(sock, server_hostname=host)
+
 
 def _valid_ip(text):
     """Return the parsed IP string, or None if *text* is not a bare IP.
@@ -141,8 +158,7 @@ def _http_get(sock, scheme, host, path, timeout):
     error; non-200 replies raise too (a 301 to HTTPS or a portal's 302
     carries no usable IP)."""
     if scheme == "https":
-        sock = ssl.create_default_context().wrap_socket(
-            sock, server_hostname=host)
+        sock = _tls_wrap(sock, host)
     sock.settimeout(timeout)
     req = (f"GET {path} HTTP/1.1\r\n"
            f"Host: {host}\r\n"
@@ -192,9 +208,7 @@ def _fetch_direct_v4(scheme, host, path, timeout):
         try:
             with socket.create_connection((sa[0], port), timeout=timeout) as sock:
                 if scheme == "https":
-                    import ssl as _ssl
-                    ctx = _ssl.create_default_context()
-                    return _http_get(ctx.wrap_socket(sock, server_hostname=host),
+                    return _http_get(_tls_wrap(sock, host),
                                      scheme, host, path, timeout)
                 return _http_get(sock, scheme, host, path, timeout)
         except OSError as e:
