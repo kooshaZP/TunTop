@@ -251,9 +251,19 @@ _ACTIVE_BG = ""   # set by _arm_bg(); "" = terminal default (bg off)
 def _arm_bg():
     """Arm the ACTIVE theme's background; returns the SGR (may be empty).
     Also refreshes _R so every later span end re-arms THIS theme's bg."""
-    global _ACTIVE_BG, _R
+    global _ACTIVE_BG, _R, DOT_OK, DOT_WARN, DOT_FAIL, DOT_IDLE
     _ACTIVE_BG = THEMES[ACTIVE_THEME].get("bg", "")
     _R = "\033[0m" + _ACTIVE_BG
+    # The status dots embed _R, and _apply_glyphs() captured them at startup
+    # - BEFORE the first frame ever armed the theme bg - so every row that
+    # starts with a dot (VPN / GEO / bypass entries / "none yet") painted a
+    # terminal-default BLACK cell from the dot glyph up to the next _R in the
+    # row. They were also frozen on the startup theme after an [M] switch.
+    # Rebuild them here so they always carry the ACTIVE theme's background.
+    DOT_OK   = GREEN + DOT_GLYPH + _R
+    DOT_WARN = YELLOW + DOT_GLYPH + _R
+    DOT_FAIL = RED + DOT_GLYPH + _R
+    DOT_IDLE = GRAY + DOT_GLYPH + _R
     return _ACTIVE_BG
 
 

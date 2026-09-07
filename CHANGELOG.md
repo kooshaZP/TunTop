@@ -2,6 +2,18 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.15] - 2026-09-07
+
+### Fixed
+- **Black background cells behind the status dots (VPN / GEO / bypass
+  rows)**: the dot constants (●) embedded the shared span-end reset that
+  was captured at STARTUP - before the first frame ever armed the theme
+  background - so every row that begins with a dot repainted a
+  terminal-default black cell from the glyph up to the next reset, in
+  every theme that sets a background (and stayed on the startup theme
+  after an [M] switch). `_arm_bg()` now rebuilds the dots each frame so
+  they always re-arm the ACTIVE theme's background.
+
 ## [1.0.14] - 2026-09-07
 
 ### Added

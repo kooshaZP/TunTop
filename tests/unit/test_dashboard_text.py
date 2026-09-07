@@ -66,6 +66,43 @@ class TestHslice(unittest.TestCase):
         self.assertEqual(dashboard._hslice("abc", 10, 3), "")
 
 
+class TestStatusDotBackground(unittest.TestCase):
+    """Regression: the status dots (DOT_OK/DOT_WARN/DOT_FAIL/DOT_IDLE) were
+    captured once at _apply_glyphs() time - BEFORE the first _arm_bg() armed
+    the theme background - so every row that starts with a dot (VPN / GEO /
+    bypass entries / "none yet") painted a terminal-default BLACK cell from
+    the dot glyph up to the next _R in the row, in every theme that sets a
+    background. _arm_bg() must rebuild the dots so they always embed the
+    ACTIVE theme's bg (also after an [M] theme switch)."""
+
+    def tearDown(self):
+        dashboard.ACTIVE_THEME = 0
+        dashboard._arm_bg()
+
+    def test_dots_lack_bg_before_first_arm(self):
+        # Simulate the true startup order: at import time _R is a bare reset
+        # (the line-444 placeholder runs before _arm_bg() ever does), so
+        # _apply_glyphs() captures exactly that bg-less _R into the dots.
+        with mock.patch.object(dashboard, "_R", "\x1b[0m"):
+            dashboard._apply_glyphs(True)
+        bg = dashboard.THEMES[dashboard.ACTIVE_THEME]["bg"]
+        self.assertNotIn(bg, dashboard.DOT_OK)
+
+    def test_arm_bg_rebuilds_dots_with_active_theme_bg(self):
+        dashboard._apply_glyphs(True)
+        for idx in range(len(dashboard.THEMES)):
+            dashboard.ACTIVE_THEME = idx
+            dashboard._arm_bg()
+            bg = dashboard.THEMES[idx]["bg"]
+            for dot in (dashboard.DOT_OK, dashboard.DOT_WARN,
+                        dashboard.DOT_FAIL, dashboard.DOT_IDLE):
+                # The dot's trailing reset re-arms THIS theme's background.
+                self.assertTrue(dot.endswith("\x1b[0m" + bg),
+                                f"dot {dot!r} does not re-arm theme {idx} bg")
+
+
+if __name__ == "__main__":
+    unittest.main()
 class TestHpad(unittest.TestCase):
     def test_short_text_right_padded(self):
         self.assertEqual(dashboard._hpad("ab", 5), "ab   ")
