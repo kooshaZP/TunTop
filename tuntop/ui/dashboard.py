@@ -1333,22 +1333,21 @@ def get_vpn_status():
     built-in VPN connections; third-party clients (their adapters often named
     like 'VPN Client Adapter - VPN') are caught by the adapter fallback, so
     the dashboard shows the same VPN the helper's route lookup finds."""
+    # ONE PowerShell spawn for both sources (Get-VpnConnection, then the
+    # third-party adapter fallback): the dashboard used to make two spawns
+    # every sample (~2x the process churn on machines where every
+    # powershell.exe start costs 1-3s - AV real-time scanning).
     ok, out = _ps(
-        "@(@(Get-VpnConnection -AllUserConnection -EA SilentlyContinue) + "
+        "$n = @(@(Get-VpnConnection -AllUserConnection -EA SilentlyContinue) + "
         "@(Get-VpnConnection -EA SilentlyContinue)) | "
-        "? ConnectionStatus -eq 'Connected' | Select-Object -First 1 | % {$_.Name}")
-    if ok:
-        name = out.strip()
-        if name:
-            return name
-    ok2, out2 = _ps(
-        "(Get-NetAdapter -EA SilentlyContinue | "
+        "? ConnectionStatus -eq 'Connected' | Select-Object -First 1 | % {$_.Name}; "
+        "if (-not $n) { $n = (Get-NetAdapter -EA SilentlyContinue | "
         "? {$_.Status -eq 'Up' -and $_.InterfaceAlias -ne 'wintun' -and "
         "$_.InterfaceDescription -notmatch 'Wintun' -and "
         "$_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'} | "
-        "Select-Object -First 1).InterfaceAlias")
-    if ok2:
-        name = out2.strip()
+        "Select-Object -First 1).InterfaceAlias }; $n")
+    if ok:
+        name = out.strip()
         if name:
             return name
     return None
@@ -1816,6 +1815,7 @@ class BTopTui:
         # the app is unresponsive and I can't start it again or exit".
         self._teardown_lock = threading.Lock()
         self._stopping = threading.Event()   # set while ANY stop/teardown runs
+        self._start_after_stop = False       # [S] queued while a stop is running
 
         # Live-reconfiguration support
         self._iface_cache = None        # cached (interface, gateway) for live bypass-route adds
@@ -1912,20 +1912,33 @@ class BTopTui:
         # VPN - every 4 s. Sample whenever ANY VPN-dependent feature cares:
         # [V] vless-over-vpn, geo-via-VPN, or VPN-bypass display. The status
         # feeds the top-bar chip (red on disconnect) and the live adapter name.
+        # NEVER sample (or re-apply anything) while a stop/teardown is
+        # running: every spawn competes with the route sweep's PowerShell
+        # work and stretches the "stop still in progress" window out - the
+        # "[T] then the app feels frozen" report. Sampling resumes the next
+        # tick after the sweep finishes; the chip shows DOWN meanwhile.
+        stopping = self._stopping.is_set()
         if getattr(self.ns, "vless_over_vpn", False) or \
                 getattr(self.ns, "geoip", None) or \
                 not getattr(self.ns, "no_vpn_bypass", False):
-            if now - self._vpn_cache_ts >= 4.0:
+            if not stopping and now - self._vpn_cache_ts >= 4.0:
                 self._vpn_cache_ts = now
                 self._vpn_status = get_vpn_status()
+            elif stopping:
+                # Keep the cadence anchors fresh so the first post-stop
+                # sample isn't immediately due mid-teardown either.
+                self._vpn_cache_ts = now
+                self._vpn_recon_ts = now
         # VPN ARRIVAL reconciliation (every ~5s): the moment a Windows VPN
         # appears, everything that wanted it but found nothing at apply time
         # is re-applied - [vpn]-tagged bypass entries stuck at "[route
         # pending]" and geo-via-VPN requests that aborted with "no connected
         # Windows VPN". Disappearance needs no action: the VPN's own routes
         # vanish with the adapter; the pending-state machinery re-fires on
-        # its own the next time the VPN connects.
-        if now - getattr(self, "_vpn_recon_ts", 0.0) >= 5.0:
+        # its own the next time the VPN connects. Gated on _stopping: a
+        # mid-sweep _on_vpn_arrived() would re-install routes the sweep is
+        # deleting (the sweep then never converges).
+        if not stopping and now - getattr(self, "_vpn_recon_ts", 0.0) >= 5.0:
             self._vpn_recon_ts = now
             vpn_up = bool(self._vpn_status)
             was_up = getattr(self, "_vpn_was_up", False)
@@ -3039,7 +3052,11 @@ class BTopTui:
         thread can never stall on a slow lookup."""
         while self._telemetry_running and self.running:
             try:
-                self._bypass_resolve_tick()
+                # A stop/teardown is sweeping routes RIGHT NOW - installing
+                # bypass routes under it would make the sweep fight the
+                # resolver (deleted vs re-added) and stretch the stop out.
+                if not self._stopping.is_set():
+                    self._bypass_resolve_tick()
             except Exception as e:
                 self._blog(f"[!] Bypass resolver error: {e}")
             time.sleep(0.5)
@@ -4568,11 +4585,20 @@ class BTopTui:
         elif key == 's':
             if self._stopping.is_set():
                 # A stop worker is mid-sweep (routes/wintun). Starting NOW
-                # would race it: the new helper's routes could be deleted by
-                # the finisher, or the TUN grabbed mid-teardown. Wait it out.
-                self.log_lines.append(
-                    "[*] Stop still in progress (route sweep) - press [S] "
-                    "again in a few seconds.")
+                # would race it - so QUEUE the start: the moment the sweep
+                # finishes, the tunnel comes back up on its own. (Telling
+                # the user to "press [S] again in a few seconds" read as
+                # "the app is frozen": the start never happened unless they
+                # kept retrying blindly.)
+                if getattr(self, "_start_after_stop", False):
+                    self.log_lines.append("[i] Start already queued - the " 
+                                          "tunnel will come up as soon as " 
+                                          "the stop finishes.")
+                else:
+                    self._start_after_stop = True
+                    self.log_lines.append(
+                        "[*] Stop in progress - start QUEUED: the tunnel "
+                        "will launch automatically when the sweep finishes.")
                 return True
             if not self.proc or self.proc.poll() is not None:
                 self.launch()
@@ -6233,10 +6259,16 @@ class BTopTui:
             # never keep the process alive past exit.
             self.recovery.pause("app exiting")
             self.recovery.shutdown()
+            # A [S]-queued start must NOT fire during exit.
+            self._start_after_stop = False
             if self._stopping.is_set():
                 # [T]'s worker is mid-teardown - let it finish instead of
-                # fighting it (double sweeps = the post-stop freeze).
-                while self._stopping.is_set():
+                # fighting it (double sweeps = the post-stop freeze). Bounded
+                # wait: 30s covers any sweep; a wedged teardown must not
+                # hang the exit forever.
+                for _ in range(150):
+                    if not self._stopping.is_set():
+                        break
                     time.sleep(0.2)
             else:
                 self.stop()
@@ -7201,7 +7233,21 @@ class BTopTui:
             self.stop()
         except Exception as e:
             self._blog(f"[!] Stop failed: {e.__class__.__name__}: {e}")
-        else:
+        finally:
+            # [S] pressed while the sweep was running? Launch NOW - the
+            # sweep is done, so the start can no longer race it. This is
+            # what turns "stop then app ignores [S]" into a real restart.
+            if getattr(self, "_start_after_stop", False) \
+                    and not getattr(self, "_shutting_down", False):
+                self._start_after_stop = False
+                if self.proc is None or self.proc.poll() is not None:
+                    self._blog("[*] Queued start: launching the tunnel...")
+                    try:
+                        self.launch()
+                    except Exception as e:
+                        self._blog(f"[!] Queued start failed: "
+                                   f"{e.__class__.__name__}: {e}")
+        if not getattr(self, "_start_after_stop", False):
             self._blog("[+] Tunnel stopped - traffic now leaves via the "
                        "physical NIC until you press [S] again.")
 
