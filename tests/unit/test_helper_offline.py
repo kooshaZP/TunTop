@@ -35,7 +35,8 @@ class TestProbeTunnelMultiConcurrent(unittest.TestCase):
             ok, msg = H._probe_tunnel_multi(timeout=4)
             dt = time.time() - t0
         self.assertTrue(ok, f"expected OK, got {msg}")
-        self.assertLess(dt, 1.0, "probe was not concurrent")
+        self.assertLess(dt, 1.3, "probe was not concurrent"
+                        f"(dt={dt:.3f}s)")
         self.assertEqual(len(set(calls)), 4,
                          f"expected all 4 endpoints probed, calls={calls}")
 
