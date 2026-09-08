@@ -28,7 +28,7 @@ v2rayN, Xray, sing-box, Clash Meta — any proxy client with a local SOCKS5 inbo
 - Kill-safe cleanup — verified teardown on every exit
 - Live bypass add/remove without restarting the tunnel
 - Geo-IP country routing from `geoip.dat`
-- Health monitoring with ~30 probes
+- Health monitoring with 42+ live checks (route, DNS, leak, proxy, geo)
 - Self-healing — auto-restarts on tunnel failure
 - btop-style dashboard with throughput graphs, 7 color themes
 - Leak test, diagnostics export, profiles
@@ -217,6 +217,36 @@ then the graph — and the help footer is only removed as the last resort.
 | Administrator         | route table management        |
 | A SOCKS5 proxy client (v2rayN, Xray, sing-box, Clash Meta, ...) running locally | provides the SOCKS5 inbound |
 
+## Trust & packaging (the honest version)
+
+TunTop is a single-maintainer project. Here is exactly what you are accepting
+when you run it, and what has / has not been verified:
+
+- **The exe is unsigned and self-extracting.** It requires Administrator and
+  rewrites the routing table — the same behavior profile AV/ML models flag.
+  We make **no claim** that antivirus false positives are resolved; they may
+  still occur. The `TunTop-x64.zip` / source route avoids self-extraction
+  entirely: run from source with Python, or use the zip (verified below)
+  instead of the bare onefile exe if your AV is aggressive.
+- **What you CAN verify:** every published release ships `checksums.txt`; the
+  CI workflow builds the exe from the tagged commit and the SHA-256 you
+  compute locally (`certutil -hashfile TunTop.exe SHA256`) proves the bytes
+  match what CI produced. That proves integrity (no tampering in transit),
+  **not** safety — the difference matters.
+- **Battle-testing:** the automation suite (see [Tests](#tests)) runs on every push, but
+  real-world exposure is still low — few outside users, no broad hardware /
+  network matrix coverage beyond the
+  [test matrix](docs/TEST-MATRIX.md). If you rely on it, read the routing
+  code (`tuntop/network/routing.py`, `tuntop/core/cleanup_watchdog.py`) — it
+  is written to be auditable on purpose.
+- **Release hygiene:** version metadata drift has happened before (1.0.14
+  shipped with exe properties saying 1.0.13 - fixed in 253f373, and the
+  same class was caught AGAIN pre-release in 1.0.19). It is now enforced,
+  not promised: `tests/unit/test_release_hygiene.py` fails the suite (and
+  therefore CI) if `tuntop_version_info.txt`, `tuntop/__init__.py` and
+  `CHANGELOG.md` disagree. Bug-class repeats are documented in the
+  [changelog](CHANGELOG.md) rather than hidden.
+
 ## Project layout
 
 ```
@@ -248,7 +278,7 @@ tuntop/
   ui/                      <- btop-style dashboard (owns the tunnel)
     dashboard.py
     themes.py              <- terminal text/layout primitives
-tests/                     <- 170+ tests across 5 tiers
+tests/                     <- test suite across 5 tiers (count via: python -m unittest discover -s tests -t .)
 ```
 
 `tun2socks.exe` and `wintun.dll` are auto-downloaded on first run and not in the repo.
@@ -271,7 +301,8 @@ tests/                     <- 170+ tests across 5 tiers
 
 ## Tests
 
-164 pure-stdlib tests across 5 tiers, runnable on any OS with no admin rights:
+Pure-stdlib test suite (350+ tests; exact count via the command below — it changes with every release), runnable on any OS with no admin
+rights (current count prints with the command below):
 
 ```bash
 # Run the full suite (what CI runs)
