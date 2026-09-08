@@ -10,8 +10,6 @@
 
 `windows` · `vpn` · `proxy` · `socks5` · `tun2socks` · `wintun` · `full-tunnel` · `v2rayn` · `xray` · `sing-box` · `clash` · `vless` · `vmess` · `trojan` · `shadowsocks` · `geoip` · `dns-leak-protection` · `tui` · `dashboard` · `network-monitor` · `routing` · `privacy` · `censorship-circumvention` · `python`
 
-> Tip: add the same words as repo **Topics** (repo page → ⚙ About → Topics) so
-> TunTop is discoverable in GitHub search and topic pages.
 
 **A Windows full-tunnel for any SOCKS5 proxy.**
 
