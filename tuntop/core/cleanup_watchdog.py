@@ -35,11 +35,16 @@ tested without Windows (tests/recovery/test_cleanup_watchdog.py).
 from __future__ import annotations
 
 import argparse
+import base64            # routing._ps dependency - eager, see _MEI note
 import json
 import os
+import socket            # tuntop.network.dns chain - eager, see _MEI note
 import subprocess
 import sys
+import tempfile          # sweep batch files - eager, see _MEI note
+import threading         # tuntop.network.dns chain - eager, see _MEI note
 import time
+import traceback         # sweep failure diagnosis (full stack in the log)
 
 # When executed as a script (`python cleanup_watchdog.py --pid N`), the
 # package root is NOT on sys.path (sys.path[0] is this file's directory).
@@ -250,7 +255,6 @@ def sweep_lan_routes(log=None) -> int:
             victims.append((dp, alias, nh))
         if not victims:
             return 0
-        import tempfile
         lines = [f'interface ipv4 delete route {dp} "{alias}"'
                  f'{"" if nh in ("0.0.0.0", "On-link") else (" " + nh if nh else "")}'
                  for dp, alias, nh in victims]
@@ -267,7 +271,8 @@ def sweep_lan_routes(log=None) -> int:
                 pass
         return len(victims)
     except Exception as e:
-        _log(f"watchdog: LAN sweep failed: {e}", log)
+        _log(f"watchdog: LAN sweep failed: {e}\n"
+             f"{traceback.format_exc()}".rstrip(), log)
         return 0
 
 
@@ -294,8 +299,7 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
             "ConvertTo-Json -Compress -Depth 2")
         rows = []
         if ok and out.strip():
-            import json as _json
-            data = _json.loads(out)
+            data = json.loads(out)
             if isinstance(data, dict):
                 data = [data]
             rows = data
@@ -311,7 +315,6 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
             return 0
         # Batch netsh -f deletes: hundreds of lines per process, disjoint
         # prefixes cannot collide.
-        import tempfile
         chunks = [victims[i:i + 256] for i in range(0, len(victims), 256)]
         removed = 0
         for chunk in chunks:
@@ -339,7 +342,8 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
                 pass
         return removed
     except Exception as e:
-        _log(f"watchdog: geo sweep failed: {e}", log)
+        _log(f"watchdog: geo sweep failed: {e}\n"
+             f"{traceback.format_exc()}".rstrip(), log)
         return 0
 
 
@@ -446,14 +450,14 @@ def main(argv=None) -> int:
     # the sweep only needs RAM, not the filesystem.
     try:
         import tuntop.network.routing as _routing  # noqa: F401
-        import base64 as _b64  # noqa: F401
-        import tempfile as _tf  # noqa: F401
+        import tuntop.network.dns as _dns  # noqa: F401  (socket/threading)
         from tuntop.geoip import parse_geoip as _pg  # noqa: F401
         from tuntop.startup_recovery import scan as _scan  # noqa: F401
         from tuntop.startup_recovery import recover as _recover  # noqa: F401
     except Exception as _e:
-        _log(f"watchdog: eager import failed ({_e}) - sweeps may fail; "
-             "continuing so startup recovery can still clean up")
+        _log(f"watchdog: eager import failed: {traceback.format_exc()}"
+             .rstrip() + " - sweeps may fail; continuing so startup "
+             "recovery can still clean up")
 
     try:
         wait_for_exit(args.pid)

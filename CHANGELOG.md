@@ -2,6 +2,20 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.19] - 2026-09-08
+
+### Fixed
+- **Watchdog sweeps are now import-proof** - 1.0.18 pre-loaded the sweep
+  dependencies in `main()`, but the sweeps still performed in-function
+  imports (`tempfile`, `json`) and the `tuntop.network.dns` chain
+  (`socket`, `threading`) could first-load from `_MEI`/`base_library.zip`
+  at sweep time. Everything now imports at module top / before the wait,
+  so no sweep-path import ever touches the filesystem after the parent
+  dies (field: Errno 2 on `base_library.zip` still appeared in 12:49 log).
+- **Sweep failures now log the full traceback** (`.cleanup_watchdog.log`)
+  so a future failure names the exact missing module instead of a bare
+  Errno 2.
+
 ## [1.0.18] - 2026-09-07
 
 ### Fixed
