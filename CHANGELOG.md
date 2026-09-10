@@ -2,7 +2,7 @@
 
 All notable changes to TunTop are documented here.
 
-## [Unreleased]
+## [1.0.20] - 2026-09-11
 
 ### Fixed
 - **Process kills are ownership-scoped now** - every cleanup path (helper
