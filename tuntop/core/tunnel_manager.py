@@ -84,9 +84,17 @@ class TunnelManager:
         return bool(verify_for_launch())
 
     # -- Lifecycle -----------------------------------------------------------
-    def request_start(self) -> bool:
+    def request_start(self, verify_immediately: bool = True) -> bool:
         """Begin the documented start sequence. Returns False if the current
-        state makes starting illegal (the state machine enforces the graph)."""
+        state makes starting illegal (the state machine enforces the graph).
+
+        verify_immediately=True (default) walks straight to VERIFYING after
+        the launch callable returns - right for callers that launch the
+        whole tunnel synchronously (the dashboard's launch() only returns
+        once the helper process is up). Pass False when the launch merely
+        STARTS the sequence and later phases (RESOLVING -> ... -> RUNNING)
+        are observed asynchronously, so the machine doesn't skip states
+        that are about to be announced for real."""
         if not self.machine.try_transition(TunnelState.STARTING, "user start"):
             return False
         try:
@@ -96,7 +104,9 @@ class TunnelManager:
             # observed and announced by the reader thread; here we simply mark
             # the launch attempted and hand control to VERIFYING, where the
             # monitors decide RUNNING vs DEGRADED.
-            self.machine.try_transition(TunnelState.VERIFYING, "launch attempted")
+            if verify_immediately:
+                self.machine.try_transition(TunnelState.VERIFYING,
+                                            "launch attempted")
         except Exception as e:                       # pragma: no cover
             self.machine.try_transition(TunnelState.FAILED, f"launch error: {e}")
             self._blog("ERROR", "CORE", f"launch failed: {e}")

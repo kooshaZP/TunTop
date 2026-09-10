@@ -6,7 +6,7 @@ back onto the runtime options. It deliberately knows NOTHING about the
 TUI - no overlays, no log lines, no key handling (those stay in
 tuntop/ui/dashboard.py); the caller supplies any host normalisation callback.
 
-Storage: a single profiles.json next to the package, keyed by profile
+Storage: a single MyTunTopProfile.json next to the package, keyed by profile
 name. JSON-safe, human-editable, and (Phase 15 note) contains NO secrets
 - only server addresses, ports, DNS, geo and bypass settings.
 

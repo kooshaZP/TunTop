@@ -62,5 +62,27 @@ class TestLifecycle(unittest.TestCase):
         self.assertIs(m.current, TunnelState.DEGRADED)
 
 
+class TestVerifyImmediatelyFlag(unittest.TestCase):
+    """The dashboard's launch() announces STARTING itself (with the helper
+    PID) and its reader thread walks the later observed phases. When the
+    manager pre-jumps to VERIFYING, those announcements are swallowed
+    ('already in that state') - so the dashboard must be able to request a
+    start that claims only STOPPED -> STARTING."""
+
+    def test_start_without_immediate_verify_stops_at_starting(self):
+        m = TunnelStateMachine(initial=TunnelState.STOPPED)
+        launched = []
+        tm = TunnelManager(machine=m, launch=lambda: launched.append(1))
+        self.assertTrue(tm.request_start(verify_immediately=False))
+        self.assertIs(m.current, TunnelState.STARTING)
+        self.assertEqual(launched, [1])
+
+    def test_start_default_still_walks_to_verifying(self):
+        m = TunnelStateMachine(initial=TunnelState.STOPPED)
+        tm = TunnelManager(machine=m, launch=lambda: None)
+        self.assertTrue(tm.request_start())
+        self.assertIs(m.current, TunnelState.VERIFYING)
+
+
 if __name__ == "__main__":
     unittest.main()

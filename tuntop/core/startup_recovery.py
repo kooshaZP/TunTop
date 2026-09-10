@@ -121,19 +121,6 @@ class Probes:
     sweep_host_routes: Callable[[list], int]
 
 
-def _count_processes_like(name: str) -> int:
-    ok, out = routing._ps(
-        f"Get-Process -ErrorAction SilentlyContinue | "
-        f"Where-Object {{$_.ProcessName -like '{name}*'}} | "
-        f"Measure-Object | Select-Object -ExpandProperty Count")
-    if ok:
-        try:
-            return int(out.strip())
-        except Exception:
-            return 0
-    return 0
-
-
 def _wintun_route_count() -> int:
     """Routes currently installed on the tunnel adapters (0 = clean). Counts
     BOTH the primary 'wintun' and the optional second pipe's 'wintun2' (left
@@ -149,6 +136,18 @@ def _wintun_route_count() -> int:
             except Exception:
                 pass
     return total
+
+
+def _tun2socks_owned_count(tun2socks_path=None) -> int:
+    """TunTop-owned tun2socks processes currently running (0 on any probe
+    failure). Ownership-scoped: a generic tun2socks.exe another tool runs is
+    NEVER counted (tuntop.network.procguard decides by identity, not name)."""
+    try:
+        from tuntop.network.procguard import count_own
+        return count_own(tun2socks_path)
+    except Exception:
+        return 0
+
 
 
 def default_probes() -> Probes:
@@ -181,17 +180,15 @@ def default_probes() -> Probes:
         return found
 
     def kill_tun2socks():
-        before = _count_processes_like("tun2socks")
-        if before:
-            routing._ps(
-                "Get-Process -ErrorAction SilentlyContinue | "
-                "Where-Object {$_.ProcessName -like 'tun2socks*'} | "
-                "ForEach-Object { Stop-Process -Force -Id $_.Id "
-                "-ErrorAction SilentlyContinue }")
-        return before
+        # Ownership-scoped (tuntop.network.procguard): only processes that
+        # are provably TunTop's - recorded PIDs, the exact configured
+        # binary, or the distinctive vendored file name. A generic
+        # tun2socks.exe run by another tool is never touched.
+        from tuntop.network.procguard import kill_own
+        return kill_own()
 
     def teardown_adapter():
-        routing._teardown_wintun()          # routes + tun2socks, best-effort
+        routing._teardown_wintun()          # routes + owned tun2socks, best-effort
         return True
 
     def sweep_host_routes(routes):
@@ -205,15 +202,15 @@ def default_probes() -> Probes:
             if iface is None:
                 continue
             if fam == "v4":
-                ok = routing._del_route_v4(dest, iface, iface_gw[1])
+                ok, _foreign = routing._del_route_v4(dest, iface, iface_gw[1])
             else:
-                ok = routing._del_route_v6(dest, iface, iface_gw[1])
+                ok, _foreign = routing._del_route_v6(dest, iface, iface_gw[1])
             if ok:
                 n += 1
         return n
 
     return Probes(
-        tun2socks_count=lambda: _count_processes_like("tun2socks"),
+        tun2socks_count=_tun2socks_owned_count,
         wintun_route_count=_wintun_route_count,
         host_routes=host_routes,
         kill_tun2socks=kill_tun2socks,

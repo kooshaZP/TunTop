@@ -70,6 +70,7 @@ def app_dir() -> str:
 from tuntop.routing import (          # noqa: E402
     _ps, _netsh, _teardown_wintun,
     _add_route_v4, _del_route_v4, _add_route_v6, _del_route_v6,
+    _del_route_scoped,
     _route_exists_v4, _route_exists_v6,
     _get_ipv4_default, _get_ipv6_default,
     _get_egress_for, _get_vpn_ipv4_default, _get_vpn_ipv6_default,
@@ -88,6 +89,8 @@ from tuntop.recovery import (         # noqa: E402
     FailureKind, RecoveryAction, RecoveryEngine,
 )
 from tuntop.routes_txn import RouteTransaction   # noqa: E402
+from tuntop.core.tunnel_manager import TunnelManager   # noqa: E402
+from tuntop.network import procguard            # noqa: E402
 from tuntop import startup_recovery              # noqa: E402
 from tuntop import integrity                     # noqa: E402
 from tuntop import ui_text                       # noqa: E402
@@ -1193,7 +1196,9 @@ def build_checks(ns):
           "if ($c) {'Retransmitted: {0:N2}/s' -f $c.CounterSamples[0].CookedValue} "
           "else {'Counter unavailable'}; exit 0"),
         q("tun2socks process",
-          "$p = Get-Process -ErrorAction SilentlyContinue | ? ProcessName -like 'tun2socks*' | select -First 1; if ($p) {'PID ' + $p.Id} else {Write-Output 'tun2socks not running'; exit 1}"),
+          "$p = Get-CimInstance Win32_Process -Filter \"Name LIKE 'tun2socks%'\" -ErrorAction SilentlyContinue | "
+          "? { $_.ExecutablePath -and $_.ExecutablePath -like '*tun2socks-windows-amd64-v3.exe' } | select -First 1; "
+          "if ($p) {'PID ' + $p.ProcessId + ' (' + $p.ExecutablePath + ')'} else {Write-Output 'TunTop tun2socks not running'; exit 1}"),
         q("Wintun traffic counters",
           "$s = Get-NetAdapterStatistics -Name wintun -ErrorAction SilentlyContinue; if ($s) {'RX ' + $s.ReceivedBytes + ', TX ' + $s.SentBytes} else {Write-Output 'wintun statistics unavailable'; exit 1}"),
         ("IPv4 HTTPS through SOCKS5", lambda: _https(True, False, p)),
@@ -1649,6 +1654,22 @@ class BTopTui:
         else:
             self.recovery.start()
 
+        # TunnelManager (tuntop/core/tunnel_manager.py) - the Core-layer
+        # lifecycle facade the architecture docs always promised. It owns the
+        # state-machine graph for start/stop, so the UI handlers below gate
+        # their actions through it instead of poking the machine directly.
+        # This class was previously defined and tested but never wired into
+        # the dashboard (the "architecture on paper" gap); the launch/teardown
+        # mechanics still live in launch()/stop() - the manager adds the
+        # legality layer on top, matching how RecoveryEngine wraps the
+        # machine rather than replacing it.
+        self.manager = TunnelManager(
+            machine=self.tunnel,
+            launch=self.launch,          # manager drives the real launcher
+            teardown=self.stop,          # and the real teardown (self-deduped)
+            on_log=lambda level, component, message: self.logs.put(message),
+        )
+
         self.results = []
         self.checking = False
         self.running = True
@@ -2064,7 +2085,7 @@ class BTopTui:
             except Exception as e:
                 self._blog(f"[!] stop during recovery restart failed: {e}")
             try:
-                self.launch()
+                self._managed_start()
             except Exception as e:
                 self._blog(f"[!] launch during recovery restart failed: {e}")
             # "Alive" right after launch is weak evidence: the helper can
@@ -2858,14 +2879,23 @@ class BTopTui:
         # add below a silent no-op ("already exists" with the OLD egress still
         # winning) or leave two same-prefix routes fighting over the traffic.
         # The user (or the endpoint) explicitly chose THIS egress, so it must
-        # win: remove any same-prefix route first.  netsh delete needs the
-        # exact iface+next-hop, so use the robust prefix-wide deletes (they
-        # fall back to Remove-NetRoute, which ignores both).
+        # win: remove any same-prefix route first - but ONLY from interfaces
+        # TunTop controls (the tunnel adapters + this entry's planned egress).
+        # The old pre-clean used prefix-wide deletes that ignored iface and
+        # gateway entirely and could wipe a foreign static route on a
+        # physical adapter just because it happened to share the prefix.
         for _ip, (fam_pc, dest_pc, _if_pc, _gw_pc) in planned:
             if fam_pc == "v4":
-                _del_route_v4(dest_pc, "", "")
+                _removed, foreign = _del_route_scoped(
+                    dest_pc, "v4", [_if_pc] if _if_pc else [])
             else:
-                _del_route_v6(dest_pc, "", "")
+                _removed, foreign = _del_route_scoped(
+                    dest_pc, "v6", [_if_pc] if _if_pc else [])
+            if foreign and log:
+                self._blog(f"[!] {dest_pc}: a same-prefix route exists on a "
+                           "non-tunnel interface (user static route / VPN "
+                           "split tunnel) - left untouched; it may outrank "
+                           "this bypass.")
         # ── Apply (all-or-nothing) ──────────────────────────────────────
         txn = RouteTransaction(log=self._blog if log else None)
         for _ip, (fam, dest, iface, gw) in planned:
@@ -3193,65 +3223,57 @@ class BTopTui:
                 vg6 = _get_vpn_ipv6_default(getattr(self.ns, "vpn_interface", None))
             for ip in ep4:
                 if target == "proxy2":
-                    if _del_route_v4(f"{ip}/32", t2, t2_ip4):
-                        removed.append(ip)
-                    else:
-                        failed.append(ip)
+                    ok, _foreign = _del_route_v4(f"{ip}/32", t2, t2_ip4)
+                    (removed if ok else failed).append(ip)
                     continue
                 if target == "vpn":
                     if vg:
-                        ok = _del_route_v4(f"{ip}/32", vg[0], vg[1])
+                        ok, _foreign = _del_route_v4(f"{ip}/32", vg[0], vg[1])
                     else:
-                        ok = _del_route_v4(f"{ip}/32", "", "")
+                        ok, _foreign = _del_route_v4(f"{ip}/32", "", "")
                     (removed if ok else failed).append(ip)
                     continue
                 eg = _get_egress_for(ip) or self._get_vless_iface_gateway()
                 if not eg:
-                    # No egress info - try a prefix-wide delete anyway; the
-                    # robust _del_route_v4 verifies the result either way.
-                    if not _del_route_v4(f"{ip}/32", "", ""):
-                        failed.append(ip)
-                    else:
-                        removed.append(ip)
+                    # No egress info - the delete falls back to the SCOPED
+                    # removal (tunnel adapters only; _del_route_v4 verifies
+                    # the result either way and never touches foreign ifaces).
+                    ok, _foreign = _del_route_v4(f"{ip}/32", "", "")
+                    (removed if ok else failed).append(ip)
                     continue
-                if _del_route_v4(f"{ip}/32", eg[0], eg[1]):
-                    removed.append(ip)
-                else:
-                    failed.append(ip)
+                ok, _foreign = _del_route_v4(f"{ip}/32", eg[0], eg[1])
+                (removed if ok else failed).append(ip)
             if ep6:
                 if target == "proxy2":
                     for ip in ep6:
-                        if _del_route_v6(f"{ip}/128", t2, t2_ip6):
-                            removed.append(ip)
-                        else:
-                            failed.append(ip)
+                        ok, _foreign = _del_route_v6(f"{ip}/128", t2, t2_ip6)
+                        (removed if ok else failed).append(ip)
                 elif target == "vpn":
                     for ip in ep6:
                         if vg6:
-                            ok = _del_route_v6(f"{ip}/128", vg6[0], vg6[1])
+                            ok, _foreign = _del_route_v6(f"{ip}/128", vg6[0], vg6[1])
                         else:
-                            ok = _del_route_v6(f"{ip}/128", "", "")
+                            ok, _foreign = _del_route_v6(f"{ip}/128", "", "")
                         (removed if ok else failed).append(ip)
                 else:
                     v6gw = self._get_vless_iface_gateway_v6()
                     for ip in ep6:
-                        ok = False
+                        ok, _foreign = False, False
                         # Prefer a targeted delete when we know the gateway it
                         # was installed with.
                         if v6gw:
-                            ok = _del_route_v6(f"{ip}/128", v6gw[0], v6gw[1])
+                            ok, _foreign = _del_route_v6(f"{ip}/128", v6gw[0], v6gw[1])
                         if ok:
                             removed.append(ip)
                             continue
                         # No gateway detected (or the targeted delete missed):
-                        # fall back to a prefix-wide Remove-NetRoute that ignores
-                        # iface/nexthop, so a route installed earlier (when a
-                        # gateway existed) is still removed even if the gateway
-                        # is no longer detected - mirrors the IPv4 path.
-                        if _del_route_v6(f"{ip}/128", "", ""):
-                            removed.append(ip)
-                        else:
-                            failed.append(ip)
+                        # fall back to the SCOPED delete - same prefix, but only
+                        # on the tunnel adapters / recorded interface, so a
+                        # route installed earlier (when a gateway existed) is
+                        # still removed even if the gateway is no longer
+                        # detected - mirrors the IPv4 path.
+                        ok, _foreign = _del_route_v6(f"{ip}/128", "", "")
+                        (removed if ok else failed).append(ip)
             if removed:
                 self._blog(f"[-] Removed bypass route(s): {', '.join(removed)}")
             elif not failed:
@@ -3637,8 +3659,8 @@ class BTopTui:
             self._iface_cache = None
             gone = []
             for ip in old_ips:
-                ok = (_del_route_v4(f"{ip}/32", "", "") if ":" not in ip
-                      else _del_route_v6(f"{ip}/128", "", ""))
+                ok, _foreign = (_del_route_v4(f"{ip}/32", "", "") if ":" not in ip
+                                else _del_route_v6(f"{ip}/128", "", ""))
                 if ok:
                     gone.append(ip)
             if gone:
@@ -4093,7 +4115,7 @@ class BTopTui:
             self.baseline_bytes = [None]
             self._last_raw_rx = None
             self._last_raw_tx = None
-            self.launch()
+            self._managed_start()
             self._blog(f"[+] Restarted with SOCKS port {new_port}")
         threading.Thread(target=_port_restart, daemon=True).start()
 
@@ -4718,7 +4740,7 @@ class BTopTui:
                         "will launch automatically when the sweep finishes.")
                 return True
             if not self.proc or self.proc.poll() is not None:
-                self.launch()
+                self._managed_start()
             else:
                 # Pressing [S] while the tunnel is up used to be a silent
                 # no-op - say why, and point at the key that DOES something.
@@ -6472,6 +6494,37 @@ class BTopTui:
                 self.stop()
             self._restore_console_mode()
 
+    def _managed_start(self):
+        """Start the tunnel through the Core layer (TunnelManager) - the
+        UI -> Core -> Windows path the architecture prescribes. The manager
+        enforces the state graph, so a start requested while another
+        lifecycle phase is in flight is REJECTED instead of spawning a
+        second helper racing the first (the old direct launch() call).
+
+        verify_immediately=False: launch() itself announces STARTING (with
+        the helper PID) and the reader thread walks the observed phases
+        (RESOLVING ... VERIFYING -> RUNNING); pre-jumping to VERIFYING here
+        would swallow those real announcements.
+
+        Returns True when the launch went out. A rejection while the machine
+        is stranded mid-sequence (helper died between phase markers, so no
+        STOPPED/FAILED was ever announced) resets the machine - loudly - and
+        retries once: a manual start must never be bricked by stale state."""
+        if self.manager.request_start(verify_immediately=False):
+            return True
+        current = self.tunnel.current
+        # Genuinely busy: a teardown is running - the queued-start logic in
+        # _stop_async owns restarting after it. Never force-reset here.
+        if current is TunnelState.STOPPING or self._stopping.is_set():
+            self._blog(f"[i] Start rejected - teardown in progress "
+                       f"({self.tunnel.state_name}). Press [S] again once "
+                       "it finishes.")
+            return False
+        self._blog(f"[*] Tunnel machine stranded in {current.value} with no "
+                   "helper process - resetting it before starting.")
+        self.tunnel.reset(f"manual start from {current.value}")
+        return self.manager.request_start(verify_immediately=False)
+
     def launch(self):
         if not getattr(self.ns, "server", None):
             return
@@ -7215,16 +7268,15 @@ class BTopTui:
 
     @staticmethod
     def _tun2socks_running():
-        ok, out = _ps(
-            "Get-Process -ErrorAction SilentlyContinue | "
-            "Where-Object {$_.ProcessName -like 'tun2socks*'} | "
-            "Measure-Object | Select-Object -ExpandProperty Count")
-        if ok:
-            try:
-                return int(out.strip()) > 0
-            except Exception:
-                return False
-        return False
+        """True only while a TUNTOP-OWNED tun2socks is alive (procguard:
+        vendored binary name or the exact configured path). A generic
+        tun2socks.exe another tool runs must never satisfy this - the
+        teardown loop at the [Q]/[T] call sites would otherwise wait on (or
+        restart for) a process TunTop doesn't own."""
+        try:
+            return procguard.count_own() > 0
+        except Exception:
+            return False
 
     def _shutdown_with_progress(self):
         """Run the full route-clearing teardown with a live progress bar and do
@@ -7441,7 +7493,7 @@ class BTopTui:
                 if self.proc is None or self.proc.poll() is not None:
                     self._blog("[*] Queued start: launching the tunnel...")
                     try:
-                        self.launch()
+                        self._managed_start()
                     except Exception as e:
                         self._blog(f"[!] Queued start failed: "
                                    f"{e.__class__.__name__}: {e}")
@@ -7528,7 +7580,7 @@ class BTopTui:
                 except Exception as e:
                     self._blog(f"[!] stop during bypass restart failed: {e}")
                 try:
-                    self.launch()
+                    self._managed_start()
                 except Exception as e:
                     self._blog(f"[!] launch during bypass restart failed: {e}")
                 if self.proc and self.proc.poll() is None:

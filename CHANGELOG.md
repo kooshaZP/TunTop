@@ -2,6 +2,48 @@
 
 All notable changes to TunTop are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **Process kills are ownership-scoped now** - every cleanup path (helper
+  preflight, `routing._teardown_wintun`, the startup-recovery probes, the
+  dashboard's teardown loop and its "tun2socks process" health check) used
+  to kill/count BY PROCESS NAME (`ProcessName -like 'tun2socks*'`). Since
+  tun2socks is a generic open-source tool other software legitimately
+  runs, TunTop's cleanup/watchdog could terminate a foreign tun2socks.exe
+  it never started. All of those paths now go through the new
+  `tuntop.network.procguard`, which selects only processes that are
+  provably TunTop's: PIDs recorded from its own launches, the exact
+  configured `--tun2socks` path, or the distinctive vendored binary name
+  (`tun2socks-windows-amd64-v3.exe`). A generic `tun2socks.exe` from
+  another tool is never killed, never counted.
+- **Route-delete fallback is interface-scoped now** - when netsh delete
+  failed with parameter drift, `_del_route_v4/_v6` fell back to a
+  prefix-wide `Remove-NetRoute` (no interface, no gateway), which could
+  delete a same-prefix route the user or a corporate VPN client installed
+  on an adapter TunTop never touched. The fallback now deletes the prefix
+  ONLY from the tunnel adapters (`wintun`, `wintun2`) plus the interface
+  the route was installed on (`routing._del_route_scoped`); a same-prefix
+  route surviving on any other interface is reported as foreign and left
+  alone (the live-bypass pre-clean and removal paths warn in the log).
+  All `_del_route_*` helpers now return `(removed, foreign)`.
+- **TunnelManager is actually wired up** - the Core-layer lifecycle
+  facade existed and was tested, but the dashboard never used it (the
+  "architecture on paper" gap). It is now constructed in the dashboard and
+  every start path ([S], queued start after a stop, recovery restart,
+  port-change restart, bypass-change restart) goes through
+  `TunnelManager.request_start`, which enforces the state graph: a start
+  while another lifecycle phase is in flight is rejected instead of
+  spawning a second helper. A machine stranded mid-sequence by a dead
+  helper is reset (loudly) so a manual start always works.
+  `request_start` gained `verify_immediately=False` for async starts so
+  the manager doesn't swallow the reader thread's real phase
+  announcements.
+- **Release zip excludes the real profile filename** - the exclusion list
+  said `profiles.json` but the actual store is `MyTunTopProfile.json`
+  (legacy `profiles.json` stays excluded too). The file holds only
+  settings (no credentials), so this was a hygiene fix, not a leak.
+
 ## [1.0.19] - 2026-09-08
 
 ### Fixed

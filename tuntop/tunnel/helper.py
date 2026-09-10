@@ -717,13 +717,17 @@ def run_ps(script, timeout=15):
     return run(base_cmd + ["-EncodedCommand", encoded], timeout=timeout)
 
 
-def preflight_cleanup():
+def preflight_cleanup(tun2socks_path=None):
     """Clear state left behind by a run that didn't exit cleanly (window
     closed forcibly, process killed, previous crash). Leftover Wintun
     routes or an orphaned tun2socks are the main reason a *later* run can
     fail to configure routes, look like it dropped the VPN, or crash on
     startup. Also drop the Wintun adapter itself so tun2socks recreates it
-    fresh (a stale adapter can make tun2socks fail to bind)."""
+    fresh (a stale adapter can make tun2socks fail to bind).
+
+    tun2socks_path: the --tun2socks path this run is about to use. Orphan
+    kills are OWNERSHIP-SCOPED (vendored binary name or exactly this path),
+    so a tun2socks.exe another tool is running is never terminated."""
     print("[*] Checking for leftover state from a previous run...")
     # Both pipes: the primary 'wintun' and (when a previous run used
     # --proxy2-port) the secondary 'wintun2'. Removing state for an adapter
@@ -733,13 +737,19 @@ def preflight_cleanup():
     run_ps(f"Get-NetRoute -InterfaceAlias '{TUN2}' -ErrorAction SilentlyContinue | "
            "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
 
-    _, out, _ = run_ps("Get-Process | Where-Object {$_.ProcessName -like 'tun2socks*'} | "
-                        "Select-Object -ExpandProperty Id")
+    _, out, _ = run_ps(
+        "Get-CimInstance Win32_Process "
+        "-Filter \"Name LIKE 'tun2socks%'\" -ErrorAction SilentlyContinue | "
+        "Where-Object { ($_.ExecutablePath -and "
+        "($_.ExecutablePath -like '*tun2socks-windows-amd64-v3.exe')) -or "
+        f"($_.ExecutablePath -eq '{ps_quote(tun2socks_path or '')}') }} | "
+        "Select-Object -ExpandProperty ProcessId")
     pids = [p for p in out.split() if p.strip().isdigit()]
     if pids:
-        print(f"[*] Stopping leftover tun2socks process(es): {', '.join(pids)}")
+        print(f"[*] Stopping leftover TunTop tun2socks process(es): "
+              f"{', '.join(pids)}")
         for pid in pids:
-            run(["taskkill", "/F", "/PID", pid])
+            run(["taskkill", "/F", "/T", "/PID", pid])
         time.sleep(1)
 
     run_ps(f"Remove-NetAdapter -Name '{TUN}' -Force -Confirm:$false -ErrorAction SilentlyContinue")
@@ -2536,7 +2546,7 @@ def main():
                 signal.signal(_sig, _on_signal)
             except (ValueError, OSError, AttributeError, RuntimeError):
                 pass
-    preflight_cleanup()
+    preflight_cleanup(tun2socks_path=getattr(args, "tun2socks", None))
 
     iface, gateway, ifindex = get_ipv4_default()
     print(f"[*] Physical interface: {iface}  IfIndex={ifindex}  Gateway={gateway}")

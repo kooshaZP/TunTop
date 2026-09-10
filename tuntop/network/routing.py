@@ -88,16 +88,21 @@ def _teardown_wintun():
     """Best-effort teardown of stale tunnel state: removes routes from BOTH
     tunnel adapters (the primary 'wintun' and, when a previous run used
     --proxy2-port, the secondary 'wintun2') and force-kills every orphaned
-    tun2socks process. A crash mid-session with proxy2 active otherwise
-    leaves the second adapter and its routes behind for the next launch."""
+    tun2socks process THAT TUNTOP OWNS (identity-checked by
+    tuntop.network.procguard: exact configured binary path or the
+    exact configured binary path or the distinctive vendored file name - a
+    generic tun2socks.exe another tool runs is never touched). A crash
+    mid-session with proxy2 active otherwise leaves the second adapter and
+    its routes behind for the next launch."""
     try:
         for adapter in ("wintun", "wintun2"):
             _ps(f"Get-NetRoute -InterfaceAlias '{adapter}' -ErrorAction SilentlyContinue | "
                 "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
-        _ps("Get-Process -ErrorAction SilentlyContinue | Where-Object {$_.ProcessName -like 'tun2socks*'} | "
-            "ForEach-Object { Stop-Process -Force -Id $_.Id -ErrorAction SilentlyContinue }")
+        from tuntop.network.procguard import kill_own
+        kill_own()
     except Exception:
         pass
+
 
 
 # ─── Live route helpers (for in-dashboard bypass-IP editing) ─────────────────
@@ -360,42 +365,99 @@ def _route_exists_v6(dest):
     return ok and "yes" in out
 
 
+# NOTE on the delete fallbacks below (the "prefix-wide Remove-NetRoute" fix):
+# The old code fell back to
+#     Remove-NetRoute -DestinationPrefix '<dest>' -AddressFamily <fam>
+# which deletes EVERY route with that prefix on EVERY interface - including
+# a static route the user (or a corporate VPN client) installed on a
+# physical adapter TunTop never touched. The fallback is now scoped:
+#
+#   1. netsh with the exact iface+next-hop (unchanged - the precise path);
+#   2. Remove-NetRoute WITH -InterfaceAlias, once per interface that
+#      plausibly hosts the route: the two tunnel adapters ('wintun',
+#      'wintun2') plus, when the caller knows one, the interface the route
+#      was installed on. Never interface-less, never wildcard;
+#   3. if a same-prefix route still exists on any OTHER interface, it is
+#      left alone and reported as foreign - TunTop must not delete a route
+#      it did not create.
+#
+# Returns (removed, foreign) so callers can log the one case where the
+# prefix stayed occupied by someone else's route.
+
 def _del_route_v4(dest, iface, gateway):
     """Delete an IPv4 route. Robust against parameter drift: netsh only
     removes the route when iface AND next-hop BOTH match what was recorded at
     install time. If the egress changed since then (Wi-Fi switch, DHCP renew,
     on-link <-> gateway form), netsh answers 'element not found' - which looks
     identical to 'route was never there'. Left alone, that silently KEEPS the
-    /32 route alive and traffic keeps flowing DIRECT after [X] remove."""
+    /32 route alive and traffic keeps flowing DIRECT after [X] remove.
+
+    Returns (removed, foreign): `foreign` is True when a same-prefix route
+    still exists on an interface outside the tunnel adapters + `iface` - that
+    route is NOT ours and was deliberately left alone."""
     ok, msg = _netsh(["interface", "ipv4", "delete", "route", dest, iface, gateway])
     low = msg.lower()
     if ok:
-        return True
+        return True, False
     claims_gone = "not found" in low or "element" in low
     # Ambiguous failure: either genuinely absent, or our parameters don't
     # match the installed route. Check the live table before believing it...
     if claims_gone and not _route_exists_v4(dest):
-        return True
-    # ...and fall back to a prefix-wide delete that ignores iface/nexthop.
-    _ps(f"Remove-NetRoute -DestinationPrefix '{dest}' -AddressFamily IPv4 "
-        f"-Confirm:$false -ErrorAction SilentlyContinue | Out-Null")
-    return not _route_exists_v4(dest)
+        return True, False
+    # ...and fall back to a SCOPED delete: same prefix, but only on the
+    # tunnel adapters and the interface the route was installed on.
+    return _del_route_scoped(dest, "v4", [iface])
 
 
 def _del_route_v6(dest, iface, gateway):
+    """IPv6 counterpart of _del_route_v4. Returns (removed, foreign)."""
     cmd = ["interface", "ipv6", "delete", "route", dest, iface]
     if gateway:
         cmd.append(gateway)
     ok, msg = _netsh(cmd)
     low = msg.lower()
     if ok:
-        return True
+        return True, False
     claims_gone = "not found" in low or "element" in low
     if claims_gone and not _route_exists_v6(dest):
-        return True
-    _ps(f"Remove-NetRoute -DestinationPrefix '{dest}' -AddressFamily IPv6 "
-        f"-Confirm:$false -ErrorAction SilentlyContinue | Out-Null")
-    return not _route_exists_v6(dest)
+        return True, False
+    return _del_route_scoped(dest, "v6", [iface])
+
+
+_TUNNEL_ALIASES = ("wintun", "wintun2")
+
+
+def _del_route_scoped(dest, fam, known_ifaces=()):
+    """Remove `dest` (e.g. '1.2.3.4/32') from the tunnel adapters and any
+    interface the caller knows the route was installed on - and from
+    NOTHING else. Never raises. Returns (removed, foreign).
+
+    This is the ONLY prefix-wide-looking delete in TunTop, and it is never
+    actually prefix-wide: every Remove-NetRoute carries -InterfaceAlias.
+    A same-prefix route on any other interface is foreign (user static
+    route, corporate VPN split tunnel) and must survive."""
+    if fam not in ("v4", "v6"):
+        return False, False
+    fam_ps = "IPv4" if fam == "v4" else "IPv6"
+    # Candidate interfaces: ours first, deduplicated, order-stable.
+    candidates = list(dict.fromkeys(
+        [a for a in (known_ifaces or ()) if a] + list(_TUNNEL_ALIASES)))
+    for alias in candidates:
+        _ps(f"Remove-NetRoute -DestinationPrefix '{dest}' -AddressFamily {fam_ps} "
+            f"-InterfaceAlias '{ps_quote(alias)}' "
+            f"-Confirm:$false -ErrorAction SilentlyContinue | Out-Null")
+    # Anything left with this prefix is on an interface outside our scope.
+    ok, out = _ps(
+        f"$r = Get-NetRoute -DestinationPrefix '{dest}' -AddressFamily {fam_ps} "
+        f"-ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceAlias "
+        f"-Unique; if ($r) {{ $r -join '|' }} else {{ 'none' }}")
+    leftover = []
+    if ok and out and out.strip() != "none" and out.strip() != "No result":
+        leftover = [a for a in out.strip().split("|") if a]
+    foreign = [a for a in leftover
+               if a.lower() not in [c.lower() for c in candidates]]
+    return not leftover, bool(foreign)
+
 
 
 def _add_route_v6(dest, iface, gateway, metric=1):

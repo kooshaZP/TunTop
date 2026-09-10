@@ -44,7 +44,8 @@ EXCLUDE_PATTERNS = {
     "__pycache__",
     "*.pyc",
     ".pyc",
-    "profiles.json",
+    "MyTunTopProfile.json",   # saved profiles (settings only, no secrets)
+    "profiles.json",          # legacy profile-store name (pre-rename)
     "diagnostics_*.txt",
     "*.log",
     "crash_*.txt",
