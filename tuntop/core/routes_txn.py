@@ -68,15 +68,41 @@ class RouteResult:
 
 
 class Backend:
-    """The six Windows primitives a transaction needs, injectable for
-    tests. Each returns True on success / truthy existence check."""
+    """The Windows primitives a transaction needs, injectable for tests.
+
+    REQUIRED (legacy contract, unchanged): add/exists/del per family.
+    `add`/`del` return True on success; `exists(dest)` is the coarse
+    prefix probe used by older backends.
+
+    OPTIONAL identity-aware primitives (Phase: exact verification):
+      * verify_*(dest, iface, gateway, metric) -> bool
+        "is OUR EXACT route present?" - the correct gate for both an add
+        (must be true) and a remove (must be false). When absent, the
+        transaction falls back to the prefix-level exists() probe, so every
+        pre-existing custom backend keeps working unchanged.
+      * table_*(dest) -> [{'iface','nexthop','eff'}] best-first
+        all live routes for the prefix with their EFFECTIVE metric, used
+        to catch the "half-true" install: our /32 is present but a foreign
+        same-prefix route with a better metric owns the traffic. Only
+        checked for host routes (/32, /128) where sole ownership is the
+        whole point; default/split routes legitimately co-exist.
+
+    `del` may return a bool or a (removed, foreign) tuple - both honored
+    (the old code took bool() of the tuple, which is ALWAYS true: a
+    silently failed delete used to pass; that bug is now closed)."""
 
     def __init__(self,
                  add_v4: Callable, exists_v4: Callable, del_v4: Callable,
-                 add_v6: Callable, exists_v6: Callable, del_v6: Callable):
+                 add_v6: Callable, exists_v6: Callable, del_v6: Callable,
+                 verify_v4: Optional[Callable] = None,
+                 verify_v6: Optional[Callable] = None,
+                 table_v4: Optional[Callable] = None,
+                 table_v6: Optional[Callable] = None):
         self._add = {"v4": add_v4, "v6": add_v6}
         self._exists = {"v4": exists_v4, "v6": exists_v6}
         self._del = {"v4": del_v4, "v6": del_v6}
+        self._verify = {"v4": verify_v4, "v6": verify_v6}
+        self._table = {"v4": table_v4, "v6": table_v6}
 
     def add(self, op: RouteOp) -> bool:
         return bool(self._add[op.family](op.dest, op.iface, op.gateway,
@@ -86,16 +112,76 @@ class Backend:
         return bool(self._exists[op.family](op.dest))
 
     def remove(self, op: RouteOp) -> bool:
-        return bool(self._del[op.family](op.dest, op.iface, op.gateway))
+        res = self._del[op.family](op.dest, op.iface, op.gateway)
+        if isinstance(res, tuple):        # (removed, foreign)
+            res = res[0]
+        return bool(res)
+
+    def verify(self, op: RouteOp) -> bool:
+        """Is our EXACT route present? Falls back to the legacy prefix
+        probe for backends without an identity-aware verifier."""
+        fn = self._verify[op.family]
+        if fn is None:
+            return self.exists(op)
+        try:
+            return bool(fn(op.dest, op.iface, op.gateway, op.metric))
+        except TypeError:               # custom backends with fewer params
+            return bool(self._exists[op.family](op.dest))
+
+    def shadow(self, op: RouteOp) -> Optional[str]:
+        """For host routes: return a human-readable conflict description
+        when a FOREIGN same-prefix route owns the traffic (strictly better
+        effective metric than ours). None = no conflict / not checkable."""
+        fn = self._table[op.family]
+        if fn is None or not _is_host_route(op.dest):
+            return None
+        try:
+            rows = fn(op.dest) or []
+        except TypeError:
+            return None
+        ours = None
+        for r in rows:
+            if (str(r.get("iface", "")).lower() == str(op.iface or "").lower()
+                    and _norm_gw(op.family, r.get("nexthop"))
+                    == _norm_gw(op.family, op.gateway)):
+                ours = r
+                break
+        if ours is None or not rows:
+            return None
+        best = min(rows, key=lambda r: int(r.get("eff", 0) or 0))
+        if int(best.get("eff", 0) or 0) < int(ours.get("eff", 0) or 0):
+            return (f"shadowed by better-metric route "
+                    f"on '{best.get('iface')}'")
+        return None
+
+
+def _is_host_route(dest: str) -> bool:
+    """/32 (IPv4) or /128 (IPv6): single-destination routes, where co-
+    existing same-prefix routes on other interfaces are a CONFLICT, not a
+    normal state like the default-route coexistence the split /1 trick
+    relies on."""
+    try:
+        plen = int((dest or "").rsplit("/", 1)[1])
+    except (ValueError, IndexError):
+        return False
+    return plen == 128 if ":" in (dest or "") else plen == 32
+
+
+def _norm_gw(fam, gw):
+    g = (gw or "").strip()
+    return g or ("0.0.0.0" if fam == "v4" else "::")
 
 
 #: The real Windows backend (netsh add/verify + PowerShell delete with
-#: fallbacks - the exact helpers the non-transactional paths always used).
+#: fallbacks - the exact helpers the non-transactional paths always used),
+#: upgraded with the identity-aware verify/table primitives.
 WINDOWS_BACKEND = Backend(
     add_v4=routing._add_route_v4, exists_v4=routing._route_exists_v4,
     del_v4=routing._del_route_v4,
     add_v6=routing._add_route_v6, exists_v6=routing._route_exists_v6,
     del_v6=routing._del_route_v6,
+    verify_v4=routing._route_matches_v4, verify_v6=routing._route_matches_v6,
+    table_v4=routing._route_table_v4, table_v6=routing._route_table_v6,
 )
 
 
@@ -188,6 +274,15 @@ class RouteTransaction:
             if err is None:
                 applied.append(op)
                 continue
+            # The op FAILED but may have installed a route anyway (verified
+            # present yet shadowed / half-committed): remove it before
+            # unwinding, so a failed op can never leak live state.
+            if op.action == "add":
+                try:
+                    if self._backend.verify(op):
+                        self._backend.remove(op)
+                except Exception:
+                    pass
             result.failed.append((op, err))
             self._log(f"[!] Route transaction aborted at '{op}': {err}")
             break
@@ -201,21 +296,37 @@ class RouteTransaction:
 
     def _apply_one(self, op: RouteOp) -> Optional[str]:
         """Execute one op and VERIFY it took effect. Returns an error string
-        or None on verified success."""
+        or None on verified success.
+
+        Verification is IDENTITY-aware when the backend provides it:
+        an add passes only if OUR exact route (dest + interface + next-hop
+        + metric) is live and, for host routes, no foreign better-metric
+        route shadows the prefix; a remove passes only if OUR route is gone
+        (a foreign same-prefix route on another interface is NOT a failure
+        - it was never ours)."""
         be = self._backend
         try:
             if op.action == "add":
                 if not be.add(op):
                     return "route add reported failure"
-                if not be.exists(op):
-                    # netsh said OK but the prefix is not in the table -
-                    # the classic silent half-install; treat as a failure.
-                    return "route add claimed success but prefix not in table"
+                if not be.verify(op):
+                    # netsh said OK but our exact route is not in the table
+                    # - the classic silent half-install; treat as a failure.
+                    return ("route add claimed success but the exact route "
+                            "is not in the table")
+                conflict = be.shadow(op)
+                if conflict:
+                    return f"route add verified but {conflict}"
             else:
-                if not be.remove(op):
+                # A scoped delete may honestly report "not fully removed"
+                # because a FOREIGN same-prefix route survives on another
+                # interface - that is not our failure if OUR exact route
+                # is gone. The identity verify decides.
+                if not be.remove(op) and be.verify(op):
                     return "route delete reported failure"
-                if be.exists(op):
-                    return "route delete claimed success but prefix still routed"
+                if be.verify(op):
+                    return ("route delete claimed success but our exact "
+                            "route is still in the table")
         except Exception as e:
             return f"{type(e).__name__}: {e}"
         return None

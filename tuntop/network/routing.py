@@ -376,6 +376,96 @@ def _route_exists_v6(dest):
     return ok and "yes" in out
 
 
+# ─── Exact route identity (prefix alone is NOT a route) ────────────────────
+# Windows happily keeps SEVERAL routes for one prefix (different interface /
+# next-hop / metric). A prefix-only existence check therefore proves nothing:
+# a foreign same-prefix route can make our add "verify" while traffic uses
+# someone else's route, and it can make our delete "fail" while only our own
+# route was in fact removed. These helpers match (dest, iface, next-hop,
+# metric) - the full identity - and rank the live routes by EFFECTIVE metric
+# (RouteMetric + InterfaceMetric, the way Windows itself picks a winner).
+
+def _route_list_rows(dest, fam):
+    """All live routes for exactly this prefix as
+    [{'iface','nexthop','metric','ifmetric'}] (single PowerShell spawn)."""
+    if fam not in ("v4", "v6"):
+        return []
+    fam_ps = "IPv4" if fam == "v4" else "IPv6"
+    ok, out = _ps(
+        f"Get-NetRoute -DestinationPrefix '{ps_quote(dest)}' -AddressFamily {fam_ps} "
+        "-ErrorAction SilentlyContinue | Select-Object InterfaceAlias,NextHop,"
+        "RouteMetric,InterfaceMetric | ConvertTo-Json -Compress")
+    if not ok or not out or not out.strip():
+        return []
+    try:
+        d = json.loads(out)
+    except Exception:
+        return []
+    rows = d if isinstance(d, list) else [d]
+    return [{"iface": str(r.get("InterfaceAlias", "") or ""),
+             "nexthop": str(r.get("NextHop", "") or ""),
+             "metric": _as_int(r.get("RouteMetric")),
+             "ifmetric": _as_int(r.get("InterfaceMetric"))}
+            for r in rows if isinstance(r, dict)]
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _norm_gw(fam, gw):
+    """Normalize an on-link next hop: netsh accepts ''/0.0.0.0 (v4) and
+    ''/:: (v6) for the same route - Get-NetRoute reports the zero form."""
+    g = (gw or "").strip()
+    return g or ("0.0.0.0" if fam == "v4" else "::")
+
+
+def _route_matches_rows(rows, fam, iface, gateway=None, metric=None):
+    """Pure logic over _route_list_rows output: is the EXACT route
+    (iface + normalized next-hop [+ metric]) present?"""
+    want_gw = _norm_gw(fam, gateway)
+    for r in rows or []:
+        if str(r.get("iface", "")).lower() != str(iface or "").lower():
+            continue
+        if _norm_gw(fam, r.get("nexthop")) != want_gw:
+            continue
+        if metric is not None and _as_int(r.get("metric")) != int(metric):
+            continue
+        return True
+    return False
+
+
+def _route_matches_v4(dest, iface, gateway=None, metric=None):
+    return _route_matches_rows(_route_list_rows(dest, "v4"), "v4",
+                               iface, gateway, metric)
+
+
+def _route_matches_v6(dest, iface, gateway=None, metric=None):
+    return _route_matches_rows(_route_list_rows(dest, "v6"), "v6",
+                               iface, gateway, metric)
+
+
+def _route_table_rows(rows, fam):
+    """Normalize to the transaction-facing form: [{'iface','nexthop','eff'}]
+    sorted best-first (effective metric = RouteMetric + InterfaceMetric)."""
+    out = sorted(({"iface": r.get("iface", ""),
+                   "nexthop": r.get("nexthop", ""),
+                   "eff": _as_int(r.get("metric")) + _as_int(r.get("ifmetric"))}
+                  for r in rows or []), key=lambda r: r["eff"])
+    return out
+
+
+def _route_table_v4(dest):
+    return _route_table_rows(_route_list_rows(dest, "v4"), "v4")
+
+
+def _route_table_v6(dest):
+    return _route_table_rows(_route_list_rows(dest, "v6"), "v6")
+
+
 # NOTE on the delete fallbacks below (the "prefix-wide Remove-NetRoute" fix):
 # The old code fell back to
 #     Remove-NetRoute -DestinationPrefix '<dest>' -AddressFamily <fam>

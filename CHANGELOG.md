@@ -2,6 +2,46 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.27] - 2026-09-12
+
+### Fixed (route transactions now verify ROUTES, not prefixes)
+- **Prefix-only verification proved nothing** - `RouteTransaction` accepted
+  an add as "verified" if ANY route with the destination prefix existed,
+  and failed a delete if one still did. Windows keeps several routes per
+  prefix, so: a foreign same-prefix route on a better-metric interface
+  made a half-dead bypass "verify OK"; and deleting our /32 while a
+  foreign /32 survived was reported as a failed delete (and rolled back).
+  `Backend` now takes optional identity-aware `verify_*(dest, iface,
+  gateway, metric)` and `table_*(dest)` primitives (pure fallback to the
+  legacy prefix probe for old custom backends - every existing test
+  passes unchanged).
+- **Shadowed installs detected**: for HOST routes (/32, /128 - never for
+  default/split routes, whose coexistence is the design), after adding we
+  rank all same-prefix routes by EFFECTIVE metric (RouteMetric +
+  InterfaceMetric) and FAIL the transaction if a foreign route owns the
+  traffic. Previously a VLESS /32 silently losing to the VPN's own /32 was
+  invisible: dashboard green, traffic dead.
+- **Failed ops no longer leak routes**: the op that failed mid-
+  transaction (verified-present but shadowed) is now itself removed before
+  rollback of the earlier ones - all-or-nothing really means it.
+- **`Backend.remove` bug**: the Windows delete primitive returns a
+  `(removed, foreign)` tuple; `bool(tuple)` was ALWAYS True, so a fully
+  failed delete could only be caught by the (wrong) prefix check. The
+  tuple is now unpacked and the identity verify decides.
+- **helper `add_v4/add_v6` verify their own installs**: after netsh says
+  OK, host-route (/32, /128) adds confirm the EXACT route (interface +
+  next-hop + metric) is live before recording it in the ledger - the
+  half-installs that used to be recorded as successes now return False
+  and the caller's failure path runs. (Default/LAN/split adds skip the
+  per-add check: they are polled continuously by the monitor instead.)
+- **`add_v4` appeared-during-add race branch** no longer leaks a ledger
+  entry: the recovered route is now recorded like any other success.
+- New primitives: `routing._route_matches_v4/v6` (exact identity),
+  `routing._route_table_v4/v6` (all same-prefix routes ranked by effective
+  metric). 24 new tests (`tests/routing/test_route_identity.py`) on a
+  multi-slot `FakeExactRouter` covering shadowing, ties, misdirected
+  adds, foreign-preserving deletes, idempotent removes and rollback.
+
 ## [1.0.26] - 2026-09-12
 
 ### Fixed (foreign-TUN exclusion by driver, not alias)

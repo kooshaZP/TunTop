@@ -1070,6 +1070,29 @@ if ($null -eq $r) {{ exit 0 }}
     return d if isinstance(d, list) else [d]
 
 
+def _route_identity_present(rows, fam, iface, gateway, metric=None):
+    """Pure check over get_existing_v*_routes output: does the EXACT route
+    (interface + normalized next-hop [+ route metric]) live in the table?
+    Windows keeps multiple routes per prefix, so 'the prefix exists' proves
+    nothing about OUR route being installed."""
+    want_gw = (gateway or "").strip() or ("0.0.0.0" if fam == "v4" else "::")
+    for r in rows or []:
+        if str(r.get("InterfaceAlias", "")).lower() != str(iface or "").lower():
+            continue
+        r_gw = str(r.get("NextHop", "") or "").strip() or \
+            ("0.0.0.0" if fam == "v4" else "::")
+        if r_gw != want_gw:
+            continue
+        if metric is not None:
+            try:
+                if int(r.get("RouteMetric", 0) or 0) != int(metric):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        return True
+    return False
+
+
 def add_v4(dest, iface, gateway, metric=1):
     """
     Add an IPv4 route idempotently.
@@ -1138,16 +1161,26 @@ def add_v4(dest, iface, gateway, metric=1):
         # A race or Windows duplicate-route response may happen between the
         # check above and the add. Re-check before declaring failure.
         existing_after = get_existing_v4_routes(dest)
-        for r in existing_after:
-            same_iface = str(r.get("InterfaceAlias", "")).lower() == iface.lower()
-            same_gateway = str(r.get("NextHop", "")) == gateway
-            if same_iface and same_gateway:
-                print(f"    [=] Route appeared during add and is correct: {dest}")
-                return True
+        if _route_identity_present(existing_after, "v4", iface, gateway, metric):
+            print(f"    [=] Route appeared during add and is correct: {dest}")
+            added_routes.append(("v4", dest, iface, gateway), metric=metric)
+            return True
 
         print(f"[!] IPv4 route failed: {dest} -> {err or out}")
         return False
 
+    # netsh said OK - Windows says OK a lot of things. Confirm our EXACT
+    # route is live for HOST routes (/32): bypass/VLESS installs are the
+    # few routes where a silent half-commit means the whole design leaks,
+    # and every one is worth a verification spawn. Default/LAN/split adds
+    # are verified continuously by the monitor loop instead - polling the
+    # table after each of those dozens of installs would add tens of
+    # PowerShell spawns to every start on AV-slow machines.
+    if dest.endswith("/32") and not _route_identity_present(
+            get_existing_v4_routes(dest), "v4", iface, gateway, metric):
+        print(f"[!] IPv4 route vanished after add: {dest} -> {iface} "
+              f"({gateway} m={metric}) - not recording it")
+        return False
     added_routes.append(("v4", dest, iface, gateway), metric=metric)
     return True
 
@@ -1211,14 +1244,19 @@ def add_v6(dest, iface, gateway=None, metric=1):
         # A race or Windows duplicate-route response may happen between the
         # check above and the add. Re-check before declaring failure.
         existing_after = get_existing_v6_routes(dest)
-        for r in existing_after:
-            same_iface = str(r.get("InterfaceAlias", "")).lower() == iface.lower()
-            same_gateway = str(r.get("NextHop", "") or "") == (gateway or "")
-            if same_iface and same_gateway:
-                print(f"    [=] Route appeared during add and is correct: {dest}")
-                added_routes.append(("v6", dest, iface, gateway), metric=metric)
-                return True
+        if _route_identity_present(existing_after, "v6", iface, gateway, metric):
+            print(f"    [=] Route appeared during add and is correct: {dest}")
+            added_routes.append(("v6", dest, iface, gateway), metric=metric)
+            return True
         print(f"[!] IPv6 route failed: {dest} -> {err or out}")
+        return False
+
+    # Identity verify for host routes after a "successful" add
+    # (see add_v4 for the policy and reasoning).
+    if dest.endswith("/128") and not _route_identity_present(
+            get_existing_v6_routes(dest), "v6", iface, gateway, metric):
+        print(f"[!] IPv6 route vanished after add: {dest} -> {iface} "
+              f"({gateway} m={metric}) - not recording it")
         return False
     added_routes.append(("v6", dest, iface, gateway), metric=metric)
     return True

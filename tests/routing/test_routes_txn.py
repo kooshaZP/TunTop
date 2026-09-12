@@ -128,7 +128,7 @@ class TestRollback(unittest.TestCase):
             lambda t: t.add_v4("5.5.5.5/32", "Wi-Fi"),
         ).commit()
         self.assertFalse(result.ok)
-        self.assertIn("not in table", result.failed[0][1])
+        self.assertIn("not in the table", result.failed[0][1])
         self.assertNotIn(("v4", "1.1.1.1/32"), r.table)   # rolled back
 
     def test_stuck_deletion_is_caught_by_verify(self):
@@ -139,7 +139,7 @@ class TestRollback(unittest.TestCase):
             r, lambda t: t.remove_v4("9.9.9.9/32", "Eth", "10.0.0.1")
         ).commit()
         self.assertFalse(result.ok)
-        self.assertIn("still routed", result.failed[0][1])
+        self.assertIn("still in the table", result.failed[0][1])
 
     def test_rollback_failure_is_recorded_never_raised(self):
         # A backend whose deletes always fail: rollback cannot undo the
