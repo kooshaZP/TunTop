@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 
 from tuntop.psshell import ps_quote
+from tuntop.config.defaults import TUNNEL_ALIASES, VPN_IFACE_RE  # noqa: F401
 
 # Windows caps a whole CreateProcess command line at 32767 characters.
 # -EncodedCommand puts the ENTIRE script on the command line (base64 of
@@ -95,7 +96,7 @@ def _teardown_wintun():
     mid-session with proxy2 active otherwise leaves the second adapter and
     its routes behind for the next launch."""
     try:
-        for adapter in ("wintun", "wintun2"):
+        for adapter in TUNNEL_ALIASES:
             _ps(f"Get-NetRoute -InterfaceAlias '{adapter}' -ErrorAction SilentlyContinue | "
                 "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
         from tuntop.network.procguard import kill_own
@@ -134,13 +135,13 @@ $vpnAliases = @(
     }
 )
 Get-NetRoute -ErrorAction SilentlyContinue |
-    Where-Object { $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)' } |
+    Where-Object { $_.InterfaceAlias -match '__VPN_IFACE_RE__' } |
     Select-Object -ExpandProperty InterfaceAlias -Unique | ForEach-Object { $vpnAliases += $_ }
 $vpnAliases = @($vpnAliases | Where-Object { $_ } | Select-Object -Unique)
 $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -ne 'wintun' -and
+        $_.InterfaceAlias -notmatch '^wintun' -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
     Sort-Object RouteMetric, InterfaceMetric |
@@ -158,18 +159,18 @@ if ($null -eq $r) {
                 }
             }
         } |
-        Where-Object { $_.InterfaceAlias -ne 'wintun' -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
+        Where-Object { $_.InterfaceAlias -notmatch '^wintun' -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
         Select-Object -First 1
 }
 if ($null -eq $r) {
     $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object {$_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun'} |
+        Where-Object {$_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun'} |
         Sort-Object RouteMetric, InterfaceMetric |
         Select-Object -First 1 NextHop, InterfaceAlias
 }
 if ($null -eq $r) { exit 1 }
 $r | ConvertTo-Json -Compress
-"""
+""".replace("__VPN_IFACE_RE__", VPN_IFACE_RE)
     ok, out = _ps(ps)
     if not ok:
         return None
@@ -189,13 +190,13 @@ def _get_egress_for(ip):
     ps = rf"""
 $r = Find-NetRoute -RemoteIPAddress '{ps_quote(ip)}' -ErrorAction SilentlyContinue
 if ($r) {{
-    $r = @($r) | Where-Object {{ $_.InterfaceAlias -ne 'wintun' }} |
+    $r = @($r) | Where-Object {{ $_.InterfaceAlias -notmatch '^wintun' }} |
         Sort-Object -Property @{{Expression={{ ($_.DestinationPrefix -split '/')[1] -as [int] }}; Descending=$true}}, RouteMetric, InterfaceMetric |
         Select-Object -First 1
 }}
 if (-not $r) {{
     $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object {{ $_.InterfaceAlias -ne 'wintun' -and $_.NextHop -ne '0.0.0.0' }} |
+        Where-Object {{ $_.InterfaceAlias -notmatch '^wintun' -and $_.NextHop -ne '0.0.0.0' }} |
         Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
 }}
 if ($null -eq $r) {{ exit 1 }}
@@ -266,15 +267,16 @@ if ($null -eq $best) {
     # for ANY Alive IPv4 route, not just a default route.
     $best = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object {
-            $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun' -and
-            $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
+            $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' -and
+            $_.InterfaceAlias -match '__VPN_IFACE_RE__'
         } |
         Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true},
             RouteMetric, InterfaceMetric | Select-Object -First 1
 }
 if ($null -eq $best) { exit 1 }
 $best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
-"""
+""".replace("__VPN_IFACE_RE__", VPN_IFACE_RE)
+    ok, out = _ps(ps)
     ok, out = _ps(ps)
     if not ok:
         return None
@@ -424,7 +426,7 @@ def _del_route_v6(dest, iface, gateway):
     return _del_route_scoped(dest, "v6", [iface])
 
 
-_TUNNEL_ALIASES = ("wintun", "wintun2")
+_TUNNEL_ALIASES = TUNNEL_ALIASES
 
 
 def _del_route_scoped(dest, fam, known_ifaces=()):
@@ -508,26 +510,26 @@ $vpnAliases = @(
     }
 )
 Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-    Where-Object { $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)' } |
+    Where-Object { $_.InterfaceAlias -match '__VPN_IFACE_RE__' } |
     Select-Object -ExpandProperty InterfaceAlias -Unique | ForEach-Object { $vpnAliases += $_ }
 $vpnAliases = @($vpnAliases | Where-Object { $_ } | Select-Object -Unique)
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -ne 'wintun' -and
+        $_.InterfaceAlias -notmatch '^wintun' -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
     Sort-Object RouteMetric, InterfaceMetric |
     Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun' } |
+        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' } |
         Sort-Object RouteMetric, InterfaceMetric |
         Select-Object -First 1 NextHop, InterfaceAlias
 }
 if ($null -eq $r) { exit 1 }
 $r | ConvertTo-Json -Compress
-"""
+""".replace("__VPN_IFACE_RE__", VPN_IFACE_RE)
     ok, out = _ps(ps)
     if not ok:
         return None

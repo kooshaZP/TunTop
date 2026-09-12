@@ -9,6 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from tuntop.config.defaults import (
+    DEFAULT_ENDPOINT_PORT, DEFAULT_SOCKS_PORT, DNS4,
+)
+
 
 @dataclass
 class Profile:
@@ -16,10 +20,10 @@ class Profile:
 
     name: str = "default"
     server: list = field(default_factory=list)
-    port: int = 10808
-    dns4: str = "8.8.8.8"
+    port: int = DEFAULT_SOCKS_PORT
+    dns4: str = DNS4
     dns6: Optional[str] = None   # None = not chosen (v4-only or defaults apply)
-    endpoint_port: int = 443
+    endpoint_port: int = DEFAULT_ENDPOINT_PORT
     bypass_ip: list = field(default_factory=list)
     vpn_bypass_ip: list = field(default_factory=list)   # targets via Windows VPN
     proxy2_bypass_ip: list = field(default_factory=list)  # targets via proxy2

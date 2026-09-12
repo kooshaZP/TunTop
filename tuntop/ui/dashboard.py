@@ -82,6 +82,11 @@ from tuntop.netdns import (           # noqa: E402
     _dns_query_udp, _dns_query_doh,
 )
 from tuntop.config import defaults as _cfgdef   # noqa: E402
+from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
+    VPN_IFACE_RE, LAN_BYPASS_PREFIXES, SWEEP_CHUNK, SWEEP_MAX_WORKERS,
+    TUN, TUN4, TUN6, TUN2, TUN2_IP4, TUN2_IP6,
+)
+from tuntop.network.routeops import sweeps as _rsweeps   # noqa: E402
 from tuntop.state import (            # noqa: E402
     TunnelState, TunnelStateMachine,
 )
@@ -105,6 +110,7 @@ from tuntop.health_report import (              # noqa: E402
 )
 from tuntop.monitor.leak import (               # noqa: E402
     run_leak_probe as _run_leak_probe,
+    run_dns_leak_probe as _run_dns_leak_probe,
     as_check_result as _leak_as_check,
     LEAK_TIMEOUT as _LEAK_TIMEOUT,
 )
@@ -1130,9 +1136,18 @@ def build_checks(ns):
         q("Wintun adapter",
           "$a = Get-NetAdapter -Name wintun -ErrorAction SilentlyContinue; if ($a -and $a.Status -eq 'Up') {'Up, ifIndex ' + $a.ifIndex} else {Write-Output 'wintun not present / not Up'; exit 1}"),
         q("Wintun IPv4",
-          "$x = Get-NetIPAddress -InterfaceAlias wintun -AddressFamily IPv4 -ErrorAction SilentlyContinue | ? {$_.IPAddress -eq '192.168.123.1'}; if ($x) {$x.IPAddress} else {Write-Output '192.168.123.1 not on wintun'; exit 1}"),
+          "$x = Get-NetIPAddress -InterfaceAlias wintun -AddressFamily IPv4 -ErrorAction SilentlyContinue | ? {$_.IPAddress -eq '" + TUN4 + "'}; if ($x) {$x.IPAddress} else {Write-Output '" + TUN4 + " not on wintun'; exit 1}"),
         q("Wintun IPv6",
           "$x = Get-NetIPAddress -InterfaceAlias wintun -AddressFamily IPv6 -ErrorAction SilentlyContinue | ? {$_.IPAddress -like 'fd00:dead:beef*'}; if ($x) {$x.IPAddress} else {Write-Output 'no fd00:dead:beef::/64 on wintun'; exit 1}"),
+        # v2rayN/xray TUN mode creates its own 'Wintun Tunnel' adapter with a
+        # default route; whichever metric-0/lowest wins steals browser traffic
+        # and this dashboard then shows RUNNING over an empty tunnel. Fail
+        # loudly instead.
+        q("No competing TUN adapter",
+          "$o=@('wintun','wintun2'); "
+          "$f = @(Get-NetAdapter -ErrorAction SilentlyContinue | ? {$_.InterfaceDescription -match 'Wintun' -and $o -notcontains $_.Name} | "
+          "% { if (Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $_.Name -ErrorAction SilentlyContinue) { $_.Name } }); "
+          "if ($f.Count) { throw ('TUN mode of another app steals the default route: ' + ($f -join ', ') + ' - turn it off (keep only SOCKS 127.0.0.1:10808)') } else {'no foreign Wintun default route'}"),
         ("v2rayN SOCKS TCP", lambda: _tcp("127.0.0.1", p)),
         ("SOCKS5 authentication", lambda: _socks_greeting(p)),
         ("SOCKS5 CONNECT by hostname (proxy relay)", lambda: _socks_connect_domain(p)),
@@ -1273,7 +1288,7 @@ def build_checks(ns):
         checks.append(q(f"VLESS server route ({_s})",
                         f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; if ($r) {{'via ' + $r.InterfaceAlias}} else {{Write-Output 'no route found'; exit 1}}"))
         checks.append(q(f"Proxy loop detection ({_s})",
-                        f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; if ($r -and $r.InterfaceAlias -ne 'wintun') {{'VLESS endpoint bypassed through ' + $r.InterfaceAlias}} else {{Write-Output 'VLESS endpoint NOT bypassed (loops into tunnel!)'; exit 1}}"))
+                        f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; if ($r -and $r.InterfaceAlias -notmatch '^wintun') {{'VLESS endpoint bypassed through ' + $r.InterfaceAlias}} else {{Write-Output 'VLESS endpoint NOT bypassed (loops into tunnel!)'; exit 1}}"))
 
     return checks
 
@@ -1351,9 +1366,9 @@ def get_vpn_status():
         "@(Get-VpnConnection -EA SilentlyContinue)) | "
         "? ConnectionStatus -eq 'Connected' | Select-Object -First 1 | % {$_.Name}; "
         "if (-not $n) { $n = (Get-NetAdapter -EA SilentlyContinue | "
-        "? {$_.Status -eq 'Up' -and $_.InterfaceAlias -ne 'wintun' -and "
+        "? {$_.Status -eq 'Up' -and $_.InterfaceAlias -notmatch '^wintun' -and "
         "$_.InterfaceDescription -notmatch 'Wintun' -and "
-        "$_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'} | "
+        "$_.InterfaceAlias -match '" + VPN_IFACE_RE + "'} | "
         "Select-Object -First 1).InterfaceAlias }; $n")
     if ok:
         name = out.strip()
@@ -1603,8 +1618,10 @@ class _GeoLogSink:
 class BTopTui:
     # Geo-leftover sweep tuning (exit cleanup): routes are removed in parallel
     # chunks so quitting after a geoip load takes seconds, not tens of seconds.
-    _SWEEP_CHUNK = 250
-    _SWEEP_WORKERS = 6
+    # Values come from tuntop.config.defaults (single source, shared with the
+    # helper's installer and the watchdog's sweeps).
+    _SWEEP_CHUNK = SWEEP_CHUNK
+    _SWEEP_WORKERS = SWEEP_MAX_WORKERS
     # [net] connection-log rate limit: one line per remote "ip:port" per window
     # (repeats inside the window are counted and summarized, not logged).
     _NET_RATE_WINDOW = 60.0
@@ -1809,6 +1826,7 @@ class BTopTui:
         self._live_bypass_added = []  # live [A] bypass-IP routes (for cleanup on stop)
         self._geo_dl_active = False   # a background geoip download is running
         self._geo_applied_target = None  # egress target the live geo routes currently point at
+        self._route_snapshot = None  # pre-session routing table (see _take_route_snapshot)
 
         # Adaptive layout: the panels shrink FIRST, the help footer is removed
         # LAST (short windows / 16:9 screens). _fixed_rows is the previous
@@ -2158,10 +2176,21 @@ class BTopTui:
         self.graph_mode = order[(idx + 1) % len(order)]
 
     def _cycle_theme(self):
-        """Cycle to the next named palette (cool -> amber -> muted -> ...)."""
+        """Cycle to the next named palette (cool -> amber -> muted -> ...)
+        and REMEMBER it in MyTunTopProfile.json (reserved _ui key), so the
+        next start comes up in the theme you last used."""
         global ACTIVE_THEME
         ACTIVE_THEME = (ACTIVE_THEME + 1) % len(THEMES)
-        return THEMES[ACTIVE_THEME]["name"]
+        name = THEMES[ACTIVE_THEME]["name"]
+        try:
+            ok, err = profiles.save_ui_state(self._profile_file(),
+                                             {"theme": name})
+            if not ok and err:
+                self._blog(f"[!] Could not remember theme '{name}': {err}")
+        except Exception as e:
+            self._blog(f"[!] Could not remember theme '{name}': "
+                       f"{e.__class__.__name__}: {e}")
+        return name
 
     # ── Mouse / console input ──────────────────────────────────────────────
 
@@ -2753,16 +2782,10 @@ class BTopTui:
                 "next": 0.0, "routed": False, "source": None, "last": 0.0}
 
     def _tun2_constants(self):
-        """(TUN2, TUN2_IP4, TUN2_IP6) from the helper module - imported lazily
-        the same way _reapply_geo_bypass_worker does, so the UI layer keeps its
-        import graph pointing at Core/Tunnel facades only."""
-        import importlib
-        here = os.path.dirname(os.path.abspath(__file__))
-        pkg_dir = os.path.dirname(here)   # tuntop/ package
-        if pkg_dir not in sys.path:
-            sys.path.insert(0, pkg_dir)
-        helper = importlib.import_module("tuntop.tunnel.helper")
-        return helper.TUN2, helper.TUN2_IP4, helper.TUN2_IP6
+        """(TUN2, TUN2_IP4, TUN2_IP6) - imported from tuntop.config.defaults
+        (the single source of truth), so the UI layer never needs to reach
+        into the helper module just to learn the second adapter's constants."""
+        return TUN2, TUN2_IP4, TUN2_IP6
 
     def _protected_geo_prefixes(self):
         """Every prefix geoip must never own (install OR remove).
@@ -3500,7 +3523,10 @@ class BTopTui:
         if not cur:
             # When enabling VLESS-over-VPN, also enable VPN bypass so the
             # VPN endpoint stays direct (required for this mode to work).
-            self.ns.no_vpn_bypass = True
+            # NOTE: 'no_vpn_bypass=True' DISABLES the bypass (it means "no
+            # bypass routes") - setting it here killed the VPN transport the
+            # moment [V] was pressed, so VLESS could never ride the VPN.
+            self.ns.no_vpn_bypass = False
             self.log_lines.append(
                 "[*] VPN endpoint bypass: ENABLED (auto-set for VLESS-over-VPN).")
         try:
@@ -3515,7 +3541,7 @@ class BTopTui:
                 "[i] Requires a CONNECTED Windows VPN; the helper re-checks it "
                 "on the restart (split-tunnel VPNs without a default route are "
                 "supported).")
-        self._apply_launch_change("vless-over-vpn toggled")
+        self._apply_mode_change_live("vless-over-vpn toggled")
 
     def _toggle_vpn_bypass(self):
         cur = bool(getattr(self.ns, "no_vpn_bypass", False))
@@ -3527,7 +3553,219 @@ class BTopTui:
         self.log_lines.append(
             f"[*] VPN endpoint bypass: {'ENABLED' if cur else 'DISABLED'} "
             f"({'VPN traffic IS tunneled' if cur else 'VPN endpoints stay direct'}).")
-        self._apply_launch_change("vpn-bypass toggled")
+        self._apply_mode_change_live("vpn-bypass toggled")
+
+    def _apply_mode_change_live(self, reason):
+        """[V]/[Y] mode toggles: re-route the affected endpoint/VPN-bypass
+        routes LIVE instead of stopping and restarting the tunnel.
+          * the RUNNING helper re-points ITS startup routes (server
+            endpoints, VPN server bypasses, VPN-route shadowing) via the
+            live-reconfig control file - the same channel the [N] DNS
+            handoff uses - so tun2socks never stops;
+          * the routes THIS dashboard installed after launch ([A]-added
+            bypass entries) are re-pointed by _reroute_own_bypass_live.
+        Falls back to the old restart path only if the control-file write
+        itself fails. With the tunnel stopped there is nothing to re-route:
+        the mode simply applies on the next [S] start."""
+        # The egress RULES just changed - the cached (iface, gateway) the
+        # live bypass installer reuses for every future [A] add is stale now
+        # (it used to survive a [V] flip and keep adding routes through the
+        # OLD egress).
+        self._iface_cache = None
+        if not (self.proc and self.proc.poll() is None):
+            self.log_lines.append(
+                f"[i] {reason}; tunnel is stopped - applies on next [S] start.")
+            return
+        # Enabling VLESS-over-VPN needs a CONNECTED Windows VPN (the helper
+        # refuses otherwise and keeps its old mode). Refuse HERE, so the
+        # dashboard's ns and the running helper can never disagree.
+        if (getattr(self.ns, "vless_over_vpn", False)
+                and not _get_vpn_ipv4_default(
+                    getattr(self.ns, "vpn_interface", None))):
+            self.ns.vless_over_vpn = False
+            self.log_lines.append(
+                "[!] No connected Windows VPN default route - "
+                "VLESS-over-VPN stays OFF. Connect the VPN and press [V] again.")
+            return
+        try:
+            self._write_control_file(extra={
+                "vless_over_vpn": bool(getattr(self.ns, "vless_over_vpn", False)),
+                "no_vpn_bypass": bool(getattr(self.ns, "no_vpn_bypass", False)),
+            })
+            self.log_lines.append(
+                f"[+] {reason} - applied LIVE, the tunnel stays up "
+                "(no TUN reset).")
+        except Exception as e:
+            self.log_lines.append(
+                f"[!] Live mode apply failed ({e.__class__.__name__}: {e}) "
+                "- restarting the tunnel instead.")
+            self._apply_launch_change(reason)
+            return
+        self._reroute_own_bypass_live()
+
+    def _reroute_own_bypass_live(self):
+        """Re-point the routes THIS dashboard installed after launch
+        (_live_bypass_added: [A]-added entries) at the new mode's egress,
+        matching what a fresh start in the new mode would install. Runs on
+        a worker thread (every route op is a PowerShell hop). VPN-tagged
+        and proxy2-target entries are mode-independent and left alone, as
+        are the geo routes (separate list, own egress rule)."""
+
+        def _worker():
+            try:
+                # VPN-tagged entries' destinations: their egress is always
+                # the VPN, whatever the VLESS transport mode says.
+                vpn_ips = set()
+                for st in (self._vpn_res_state or {}).values():
+                    for ip in (st.get("ips") or []):
+                        vpn_ips.add(f"{ip}/32" if ":" not in str(ip)
+                                    else f"{ip}/128")
+                rows = [(fam, dest, iface, gw)
+                        for fam, dest, iface, gw in list(self._live_bypass_added)
+                        if not str(iface).lower().startswith("wintun")
+                        and dest not in vpn_ips]
+                if not rows:
+                    return
+                over = bool(getattr(self.ns, "vless_over_vpn", False))
+                v4d = (_get_vpn_ipv4_default(
+                           getattr(self.ns, "vpn_interface", None)) if over
+                       else _get_ipv4_default())
+                v6d = (_get_vpn_ipv6_default(
+                           getattr(self.ns, "vpn_interface", None)) if over
+                       else _get_ipv6_default())
+                eg4 = (v4d[0], v4d[1]) if v4d else None
+                eg6 = (v6d[0], v6d[1]) if v6d else None
+                moved = 0
+                for fam, dest, iface, gw in rows:
+                    new = eg4 if fam == "v4" else eg6
+                    if not new:
+                        continue    # no usable egress in this mode - leave it
+                    if (str(new[0]).lower() == str(iface).lower()
+                            and str(new[1] or "") == str(gw or "")):
+                        continue    # already on the right egress
+                    try:
+                        _del_route_scoped(dest, fam, [iface] if iface else [])
+                    except Exception:
+                        pass
+                    try:
+                        txn = RouteTransaction(log=self._blog)
+                        if fam == "v4":
+                            txn.add_v4(dest, new[0], new[1], metric=1)
+                        else:
+                            txn.add_v6(dest, new[0], new[1], metric=1)
+                        result = txn.commit()
+                        ok = result.ok
+                    except Exception:
+                        ok = False
+                    if ok:
+                        try:
+                            idx = self._live_bypass_added.index(
+                                (fam, dest, iface, gw))
+                            self._live_bypass_added[idx] = (
+                                fam, dest, new[0], new[1])
+                        except ValueError:
+                            pass
+                        moved += 1
+                if moved:
+                    self._blog(
+                        f"[*] Re-pointed {moved} live bypass route(s) to the "
+                        f"{'Windows VPN' if over else 'physical adapter'} "
+                        "egress.")
+            except Exception as e:
+                self._blog(f"[!] Live bypass re-route failed: "
+                           f"{e.__class__.__name__}: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _reroute_live_geo_rows(self, old_iface, new_iface, new_gw):
+        """Re-point the geo routes THIS dashboard installed live ([R]/[F]
+        re-apply) after the physical gateway changed. They are tracked here,
+        NOT in the helper, so the helper's own [GATEWAY] re-point never
+        touches them - without this they keep steering the country's traffic
+        at the dead gateway.
+
+        Batched (netsh -f deletes + adds), like the exit sweeps: the list can
+        hold thousands of rows after a live re-apply, so the per-route
+        PowerShell path the [A] re-point uses would take minutes. Only v4
+        rows whose interface IS the old physical adapter move - wintun /
+        wintun2 / Windows-VPN egress rows are untouched (their next-hop is
+        internal to that adapter and unaffected by a Wi-Fi change). IPv6
+        rows stay (the helper's marker carries no v6 egress; its own v6 geo
+        rows are re-pointed helper-side). Tracking is updated in place so
+        [Q] still removes exactly what is in the table."""
+        rows = [(fam, dest, iface, gw)
+                for fam, dest, iface, gw in list(self._live_geo_added)
+                if fam == "v4"
+                and str(iface).lower() == str(old_iface).lower()]
+        if not rows:
+            return 0
+        del_rows = []
+        for _fam, dest, iface, gw in rows:
+            nh = gw if gw and gw not in ("0.0.0.0", "::") else ""
+            del_rows.append((dest, iface, nh))
+        try:
+            self._batch_delete_routes(del_rows)
+        except Exception:
+            pass
+        add_rows = [(dest, new_iface, new_gw, 1, False)
+                    for _f, dest, _i, _g in rows]
+        try:
+            self._batch_add_routes(add_rows)
+        except Exception as e:
+            self._blog(f"[!] Could not re-add live geo routes on the new "
+                       f"gateway: {e.__class__.__name__}: {e}")
+            return 0
+        moved = 0
+        for row in rows:
+            try:
+                idx = self._live_geo_added.index(row)
+                self._live_geo_added[idx] = ("v4", row[1], new_iface, new_gw)
+                moved += 1
+            except ValueError:
+                pass
+        if moved:
+            self._blog(f"[*] Re-pointed {moved} live geo route(s) to the "
+                       f"new gateway ({new_iface} {new_gw}).")
+        return moved
+
+    def _on_gateway_changed(self, line):
+        """[GATEWAY] marker from the helper: it re-pointed ITS routes after a
+        Wi-Fi/LAN change. The routes THIS dashboard installed live ([A]
+        bypass entries, live geo re-apply) are tracked dashboard-side - move
+        them to the new egress too. Non-fatal end to end."""
+        if not (self.proc and self.proc.poll() is None):
+            return
+        # Future [A] adds must resolve their egress fresh (the cache names
+        # the OLD adapter/gateway now).
+        self._iface_cache = None
+        m = re.match(r"^\[GATEWAY\] Physical egress changed: (.+?) \(([^)]*)\)"
+                     r" -> (.+?) \(([^)]*)\)", line or "")
+        old_iface = m.group(1) if m else None
+        new_iface = m.group(3) if m else None
+        new_gw = (m.group(4) if m else "") or ""
+        # [A]-added entries: the existing mode-aware re-point already picks
+        # the CURRENT egress (physical or VPN per the [V] mode) - reuse it.
+        try:
+            self._reroute_own_bypass_live()
+        except Exception as e:
+            self._blog(f"[!] Live bypass re-point after gateway change "
+                       f"failed: {e.__class__.__name__}: {e}")
+        # Live geo rows: batched re-point on a worker (can be thousands).
+        if old_iface and new_iface:
+            if getattr(self, "_gw_geo_repoint_active", False):
+                return
+            self._gw_geo_repoint_active = True
+
+            def _worker():
+                try:
+                    self._reroute_live_geo_rows(old_iface, new_iface, new_gw)
+                except Exception as e:
+                    self._blog(f"[!] Live geo re-point after gateway change "
+                               f"failed: {e.__class__.__name__}: {e}")
+                finally:
+                    self._gw_geo_repoint_active = False
+            threading.Thread(target=_worker, daemon=True,
+                             name="gw-geo-repoint").start()
 
     def _on_vpn_arrived(self):
         """A Windows VPN just CONNECTED (telemetry noticed the transition).
@@ -3882,8 +4120,8 @@ class BTopTui:
             dflt = profiles.get_default_profile(pf)
             labels = []
             for n in store.keys():
-                if n == profiles.DEFAULT_KEY:
-                    continue          # the auto-load marker, not a profile
+                if n in (profiles.DEFAULT_KEY, profiles.UI_KEY):
+                    continue          # auto-load marker / UI settings, not profiles
                 srv = store[n].get("server")
                 meta = (f"{GRAY}({', '.join(srv) if srv else '-'}"
                         f" · :{store[n].get('port')}){_R}")
@@ -3892,7 +4130,8 @@ class BTopTui:
                 labels.append(f"{star} {n}  {meta}{tag}")
             return labels
 
-        names = [n for n in data.keys() if n != profiles.DEFAULT_KEY]
+        names = [n for n in data.keys()
+                 if n not in (profiles.DEFAULT_KEY, profiles.UI_KEY)]
         labels = _labels(data)
         pending_delete = None
         size = _get_window_size() or (80, 24)
@@ -4019,6 +4258,21 @@ class BTopTui:
                                                    if status in ("ok", "same-exit")
                                                    else "[i]")
                 self._blog(f"{prefix} Leak test: {msg}")
+                # ── DNS leak test (same window, shared egress picture) ──
+                # The IP test can pass while every name query still escapes
+                # via the physical NIC - this is the second half of [L].
+                try:
+                    dns_status, dns_msg, _det = _run_dns_leak_probe(
+                        direct_ip=d.get("ip"), tunnel_ip=t.get("ip"),
+                        expected_dns=[getattr(self.ns, "dns4", None),
+                                      getattr(self.ns, "dns6", None)],
+                        timeout=_LEAK_TIMEOUT)
+                    dpfx = ("[+]" if dns_status == "ok" else
+                            "[!]" if dns_status == "dns-leak" else "[i]")
+                    self._blog(f"{dpfx} DNS leak test: {dns_msg}")
+                except Exception as e:
+                    self._blog(f"[!] DNS leak test crashed: "
+                               f"{e.__class__.__name__}: {e}")
             except Exception as e:
                 self._blog(f"[!] Leak test crashed: {e.__class__.__name__}: {e}")
             finally:
@@ -4152,15 +4406,21 @@ class BTopTui:
         except Exception:
             pass
 
-    def _write_control_file(self):
+    def _write_control_file(self, extra=None):
         """Write the helper's live-reconfig control file (the exact path the
-        helper polls in its monitor loop). Currently carries the DNS choice,
-        so a running tunnel re-binds its DNS without a restart."""
+        helper polls in its monitor loop). Default payload: the DNS choice,
+        so a running tunnel re-binds its DNS without a restart. `extra`
+        merges additional keys on top (e.g. the [V]/[Y] mode toggles) - the
+        helper treats a MISSING key as "no change", so both writers can
+        never fight each other."""
         path = _control_file_path()
+        payload = {"dns4": getattr(self.ns, "dns4", None),
+                   "dns6": getattr(self.ns, "dns6", None)}
+        if extra:
+            payload.update(extra)
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"dns4": getattr(self.ns, "dns4", None),
-                           "dns6": getattr(self.ns, "dns6", None)}, f)
+                json.dump(payload, f)
         except Exception as e:
             self.log_lines.append(f"[!] Could not write control file: {e}")
 
@@ -4600,13 +4860,16 @@ class BTopTui:
         if _eg6:
             for _ip in (self.endpoint_v6 or []):
                 reassert.append(("v6", f"{_ip}/128", _eg6[0], _eg6[1]))
-        before = len(helper.geoip_added)
         _old_stdout = sys.stdout
         sys.stdout = _GeoLogSink(self)
         _apply_err = None
+        _installed = []
         try:
-            helper.add_geoip_bypass(code, cidrs, g_iface, g_gw, v6iface, v6gw,
-                                    protected=protected, reassert=reassert)
+            # The installer RETURNS the rows it registered - the UI never
+            # reaches into (or rebinds) the helper's module globals.
+            _installed = helper.add_geoip_bypass(
+                code, cidrs, g_iface, g_gw, v6iface, v6gw,
+                protected=protected, reassert=reassert) or []
         except Exception as e:
             _apply_err = e
         finally:
@@ -4618,9 +4881,8 @@ class BTopTui:
         # geoip diagnostics were already routed through the sink; here we just
         # account for the routes we installed live. Dedup against what we already
         # track so repeated [R] presses don't accumulate duplicate tuples.
-        new = [t for t in helper.geoip_added[before:] if t not in self._live_geo_added]
+        new = [t for t in _installed if t not in self._live_geo_added]
         self._live_geo_added.extend(new)
-        helper.geoip_added = helper.geoip_added[:before]
         self._geo_applied_target = target
         if new:
             self._blog(
@@ -6528,6 +6790,16 @@ class BTopTui:
     def launch(self):
         if not getattr(self.ns, "server", None):
             return
+        # Pre-session route snapshot - taken BEFORE anything can mutate the
+        # table (the geo/LAN startup sweeps in main() already ran). Every exit
+        # path restores the diff against it, so the table after quitting is
+        # the table before starting, whatever the session did to it.
+        try:
+            n = self._take_route_snapshot()
+            self._blog(f"[*] Route snapshot taken ({n} routes) - the table "
+                       f"will be restored to this state on exit.")
+        except Exception:
+            self._route_snapshot = None
         # A fresh user start always re-arms recovery (clears give-up state)
         # and closes any stale incident from the previous run.
         self.recovery.resume()
@@ -6765,6 +7037,15 @@ class BTopTui:
                             s.split(": ", 1)[-1].strip()
                             or "traffic leaks outside the TUN")
                         # fall through: the line itself is logged below
+                    if s.startswith("[GATEWAY]"):
+                        # The helper re-pointed its routes after a Wi-Fi/LAN
+                        # change - dashboard-tracked live routes ([A] adds,
+                        # live geo re-apply) must follow to the new egress.
+                        try:
+                            self._on_gateway_changed(s)
+                        except Exception:
+                            pass
+                        # fall through: the line itself is logged below
                     self.logs.put(s)
                 # Helper stdout closed: the process has exited (clean stop,
                 # crash or external kill). Drive the machine down so neither
@@ -6853,16 +7134,8 @@ class BTopTui:
                     ips.append(ip)
         if not ips:
             return
-        stmts = []
-        for ip in ips:
-            if ":" in ip:
-                stmts.append(f"Remove-NetRoute -DestinationPrefix '{ip}/128' "
-                             f"-AddressFamily IPv6 -Confirm:$false "
-                             f"-ErrorAction SilentlyContinue | Out-Null")
-            else:
-                stmts.append(f"Remove-NetRoute -DestinationPrefix '{ip}/32' "
-                             f"-AddressFamily IPv4 -Confirm:$false "
-                             f"-ErrorAction SilentlyContinue | Out-Null")
+        # Statement builder is the shared rule (routeops.sweeps).
+        stmts = _rsweeps.host_route_stmts(ips)
         try:
             _ps("\n".join(stmts))
         except Exception:
@@ -6922,6 +7195,207 @@ class BTopTui:
             return []
         return [r for r in doc if isinstance(r, dict) and r.get("DestinationPrefix")]
 
+    def _dump_route_table_full(self):
+        """Like _dump_route_table but ALSO captures RouteMetric and Store,
+        which the snapshot/restore needs to re-create an entry exactly.
+        Empty list on failure."""
+        ps = ("$ProgressPreference='SilentlyContinue'; "
+              "$out = Get-NetRoute -ErrorAction SilentlyContinue | "
+              "Select-Object DestinationPrefix, InterfaceAlias, NextHop, "
+              "RouteMetric, Store | "
+              "ConvertTo-Json -Compress -Depth 2; Write-Output $out")
+        try:
+            ok, out = _ps(ps, timeout=90)
+        except Exception:
+            return []
+        if not ok or not out:
+            return []
+        try:
+            doc = json.loads(out.strip())
+        except Exception:
+            return []
+        if isinstance(doc, dict):
+            doc = [doc]
+        if not isinstance(doc, list):
+            return []
+        return [r for r in doc if isinstance(r, dict) and r.get("DestinationPrefix")]
+
+    # ── Route-table snapshot / restore ────────────────────────────────────────
+    # The user-visible contract: after ANY exit, the routing table must look
+    # EXACTLY like it did before the tunnel started. Layered cleanup + sweeps
+    # remove what we installed, but three paths could still drift from the
+    # pre-session table: add_v4() "stale-route replacement" deletes a user's
+    # own route for a destination we install; the geo conflict sweep removes
+    # pre-existing routes for geo CIDRs; and a force-killed helper leaves its
+    # routes behind. The snapshot (taken at launch, before anything mutates)
+    # plus the exit diff-restore closes all three: entries the session removed
+    # or modified are re-created with their original interface/next-hop/metric,
+    # and modified copies left in place are deleted first.
+
+    #: Prefixes Windows manages itself (multicast/broadcast/link-local) that
+    #: flap with media state - never snapshot, never restore.
+    _SNAPSHOT_SKIP_PREFIXES = {
+        "224.0.0.0/4", "255.255.255.255/32", "127.0.0.0/8",
+        "ff00::/8", "fe80::/64", "::1/128",
+    }
+    #: Never delete or re-create a default route: that is the machine's real
+    #: Internet path and the helper already refuses to own it.
+    _SNAPSHOT_DEFAULTS = {"0.0.0.0/0", "::/0"}
+
+    @classmethod
+    def _snapshot_key(cls, dest, alias, nh):
+        """Normalized (dest, iface, next-hop) identity of a route. The
+        next-hop token Windows writes as 0.0.0.0/:: (on-link) is normalized
+        to '' so re-reads always compare equal."""
+        dest = str(dest).strip()
+        alias = str(alias).strip()
+        nh = str(nh).strip().lower()
+        if nh in ("0.0.0.0", "::", "on-link"):
+            nh = ""
+        return (dest.lower(), alias.lower(), nh.lower())
+
+    @classmethod
+    def _snapshot_row(cls, row):
+        """True when a live route row may participate in snapshot/restore."""
+        dp = str(row.get("DestinationPrefix", "")).strip()
+        alias = str(row.get("InterfaceAlias", "")).strip()
+        if not dp or not alias:
+            return False
+        if dp.lower() in cls._SNAPSHOT_SKIP_PREFIXES:
+            return False
+        if dp.lower() in cls._SNAPSHOT_DEFAULTS:
+            return False
+        if alias.lower().startswith("wintun"):
+            return False   # our adapters' routes die with the adapter
+        return True
+
+    @classmethod
+    def _compute_route_diff(cls, snap, cur):
+        """Pure diff of two Get-NetRoute dumps (snap = pre-session, cur =
+        now). Returns (to_delete, to_add):
+          to_delete - rows present NOW for a prefix the snapshot also knows,
+                      but via a DIFFERENT iface/next-hop than any snapshot
+                      row (a modified/foreign copy to remove before restore);
+          to_add    - snapshot rows missing from the current table (removed
+                      or replaced by the session) with their metric/store
+                      preserved for an exact re-create."""
+        snap_rows = [r for r in (snap or []) if cls._snapshot_row(r)]
+        cur_rows = [r for r in (cur or []) if cls._snapshot_row(r)]
+        snap_keys = {cls._snapshot_key(r["DestinationPrefix"],
+                                       r.get("InterfaceAlias", ""),
+                                       r.get("NextHop", ""))
+                     for r in snap_rows}
+        snap_dests = {k[0] for k in snap_keys}
+        cur_keys = set()
+        for r in cur_rows:
+            cur_keys.add(cls._snapshot_key(r["DestinationPrefix"],
+                                           r.get("InterfaceAlias", ""),
+                                           r.get("NextHop", "")))
+        to_delete = []
+        seen = set()
+        for r in cur_rows:
+            key = cls._snapshot_key(r["DestinationPrefix"],
+                                    r.get("InterfaceAlias", ""),
+                                    r.get("NextHop", ""))
+            if key[0] not in snap_dests or key in snap_keys or key in seen:
+                continue
+            seen.add(key)
+            to_delete.append((key[0], r.get("InterfaceAlias", ""),
+                              key[2]))
+        to_add = []
+        for r in snap_rows:
+            key = cls._snapshot_key(r["DestinationPrefix"],
+                                    r.get("InterfaceAlias", ""),
+                                    r.get("NextHop", ""))
+            if key in cur_keys:
+                continue
+            to_add.append({
+                "dest": r["DestinationPrefix"],
+                "iface": r.get("InterfaceAlias", ""),
+                "nh": key[2],
+                "metric": r.get("RouteMetric", 0) or 0,
+                "persistent": str(r.get("Store", "")).lower()
+                              .startswith("persistent"),
+            })
+        return to_delete, to_add
+
+    def _take_route_snapshot(self):
+        """Capture the pre-session routing table (call BEFORE the helper can
+        mutate anything). Never raises; an unusable dump simply disables the
+        restore for this session."""
+        self._route_snapshot = None
+        try:
+            rows = self._dump_route_table_full()
+        except Exception:
+            rows = []
+        self._route_snapshot = [r for r in rows if self._snapshot_row(r)]
+        return len(self._route_snapshot)
+
+    def _batch_add_routes(self, rows):
+        """Re-create route rows [(dest, iface, nh, metric, persistent), ...]
+        via batched netsh -f scripts (the same fast path the geo installer
+        uses). Errors are ignored: a route Windows refuses (adapter gone) is
+        reported once and skipped. Returns how many rows were attempted."""
+        if not rows:
+            return 0
+        lines = []
+        for dest, iface, nh, metric, persistent in rows:
+            verb = "ipv6" if ":" in str(dest) else "ipv4"
+            iface_dq = '"' + str(iface).replace('"', '') + '"'
+            nh_tok = f" {nh}" if nh else ""
+            store = "persistent" if persistent else "active"
+            lines.append(f"interface {verb} add route {dest} {iface_dq}"
+                         f"{nh_tok} metric={int(metric or 0)} store={store}")
+        chunks = [lines[i:i + self._SWEEP_CHUNK]
+                  for i in range(0, len(lines), self._SWEEP_CHUNK)]
+        for chunk in chunks:
+            fd, path = tempfile.mkstemp(suffix=".txt", prefix="snap_add_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write("\n".join(chunk))
+                subprocess.run(["netsh", "-f", path],
+                               capture_output=True, timeout=180)
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+        return len(rows)
+
+    def _restore_route_snapshot(self):
+        """Make the live table match the pre-session snapshot: delete
+        modified/foreign copies of snapshot prefixes, re-create every snapshot
+        entry the session removed. Never raises. Returns (deleted, added)."""
+        snap = getattr(self, "_route_snapshot", None)
+        if not snap:
+            return (0, 0)
+        try:
+            cur = self._dump_route_table_full()
+        except Exception:
+            return (0, 0)
+        if not cur and not snap:
+            return (0, 0)
+        try:
+            to_delete, to_add = self._compute_route_diff(snap, cur)
+        except Exception:
+            return (0, 0)
+        deleted = added = 0
+        if to_delete:
+            try:
+                deleted = self._batch_delete_routes(to_delete)
+            except Exception:
+                deleted = 0
+        if to_add:
+            try:
+                added = self._batch_add_routes([
+                    (r["dest"], r["iface"], r["nh"], r["metric"],
+                     r["persistent"]) for r in to_add])
+            except Exception:
+                added = 0
+        return (deleted, added)
+
     def _geo_sweep_cidrs(self):
         """The full CIDR prefix set for --geoip-code (cached per process;
         tuntop.geoip's cross-run disk cache makes even the first decode
@@ -6952,12 +7426,13 @@ class BTopTui:
     def _leftover_geo_routes(self):
         """Live routes whose DestinationPrefix exactly matches one of the
         --geoip-code country CIDRs (i.e. bypass routes that should have been
-        removed but are still installed - on ANY interface/gateway)."""
-        cidrs = self._geo_sweep_cidrs()
-        if not cidrs:
-            return []
-        return [r for r in self._dump_route_table()
-                if str(r.get("DestinationPrefix")) in cidrs]
+        removed but are still installed - on ANY interface/gateway). The
+        matching rule lives in tuntop.network.routeops.sweeps (one copy for
+        the dashboard, the watchdog and startup recovery)."""
+        victims = _rsweeps.geo_victims(self._dump_route_table(),
+                                       self._geo_sweep_cidrs())
+        return [{"DestinationPrefix": dp, "InterfaceAlias": alias,
+                 "NextHop": nh} for dp, alias, nh in victims]
 
     def _sweep_lan_leftovers(self):
         """Last-resort exit sweep for the helper's LAN bypass routes
@@ -6966,29 +7441,40 @@ class BTopTui:
         but a force-killed helper skips that - and stale LAN routes after a
         network change keep steering RFC1918 traffic at a dead gateway.
         Gateway-matched like the watchdog's sweep, so foreign static routes
-        are never touched. Returns how many were removed."""
+        are never touched.
+
+        ALSO removes the network-change leftovers the gateway match can
+        never see: LAN-prefix routes pinned to the CURRENT physical adapter
+        via a REAL (non on-link) next-hop that is NOT the current gateway.
+        Those are ours from a previous network - after switching Wi-Fi the
+        current-gateway match misses them and they keep blackholing LAN
+        traffic. Windows' own on-link routes (nh 0.0.0.0/On-link) and any
+        other interface's routes are never touched. Returns how many were
+        removed."""
         import ipaddress
         try:
             def_gw = _get_ipv4_default()
             if not def_gw:
                 return 0
             iface, gw = str(def_gw[0]), str(def_gw[1])
-            lan_prefixes = {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                            "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4",
-                            "255.255.255.255/32"}
+            # Victim selection is the SHARED rule (routeops.sweeps) - the
+            # same copy the watchdog uses; prefixes come from
+            # tuntop.config.defaults (single source).
+            raw = _rsweeps.lan_victims(self._dump_route_table(), iface, gw,
+                                       prefixes=LAN_BYPASS_PREFIXES)
             rows = []
-            for r in self._dump_route_table():
-                dp = str(r.get("DestinationPrefix", ""))
-                if dp not in lan_prefixes:
+            for dp, alias, nh in raw:
+                if nh in ("0.0.0.0", "::", "On-link", ""):
+                    # On-link: ours when it equals the current gateway's
+                    # iface; keep the original current-gw semantics.
+                    rows.append((dp, alias, ""))
                     continue
-                alias = str(r.get("InterfaceAlias", "") or "")
-                nh = str(r.get("NextHop", "") or "")
-                if alias != iface:
+                if nh == gw:
+                    rows.append((dp, alias, ""))
                     continue
-                if nh and nh not in (gw, "0.0.0.0", "On-link"):
-                    continue
-                if nh in ("0.0.0.0", "::"):
-                    nh = ""
+                # Real next-hop that is NOT the current gateway on the same
+                # adapter: a stale pin from a previous network - ours,
+                # deleted next-hop-exact so foreign routes survive.
                 rows.append((dp, alias, nh))
             if not rows:
                 return 0
@@ -7132,6 +7618,26 @@ class BTopTui:
     # the whole teardown synchronously on the main thread (so a key press can't
     # abort it) and redraw a dedicated full-screen panel with a live progress
     # bar. The loop's draw() is suppressed while this runs.
+
+    def _close_signal_helper(self):
+        """Window close (Alt+F4/[X]): ask the helper child to clean up its
+        own routes NOW and return immediately - the caller keeps sweeping
+        while the helper works, inside the ~5s close budget.
+
+        This is the Alt+F4 hole: the helper is what installed the SERVER
+        endpoint /32 + /128 routes (plus LAN bypass and geo routes), and its
+        own console-close handling is not guaranteed to run to completion
+        within the OS's kill window - killing it outright (TerminateProcess)
+        would skip its cleanup entirely and leave every route in the table.
+        CTRL_BREAK_EVENT reaches it even though it lives in its own process
+        group; its SIGBREAK handler runs cleanup() and exits. The caller
+        waits briefly afterwards and force-quits whatever is still alive."""
+        proc = getattr(self, "proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+            except Exception:
+                pass
 
     def _shutdown_stop_helper(self):
         """Signal the helper child to exit; its own atexit removes the bulk of
@@ -7334,6 +7840,8 @@ class BTopTui:
                       self._sweep_lan_leftovers))
         tasks.append(("Sweeping endpoint host bypass routes",
                       self._final_host_route_sweep))
+        tasks.append(("Restoring the pre-session route table",
+                      self._restore_route_snapshot))
         tasks.append(("Verifying routes are clear",
                       lambda: None))
 
@@ -7548,6 +8056,12 @@ class BTopTui:
         # Belt-and-braces: also clear anything the helper may have left behind
         # if it had to be force-killed (its own cleanup never ran then).
         self._exit_route_sweep()
+        # Final guarantee for the [T] path: the table matches the pre-session
+        # snapshot (re-creates anything the session removed/modified).
+        try:
+            self._restore_route_snapshot()
+        except Exception:
+            pass
         self.tunnel.try_transition(TunnelState.STOPPED, "teardown complete")
 
     def _schedule_bypass_restart(self, reason):
@@ -7852,6 +8366,22 @@ def main():
             else:
                 print(f"[!] Default profile '{_default_name}' is set but "
                       "missing from the store - ignored.")
+        # ── Restore the last used theme (reserved _ui store key) ──
+        # [M] saves its choice under MyTunTopProfile.json's "_ui" key; the
+        # very first frame must already come up in THAT palette, so this
+        # happens here - before BTopTui is ever constructed or drawn.
+        _theme_name = profiles.load_ui_state(_pf_path).get("theme")
+        if isinstance(_theme_name, str) and _theme_name:
+            for _ti, _th in enumerate(THEMES):
+                if _th.get("name") == _theme_name:
+                    global ACTIVE_THEME
+                    ACTIVE_THEME = _ti
+                    print(f"[*] Theme restored: {_theme_name} "
+                          "(cycle with [M]).")
+                    break
+            else:
+                print(f"[i] Saved theme '{_theme_name}' no longer exists "
+                      f"- using {THEMES[ACTIVE_THEME]['name']}.")
     except Exception as _e:
         print(f"[!] Default profile auto-load failed: {_e}")
 
@@ -8006,17 +8536,76 @@ def main():
         print(f"[!] Cleanup watchdog could not start: {e}")
 
     def _atexit_all():
+        # LAST-RESORT exit path - runs whenever [Q]/[T]/close handling did
+        # not already tear everything down. Order matters:
+        #   1. signal the helper child and give it a bounded window: its
+        #      self-heal loop would otherwise re-assert routes AFTER our
+        #      sweep and silently defeat the cleanup;
+        #   2. sweep + snapshot-restore;
+        #   3. SUCCESS -> clear the crash marker (the watchdog's contract:
+        #      "marker gone = clean exit, do nothing") and retire the
+        #      watchdog sidecar; FAILURE -> KEEP the marker so the detached
+        #      watchdog or the next launch's startup recovery re-cleans.
+        #      (The old code cleared it in the failure branch only - exactly
+        #      inverted: every clean quit left the marker behind and was
+        #      treated as unclean by the watchdog, every failed cleanup hid
+        #      itself from the next launch.)
+        helper_stopped = True
+        try:
+            if app is not None:
+                proc = getattr(app, "proc", None)
+                if proc is not None and proc.poll() is None:
+                    helper_stopped = False
+                    try:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                        try:
+                            proc.wait(timeout=5)
+                            helper_stopped = True
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    if proc.poll() is None:
+                        try:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=2)
+                                helper_stopped = True
+                            except Exception:
+                                proc.kill()
+                        except Exception:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                        helper_stopped = helper_stopped or proc.poll() is not None
+        except Exception:
+            pass
+        cleanup_ok = False
         try:
             if app is not None:
                 # Full sweep (live routes + geo leftovers + host routes): even
                 # if [Q]'s own teardown was skipped somehow, nothing lingers.
                 app._exit_route_sweep()
+                # And the final guarantee: the table matches the pre-session
+                # snapshot (re-creates entries the session removed/modified).
+                app._restore_route_snapshot()
+            cleanup_ok = True
         except Exception as e:
             print(f"[!] Route cleanup on exit failed: {e}")
+        try:
             _teardown_wintun()
+        except Exception:
+            pass
+        if cleanup_ok and helper_stopped:
             # Verified clean exit: the crash marker goes away, so the NEXT
-            # launch knows it starts from a clean slate.
-            startup_recovery.clear_marker()
+            # launch knows it starts from a clean slate - and the detached
+            # watchdog (still waiting on this PID) classifies the exit as
+            # clean and does nothing.
+            try:
+                startup_recovery.clear_marker()
+            except Exception:
+                pass
             # Retire the watchdog state sidecar with the session: the file
             # describes THIS run's live state; a clean exit means there is
             # nothing left for the watchdog to sweep, and the user should
@@ -8033,6 +8622,9 @@ def main():
                     os.unlink(_wd_state)
             except Exception:
                 pass
+        # On failure the marker deliberately SURVIVES: it is the signal that
+        # tells the watchdog (this run) and startup recovery (next launch)
+        # that leftovers may exist and must be swept.
     atexit.register(_atexit_all)
     # Unicode glyphs are the default everywhere (CHANGELOG 1.0.4): the conhost
     # font/codepage fix-up in _enable_ansi() has already run by now, so a
@@ -8053,27 +8645,96 @@ def main():
             # is not (routes outlive us). The detached watchdog sweeps the
             # remainder either way (marker survives: atexit does not run
             # after this handler returns).
+            if app is None:
+                return False
+            # SERIALIZE with the app's own teardown paths. A [Q] checklist
+            # (or [T] worker) may be mid-teardown right now: two concurrent
+            # teardowns used to fight over the route table - and worse, two
+            # snapshot-restore passes resurrected each other's deletes. If a
+            # teardown is in flight, WAIT for it inside the close budget and
+            # let it own the cleanup; otherwise claim the very same locks a
+            # [T] worker would take, so one started later waits for US.
+            if getattr(app, "_shutting_down", False) or \
+                    app._stopping.is_set():
+                deadline = time.time() + 10.0
+                while ((getattr(app, "_shutting_down", False)
+                        or app._stopping.is_set())) and time.time() < deadline:
+                    time.sleep(0.2)
+                return False
+            app._stopping.set()
+            # A [Q] pressed while this handler runs would only double the
+            # work - mark the shutdown as owned so its checklist no-ops.
+            app._shutting_down = True
             try:
-                if app is not None:
-                    # Fresh sidecar FIRST so the detached watchdog sees the
-                    # latest live state even if we are killed mid-sweep.
-                    app._write_watchdog_state()
-                    app._cleanup_live_routes()
-                    # _cleanup_live_routes only covers the routes THIS
-                    # process tracked - geo routes the HELPER installed at
-                    # startup are NOT in _live_geo_added, and they live on
-                    # the PHYSICAL adapter (invisible to _teardown_wintun).
-                    # Within the ~5s close budget, whatever part of the
-                    # batched CIDR sweep completes helps; the detached
-                    # watchdog sweeps the remainder either way.
-                    app._sweep_geo_leftovers()
-            except Exception as e:
-                # Best-effort only - the OS is killing us; still surface why.
-                print(f"[!] Ctrl-cleanup failed: {e}")
-            try:
-                _teardown_wintun()
-            except Exception:
-                pass
+                with app._teardown_lock:
+                    try:
+                        # Fresh sidecar FIRST so the detached watchdog sees the
+                        # latest live state even if we are killed mid-sweep.
+                        app._write_watchdog_state()
+                        # THEN the helper: it owns the server-endpoint /32+/128
+                        # routes and geo routes; ASK it to clean up now (its
+                        # SIGBREAK handler runs cleanup() and exits) so its
+                        # work overlaps our own sweeps below inside the ~5s
+                        # close budget. Not signalled = its own close handling
+                        # races the OS kill and its routes survived Alt+F4.
+                        app._close_signal_helper()
+                        app._cleanup_live_routes()
+                        # The SERVER host routes are the #1 Alt+F4 complaint
+                        # ("the servers I added stay in the routing table"):
+                        # the helper removes them in its own cleanup AFTER its
+                        # slow bulk geo delete, so a kill mid-cleanup leaves
+                        # exactly them. This sweep removes every endpoint
+                        # /32+/128 regardless of the helper's progress - one
+                        # batched PowerShell call, seconds at most.
+                        app._final_host_route_sweep()
+                        # _cleanup_live_routes only covers the routes THIS
+                        # process tracked - geo routes the HELPER installed at
+                        # startup are NOT in _live_geo_added, and they live on
+                        # the PHYSICAL adapter (invisible to _teardown_wintun).
+                        # Within the ~5s close budget, whatever part of the
+                        # batched CIDR sweep completes helps; the detached
+                        # watchdog sweeps the remainder either way.
+                        app._sweep_geo_leftovers()
+                        # LAN bypass leftovers: batched and fast; if the close
+                        # budget expires first, the watchdog still covers the
+                        # leftovers.
+                        app._sweep_lan_leftovers()
+                    except Exception as e:
+                        # Best-effort only - the OS is killing us; still
+                        # surface why.
+                        print(f"[!] Ctrl-cleanup failed: {e}")
+                    try:
+                        if app.proc is not None and app.proc.poll() is None:
+                            # Give the signalled helper a bounded window to
+                            # finish its own cleanup() (endpoint /32s,
+                            # VPN-override restore, bulk geo deletes) before
+                            # the OS's kill lands; whatever is still alive
+                            # gets terminated exactly like the close itself
+                            # would have done - no worse, and the detached
+                            # watchdog still sweeps the remainder.
+                            try:
+                                app.proc.wait(timeout=2.5)
+                            except Exception:
+                                try:
+                                    app.proc.terminate()
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    try:
+                        _teardown_wintun()
+                    except Exception:
+                        pass
+                    # LAST, parity with [Q]: the table is at rest now (helper
+                    # gone, adapter gone) - restore the pre-session diff, so
+                    # a second teardown pass can never resurrect what the
+                    # first one deleted (or vice versa).
+                    try:
+                        app._restore_route_snapshot()
+                    except Exception:
+                        pass
+            finally:
+                app._stopping.clear()
             return False
         wf = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint32)
         # Keep the function pointer alive in module state so Python's GC can't
@@ -8100,6 +8761,17 @@ def main():
                       "previous run - the fresh start is clean.")
         except Exception as _e:
             print(f"[!] Leftover geo route sweep skipped: {_e}")
+        # Same story for LAN bypass routes pinned to a gateway that no longer
+        # exists (previous run + Wi-Fi switched since): they blackhole RFC1918
+        # traffic on the new network. Runs BEFORE the snapshot so those
+        # leftovers are not re-added at exit as if they were the user's own.
+        try:
+            _n = app._sweep_lan_leftovers()
+            if _n:
+                print(f"[*] Removed {_n} leftover LAN bypass route(s) from a "
+                      "previous run - the fresh start is clean.")
+        except Exception as _e:
+            print(f"[!] Leftover LAN route sweep skipped: {_e}")
         app.launch()
         app.loop()
     except SystemExit:

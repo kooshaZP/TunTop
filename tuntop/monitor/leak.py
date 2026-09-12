@@ -20,10 +20,12 @@ from __future__ import annotations
 
 from tuntop.network.leak_probe import (        # noqa: F401
     run_leak_probe,
+    run_dns_leak_probe,
     LEAK_TIMEOUT,
 )
 
-__all__ = ["run_leak_probe", "as_check_result", "LEAK_TIMEOUT"]
+__all__ = ["run_leak_probe", "run_dns_leak_probe", "as_check_result",
+           "LEAK_TIMEOUT"]
 
 
 def as_check_result(status, message):

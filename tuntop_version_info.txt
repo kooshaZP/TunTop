@@ -5,8 +5,8 @@
 # scanners; this also makes the file properties dialog meaningful.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 20, 0),
-    prodvers=(1, 0, 20, 0),
+    filevers=(1, 0, 24, 0),
+    prodvers=(1, 0, 24, 0),
     mask=0x3F,
     flags=0x0,
     OS=0x40004,
@@ -19,12 +19,12 @@ VSVersionInfo(
       StringTable('040904B0', [
         StringStruct('CompanyName', 'kooshaZP'),
         StringStruct('FileDescription', 'TunTop - full-tunnel VPN dashboard (tun2socks + Wintun)'),
-        StringStruct('FileVersion', '1.0.20'),
+        StringStruct('FileVersion', '1.0.24'),
         StringStruct('InternalName', 'TunTop'),
         StringStruct('LegalCopyright', '(c) 2026 kooshaZP. MIT licensed.'),
         StringStruct('OriginalFilename', 'TunTop.exe'),
         StringStruct('ProductName', 'TunTop'),
-        StringStruct('ProductVersion', '1.0.20'),
+        StringStruct('ProductVersion', '1.0.24'),
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])]),

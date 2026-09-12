@@ -71,15 +71,17 @@ if _PKG_PARENT not in _sys.path:
     _sys.path.insert(0, _PKG_PARENT)
 
 from tuntop.psshell import ps_quote  # noqa: E402
-
-TUN = "wintun"
-# tun2socks' Windows/Wintun configuration uses this same interface address
-# as the route next hop (per the project's Windows example).
-TUN4 = "192.168.123.1"
-TUN4_MASK = "255.255.255.0"
-TUN6 = "fd00:dead:beef::1"
-DNS4 = "8.8.8.8"
-DNS6 = "2606:4700:4700::1111"
+from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
+    TUN, TUN4, TUN4_MASK, TUN6, TUN2, TUN2_IP4, TUN2_IP6,
+    DNS4, DNS6, LAN_BYPASS_PREFIXES, VPN_IFACE_RE, WINTUN_FAMILY_RE,
+    GEO_SUB_BATCH, GEO_MAX_WORKERS, GEO_SUB_TIMEOUT,
+    DEFAULT_SOCKS_PORT, DEFAULT_ENDPOINT_PORT,
+    WINTUN4_NET, WINTUN6_NET,
+)
+from tuntop.network.routeops import RouteLedger, RouteResult, sweeps as _rsweeps  # noqa: E402
+from tuntop.tunnel.exec import (  # noqa: E402  (moved Phase 4: state-free primitives)
+    run, ps_json, run_ps, _clean_err,
+)
 
 
 def _resolve_dns_choice(d4, d6):
@@ -110,10 +112,8 @@ def _resolve_dns_choice(d4, d6):
 # route.  CRITICAL: TUN2 must never receive a default route (0/0) - two
 # adapters fighting over 0/0 is exactly the routing-loop bug the teardown
 # guarantees exist to prevent.  TUN2 only ever receives specific-destination
-# routes (see the dashboard's proxy2 bypass targeting).
-TUN2 = "wintun2"
-TUN2_IP4 = "192.168.124.1"
-TUN2_IP6 = "fd00:dead:beef:1::1"
+# routes (see the dashboard's proxy2 bypass targeting). The TUN2 constants
+# are imported from tuntop.config.defaults above.
 
 # Active DNS servers resolved from the CLI --dns4/--dns6 flags at the top of
 # main().  _ensure_wintun_address() reads these so that re-adding the Wintun
@@ -127,8 +127,8 @@ _ACTIVE_DNS6 = DNS6
 _ACTIVE_DNS_MODE = "plain"
 _ACTIVE_DOH_TEMPLATE = None
 
-added_routes = []
-geoip_added = []   # country-range bypass routes from --geoip (potentially thousands)
+added_routes = RouteLedger("helper")
+geoip_added = RouteLedger("geo")   # country-range bypass routes from --geoip (potentially thousands)
 
 # ── Live-reconfiguration channel (dashboard -> running helper) ──────────────
 # The dashboard owns the UI and this helper runs as its child process. For
@@ -144,9 +144,9 @@ _control_mtime = 0.0
 
 
 def poll_control_file():
-    """Apply dashboard-written live changes (currently: DNS4/DNS6). Returns
-    True when a change was applied. Never raises - a malformed/partial write
-    must not take the tunnel down."""
+    """Apply dashboard-written live changes (DNS4/DNS6 and the [V]/[Y]
+    transport-mode toggles). Returns True when a change was applied.
+    Never raises - a malformed/partial write must not take the tunnel down."""
     global _ACTIVE_DNS4, _ACTIVE_DNS6, _control_mtime
     try:
         mtime = os.path.getmtime(CONTROL_FILE)
@@ -176,13 +176,46 @@ def poll_control_file():
         if d6 != _ACTIVE_DNS6:
             _ACTIVE_DNS6 = d6
             changed.append(f"DNS6 -> {d6 or '(cleared - IPv6 DNS unset)'}")
+    dns_changed = bool(changed)
+    # [V]/[Y] mode toggles (same channel as the DNS): an absent key = no
+    # change; a present bool = the mode the dashboard now runs. The helper
+    # re-routes its own endpoint/VPN bypass routes LIVE (see _live_mode) so
+    # the mode change takes effect without stopping/restarting the tunnel.
+    _args = _live_mode.get("args")
+    if "vless_over_vpn" in data:
+        want = bool(data["vless_over_vpn"])
+        if want != _live_mode["vless_over_vpn"]:
+            ok, lines = _live_switch_vless(want)
+            for ln in lines:
+                print(ln, flush=True)
+            if ok:
+                _live_mode["vless_over_vpn"] = want
+                if _args is not None:
+                    _args.vless_over_vpn = want
+                changed.append("VLESS transport -> "
+                               + ("Windows VPN" if want
+                                  else "physical adapter bypass"))
+    if "no_vpn_bypass" in data:
+        want = bool(data["no_vpn_bypass"])
+        if want != _live_mode["no_vpn_bypass"]:
+            ok, lines = _live_switch_vpn_bypass(want)
+            for ln in lines:
+                print(ln, flush=True)
+            if ok:
+                _live_mode["no_vpn_bypass"] = want
+                if _args is not None:
+                    _args.no_vpn_bypass = want
+                changed.append("VPN endpoint bypass -> "
+                               + ("removed (VPN traffic is tunneled)" if want
+                                  else "installed (VPN endpoints stay direct)"))
     if not changed:
         return False
     print(f"[*] Live config change applied: {'; '.join(changed)}", flush=True)
-    try:
-        configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
-    except Exception as e:
-        print(f"[!] Live DNS re-apply failed: {e}", flush=True)
+    if dns_changed:
+        try:
+            configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
+        except Exception as e:
+            print(f"[!] Live DNS re-apply failed: {e}", flush=True)
     return True
 
 
@@ -210,8 +243,8 @@ def _baseline_control_file():
 # injected VPN route with an equivalent Wintun route at a lower effective metric
 # (achieved by dropping Wintun's interface metric below the VPN's). The VPN link
 # itself stays up because its server endpoint remains bypassed separately. The
-# lists below track what to undo on cleanup.
-vpn_override_routes = []      # (fam, dest, iface, gateway) entries to remove
+# ledgers below track what to undo on cleanup (thread-safe, metric-faithful).
+vpn_override_routes = RouteLedger("vpn-override")
 vpn_saved_routes = []        # original VPN routes we shadowed (for restoration)
 wintun_saved_metric = None    # Wintun InterfaceMetric to restore on exit
 vpn_override_iface = None     # connected VPN interface we shadowed (set in main)
@@ -220,11 +253,6 @@ phys_bypass_iface = None
 tun_proc = None
 tun2_proc = None   # second proxy pipe's tun2socks process (None = disabled)
 cleaned = False
-
-# Windows caps a whole CreateProcess command line at 32767 chars; the encoded
-# form of a big bulk-removal script exceeds it, so run_ps() falls back to
-# executing such scripts from a temp .ps1 file (mirrors tuntop/routing.py).
-_PS_CMDLINE_SAFE = 20000
 
 # NOTE: bulk geoip route removal (_remove_routes_bulk) deliberately shares the
 # installer's tuning (GEO_SUB_BATCH / GEO_MAX_WORKERS) and its `netsh -f`
@@ -238,85 +266,16 @@ def is_admin():
         return False
 
 
-def run(cmd, check=False, timeout=15):
-    """Run a command and return (returncode, stdout, stderr).
-
-    A timeout is enforced so a hung child cannot freeze the whole script.
-    Windows networking cmdlets (Get-VpnConnection / Find-NetRoute /
-    Get-NetRoute) can block indefinitely when the RasMan service is busy or
-    the routing table is mid-change - without a timeout this stalls the
-    helper forever ("not crashed but unresponsive"). On timeout the child is
-    killed and a nonzero code is returned, letting callers fall back instead
-    of stalling.
-
-    15s is chosen as a bound: these cmdlets are normally sub-second, so a
-    real hang is caught quickly without cutting off a legitimately slow one.
-    Hot-path callers (e.g. get_egress_for, called once per server) pass a
-    shorter timeout so N servers can't multiply the stall into minutes.
-    """
-    try:
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except (FileNotFoundError, OSError) as e:
-        msg = str(e)
-        if check:
-            print(f"[!] Command failed to start: {' '.join(cmd)}")
-            if msg:
-                print(f"    {msg}")
-        return 1, "", msg
-    try:
-        out, err = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            p.kill()
-        except Exception:
-            pass
-        # Bound the post-kill read too: if a child (e.g. netsh) inherited the
-        # stdout pipe and is still alive, a bare communicate() could hang again.
-        try:
-            out, err = p.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            out, err = "", ""
-        if check:
-            print(f"[!] Command timed out ({timeout}s): {' '.join(cmd)}")
-        return 124, (out or "").strip(), f"timed out after {timeout}s"
-    if check and p.returncode:
-        msg = (err or "").strip() or (out or "").strip()
-        print(f"[!] Command failed: {' '.join(cmd)}")
-        if msg:
-            print(f"    {msg}")
-    return p.returncode, (out or "").strip(), (err or "").strip()
+# Interface alias text pattern for Windows VPN tunnels is defined ONCE in
+# tuntop.config.defaults (VPN_IFACE_RE) and imported above - it used to be
+# re-hardcoded in seven places across three modules.
 
 
-def ps_json(script, timeout=15):
-    # -EncodedCommand (UTF-16LE, base64) instead of raw -Command text.
-    # -Command re-parses the string as if typed at a console, which can
-    # mis-split scripts containing nested single quotes, braces, or
-    # pipes. All the VPN-detection PowerShell above relies on this being
-    # reliable, so encode it rather than risk a silent parse failure.
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    code, out, _ = run([
-        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-EncodedCommand", encoded
-    ], timeout=timeout)
-    if code or not out:
-        return None
-    try:
-        return json.loads(out)
-    except Exception:
-        return None
-
-
-# Interface alias text pattern for Windows VPN tunnels.  A literal text match
-# on the alias is unreliable (a user can rename a VPN connection to anything),
-# so it is only ever used as a last-resort fallback, never the primary path.
-VPN_IFACE_RE = r"(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)"
+def _is_wintun_alias(alias):
+    """True for ANY Wintun-driver adapter: ours ('wintun', 'wintun2') and
+    foreign full-tunnel tools that share the driver naming (v2rayN/xray's
+    'Wintun Tunnel'). Exact-match comparisons miss those foreign adapters."""
+    return bool(alias) and str(alias).lower().startswith("wintun")
 
 
 def _v4_default_filter(strict):
@@ -329,7 +288,7 @@ def _v4_default_filter(strict):
     VPN exclusion logic is defined in exactly one place.
     """
     clause = (r"$_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and "
-              r"$_.InterfaceAlias -ne 'wintun'")
+              r"$_.InterfaceAlias -notmatch '%s'" % WINTUN_FAMILY_RE)
     if strict:
         clause += r" -and $_.InterfaceAlias -notmatch '%s'" % VPN_IFACE_RE
     return clause
@@ -389,7 +348,7 @@ def get_ipv4_default():
 $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -ne 'wintun' -and
+        $_.InterfaceAlias -notmatch '^wintun' -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
     Sort-Object RouteMetric, InterfaceMetric |
@@ -410,13 +369,13 @@ if ($null -eq $r) {
                 }
             }
         } |
-        Where-Object { $_.InterfaceAlias -ne 'wintun' -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
+        Where-Object { $_.InterfaceAlias -notmatch '%s' -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
         Select-Object -First 1
 }
 if ($null -eq $r) {
     # Last resort only: any non-wintun 0.0.0.0/0 route (may be the VPN).
     $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun' } |
+        Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' } |
         Sort-Object RouteMetric, InterfaceMetric |
         Select-Object -First 1 NextHop, InterfaceAlias, InterfaceIndex
 }
@@ -448,7 +407,7 @@ def get_ipv6_default():
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -ne 'wintun' -and
+        $_.InterfaceAlias -notmatch '^wintun' -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
     Sort-Object RouteMetric, InterfaceMetric |
@@ -456,7 +415,7 @@ $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction Sil
 if ($null -eq $r) {
     # Last resort only: any non-wintun IPv6 default route (may be the VPN).
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun' } |
+        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' } |
         Sort-Object RouteMetric, InterfaceMetric |
         Select-Object -First 1 NextHop, InterfaceAlias
 }
@@ -491,7 +450,7 @@ def get_egress_for(ip, exclude_vpn=True):
     ps = (
         "$r = Find-NetRoute -RemoteIPAddress '" + ps_quote(ip) + "' -ErrorAction SilentlyContinue\n"
         "if ($r) {\n"
-        "    $r = @($r) | Where-Object { $_.InterfaceAlias -ne 'wintun'" + vpn_clause + " } |\n"
+        "    $r = @($r) | Where-Object { $_.InterfaceAlias -notmatch '^wintun'" + vpn_clause + " } |\n"
         "        Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true}, RouteMetric, InterfaceMetric |\n"
         "        Select-Object -First 1\n"
         "}\n"
@@ -594,7 +553,7 @@ if ($null -eq $best) {
     # Fallback for VPN clients Get-VpnConnection does not expose.
     $best = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
         Where-Object {
-            $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun' -and
+            $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' -and
             $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
         } |
         Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
@@ -618,7 +577,7 @@ if ($null -eq $best) {
     # for ANY Alive IPv4 route, not just a default route.
     $best = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object {
-            $_.State -eq 'Alive' -and $_.InterfaceAlias -ne 'wintun' -and
+            $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' -and
             $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
         } |
         Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true},
@@ -691,30 +650,35 @@ if (@($c).Count -eq 0) { exit 1 }
     return {str(x["Name"]): str(x["ConnectionStatus"]) for x in records}
 
 
-def run_ps(script, timeout=15):
-    """Run a PowerShell script and return its raw stdout, for callers that
-    don't need ps_json's JSON parsing.
-
-    Small scripts use -EncodedCommand as before. Scripts whose encoded command
-    line would approach the Windows 32767-char CreateProcess cap - notably
-    _remove_routes_bulk's multi-hundred-statement geoip teardown batches,
-    which silently NEVER STARTED over the limit (why geoip routes survived
-    every cleanup) - are written to a temp .ps1 file and run with -File
-    instead."""
-    base_cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass"]
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    if len(encoded) + 80 > _PS_CMDLINE_SAFE:
-        fd, path = tempfile.mkstemp(suffix=".ps1", prefix="TunTop_helper_")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
-                f.write(script)
-            return run(base_cmd + ["-File", path], timeout=timeout)
-        finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
-    return run(base_cmd + ["-EncodedCommand", encoded], timeout=timeout)
+def get_foreign_tun_adapters():
+    """Wintun-driver adapters that are NOT ours (e.g. v2rayN/xray in TUN mode
+    creates 'Wintun Tunnel'). Returns [(alias, default_route)] - a non-empty
+    result means a competing full-tunnel program owns a default route too, so
+    only the lowest-metric tunnel actually carries traffic. Read-only: we
+    never touch another program's adapter."""
+    ps = (
+        "$names = @('" + ps_quote(TUN) + "','" + ps_quote(TUN2) + "')\n"
+        "$ours = Get-NetAdapter -ErrorAction SilentlyContinue |\n"
+        "    Where-Object { $_.InterfaceDescription -match 'Wintun' -and $names -notcontains $_.Name } |\n"
+        "    Select-Object -ExpandProperty Name\n"
+        "$out = @()\n"
+        "foreach ($n in $ours) {\n"
+        "    $d = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |\n"
+        "        Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1\n"
+        "    if ($d) {\n"
+        "        $out += [PSCustomObject]@{ Alias = $n; Default = 'yes' }\n"
+        "    } else {\n"
+        "        $out += [PSCustomObject]@{ Alias = $n; Default = 'no' }\n"
+        "    }\n"
+        "}\n"
+        "ConvertTo-Json -InputObject @($out) -Compress\n"
+    )
+    d = ps_json(ps)
+    if not d:
+        return []
+    records = d if isinstance(d, list) else [d]
+    return [(str(x.get("Alias", "")), str(x.get("Default", "")))
+            for x in records if x.get("Alias")]
 
 
 def preflight_cleanup(tun2socks_path=None):
@@ -832,18 +796,6 @@ def _read_varint(buf, pos):
 def _read_bytes(buf, pos):
     length, pos = _read_varint(buf, pos)
     return buf[pos:pos + length], pos + length
-
-
-def _clean_err(err):
-    """Pull a human-readable line out of a PowerShell stderr blob, skipping
-    the '#< CLIXML' progress/telemetry records PowerShell wraps around errors
-    so the geo-install failure reason is actually readable."""
-    for line in (err or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#<"):
-            continue
-        return line
-    return ""
 
 
 from tuntop.geo.geoip import parse_geoip  # noqa: E402
@@ -1025,6 +977,14 @@ def _disable_netbios_on_wintun():
     return "NETBIOS_DISABLED" in out
 
 
+#: LAN bypass prefixes the helper installs EVERY run (and the gateway-change
+#: re-point re-installs). Supernet prefixes Windows never creates on its own,
+#: so a route for one of these via a real gateway is always OURS.
+# LAN bypass prefixes: imported from tuntop.config.defaults (LAN_BYPASS_PREFIXES)
+# - the single copy shared with the dashboard's sweep and the watchdog.
+_LAN_BYPASS_RANGES = LAN_BYPASS_PREFIXES
+
+
 def _add_lan_bypass(iface, gateway):
     """Install direct (bypass) routes for the private/local IPv4 ranges via the
     REAL physical adapter so LAN traffic never enters the tunnel.
@@ -1037,18 +997,9 @@ def _add_lan_bypass(iface, gateway):
     each socket address').  The ranges below are all MORE specific than the TUN
     split-defaults (0.0.0.0/1, 128.0.0.0/1), so they win for LAN destinations
     and keep that traffic on the physical NIC where it belongs."""
-    ranges = [
-        "10.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "169.254.0.0/16",
-        "100.64.0.0/10",
-        "224.0.0.0/4",
-        "255.255.255.255/32",
-    ]
     print(f"[*] Installing LAN-bypass routes via {iface} ({gateway}) so local "
           f"traffic stays off the tunnel...")
-    for r in ranges:
+    for r in _LAN_BYPASS_RANGES:
         if not add_v4(r, iface, gateway, metric=10):
             print(f"[!] Could not install LAN-bypass route {r}; continuing.")
 
@@ -1183,7 +1134,7 @@ def add_v4(dest, iface, gateway, metric=1):
         print(f"[!] IPv4 route failed: {dest} -> {err or out}")
         return False
 
-    added_routes.append(("v4", dest, iface, gateway))
+    added_routes.append(("v4", dest, iface, gateway), metric=metric)
     return True
 
 
@@ -1251,11 +1202,11 @@ def add_v6(dest, iface, gateway=None, metric=1):
             same_gateway = str(r.get("NextHop", "") or "") == (gateway or "")
             if same_iface and same_gateway:
                 print(f"    [=] Route appeared during add and is correct: {dest}")
-                added_routes.append(("v6", dest, iface, gateway))
+                added_routes.append(("v6", dest, iface, gateway), metric=metric)
                 return True
         print(f"[!] IPv6 route failed: {dest} -> {err or out}")
         return False
-    added_routes.append(("v6", dest, iface, gateway))
+    added_routes.append(("v6", dest, iface, gateway), metric=metric)
     return True
 
 
@@ -1378,7 +1329,7 @@ def override_vpn_routes(vpn_iface, skip_ips):
     VPN transport and loop it back into the TUN.
     """
     global vpn_override_routes, vpn_saved_routes
-    if not vpn_iface or vpn_iface.lower() == TUN.lower():
+    if not vpn_iface or _is_wintun_alias(vpn_iface):
         return
     # Never shadow a route whose prefix is part of the geoip country bypass:
     # those CIDRs are deliberately routed DIRECT via the physical adapter
@@ -1425,6 +1376,210 @@ def override_vpn_routes(vpn_iface, skip_ips):
                 vpn_override_routes.append((fam, prefix, TUN, gw))
 
 
+# ── Live [V]/[Y] mode switching (dashboard -> running helper) ───────────────
+# The dashboard's [V] (VLESS-over-VPN) and [Y] (VPN endpoint bypass) toggles
+# used to require a full stop+start (the modes shape the ROUTES, so the old
+# path restarted the whole tunnel - the TUN reset the user felt on every
+# toggle). The dashboard now pushes the requested modes through the SAME
+# control file the [N] DNS handoff uses, and the monitor loop applies them
+# HERE: every route this helper installed at startup is re-pointed at the
+# new mode's egress, the VPN-override shadowing is undone/re-established to
+# match, and tun2socks never stops. State lives in _live_mode, armed by
+# main() once every startup route is installed.
+
+_live_mode = {
+    "args": None,             # parsed argparse namespace (set in main())
+    "vless_over_vpn": False,  # mode currently ROUTED in the table
+    "no_vpn_bypass": False,
+    "v4": [], "v6": [],       # VLESS endpoint IPs (resolved at startup)
+    "vpn_v4": [], "vpn_v6": [],   # VPN endpoint IPs
+    "phys": (None, None),     # physical iface/gateway captured at startup
+    "vpn_conn": None,         # VPN connection name the transport rides
+    "vpn_routes": [],         # (fam, dest, iface, gw) VPN bypass routes WE added
+}
+
+
+def _remove_host_routes_v6(dest):
+    """Delete every existing IPv6 route for `dest` (used when a mode switch
+    leaves no usable IPv6 gateway for a host: without its direct /128 the
+    traffic rides the TUN splits instead, exactly like the startup path)."""
+    for r in get_existing_v6_routes(dest):
+        remove_route(("v6", dest, str(r.get("InterfaceAlias", "")),
+                      str(r.get("NextHop", "") or "")))
+
+
+def _live_set_vpn_shadow(active):
+    """Undo (active=False) or (re)establish (active=True) the low-metric
+    Wintun shadowing of a connected Windows VPN's injected routes. Mirrors
+    the startup call and cleanup()'s restore path, so the same bookkeeping
+    (vpn_override_routes / vpn_saved_routes) stays valid for teardown.
+    Returns True when a shadow is (now) in place."""
+    global vpn_override_iface
+    if active:
+        if vpn_override_routes or vpn_saved_routes:
+            return True                     # already shadowed
+        args = _live_mode.get("args")
+        vdef = get_vpn_ipv4_default(
+            getattr(args, "vpn_interface", None) if args else None)
+        if not vdef:
+            return False                    # no connected VPN - nothing to shadow
+        vpn_override_iface = vdef[0]
+        skip = set(str(x) for x in (_live_mode["v4"] + _live_mode["v6"]
+                                    + _live_mode["vpn_v4"]
+                                    + _live_mode["vpn_v6"]))
+        skip.update(_vpn_self_addresses(vpn_override_iface))
+        print(f"[*] Shadowing {vpn_override_iface} injected routes with "
+              "Wintun (sole egress)...", flush=True)
+        override_vpn_routes(vpn_override_iface, skip)
+        return True
+    if not (vpn_override_routes or vpn_saved_routes):
+        return False
+    print("[*] Removing VPN-override routes (mode switch) - the VPN's own "
+          "routes are restored...", flush=True)
+    for item in reversed(list(vpn_override_routes)):
+        remove_route(item)
+    vpn_override_routes.clear()
+    for fam, dest, iface, gateway, metric in reversed(vpn_saved_routes):
+        _raw_add_route(fam, dest, iface, gateway, metric)
+    vpn_saved_routes.clear()
+    vpn_override_iface = None
+    return False
+
+
+def _live_apply_vpn_bypass_routes(enable):
+    """Install (enable) or remove (disable) the Windows-VPN endpoint bypass
+    routes. Mirrors the startup logic (resolve connected VPNs' ServerAddress
+    values, /32 + /128 via the physical egress). Returns log lines."""
+    lines = []
+    args = _live_mode.get("args")
+    if enable:
+        src = get_active_windows_vpn_servers()
+        if args is not None and getattr(args, "vpn_server", None):
+            src = src + [("manual VPN server", s) for s in args.vpn_server]
+        v4n, v6n, seen = [], [], set()
+        for name, server in src:
+            key = str(server).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ep4, ep6 = resolve_all_safe(server, label=f"VPN endpoint {server}")
+            if ep4 is None and ep6 is None:
+                lines.append(f"[!] Could not resolve VPN endpoint "
+                             f"'{name}' ({server}) - skipped.")
+                continue
+            v4n.extend(x for x in (ep4 or []) if x not in v4n)
+            v6n.extend(x for x in (ep6 or []) if x not in v6n)
+        added = []
+        d6 = get_ipv6_default()
+        for ip in v4n:
+            eg = get_egress_for(ip, exclude_vpn=True) or _live_mode["phys"]
+            if not eg or eg[0] is None:
+                continue
+            if add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
+                added.append(("v4", f"{ip}/32", eg[0], eg[1]))
+                lines.append(f"    VPN {ip} -> via {eg[0]} ({eg[1]})")
+        for ip in v6n:
+            if d6:
+                if add_v6(f"{ip}/128", d6["InterfaceAlias"], d6["NextHop"], 1):
+                    added.append(("v6", f"{ip}/128", d6["InterfaceAlias"],
+                                  d6["NextHop"]))
+        _live_mode["vpn_v4"], _live_mode["vpn_v6"] = v4n, v6n
+        _live_mode["vpn_routes"] = added
+        lines.insert(0, f"[+] VPN endpoint bypass installed live "
+                        f"({len(added)} route(s)).")
+    else:
+        removed = 0
+        for fam, dest, iface, gw in _live_mode.get("vpn_routes", []):
+            remove_route((fam, dest, iface, gw))
+            removed += 1
+        _live_mode["vpn_routes"] = []
+        lines.insert(0, f"[-] VPN endpoint bypass removed live "
+                        f"({removed} route(s)) - VPN traffic is tunneled now.")
+    return lines
+
+
+def _live_switch_vless(over):
+    """Re-point every VLESS endpoint bypass route at the mode-appropriate
+    gateway WITHOUT touching tun2socks. Returns (ok, log_lines); ok=False
+    means the switch was REFUSED (mode stays unchanged)."""
+    lines = []
+    args = _live_mode.get("args")
+    vpn_interface = getattr(args, "vpn_interface", None) if args else None
+    if over:
+        # The VPN's own injected routes must be able to carry the transport
+        # again - undo the sole-egress shadowing FIRST, then verify a VPN
+        # default route actually exists (same check as startup's pre-flight,
+        # but non-fatal: a refused switch keeps the old mode).
+        _live_set_vpn_shadow(False)
+        vdef = get_vpn_ipv4_default(vpn_interface)
+        if not vdef:
+            lines.append("[!] VLESS-over-VPN switch refused: no connected "
+                         "Windows VPN default route was found. Connect the "
+                         "VPN and toggle [V] again.")
+            return False, lines
+        _live_mode["over"] = (vdef[0], vdef[1])
+        _live_mode["vpn_conn"] = vdef[0]
+        v6d = get_vpn_ipv6_default(vpn_interface)
+        eg6 = (v6d[0], v6d[1]) if v6d else None
+    else:
+        v6d = get_ipv6_default()
+        eg6 = (v6d["InterfaceAlias"], v6d["NextHop"]) if v6d else None
+    ok = True
+    for ip in _live_mode["v4"]:
+        if over:
+            eg = get_egress_for(ip, exclude_vpn=False) or _live_mode["over"]
+        else:
+            eg = get_egress_for(ip, exclude_vpn=True) or _live_mode["phys"]
+        if not eg or eg[0] is None:
+            ok = False
+            lines.append(f"[!] No usable egress for VLESS endpoint {ip} - "
+                         "route left as-is.")
+            continue
+        # add_v4 replaces a same-prefix route installed via the OLD egress,
+        # so the flip is a true re-point, not a silent no-op.
+        if add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
+            lines.append(f"    VLESS {ip} -> via {eg[0]} ({eg[1]})")
+        else:
+            ok = False
+            lines.append(f"[!] Could not re-route VLESS endpoint {ip}.")
+    for ip in _live_mode["v6"]:
+        if eg6:
+            if add_v6(f"{ip}/128", eg6[0], eg6[1], metric=1):
+                lines.append(f"    VLESS {ip} (v6) -> via {eg6[0]} ({eg6[1]})")
+        else:
+            # No usable IPv6 gateway in this mode (e.g. IPv4-only VPN):
+            # drop the direct /128 so the endpoint rides the TUN, the same
+            # state a fresh start in this mode would produce.
+            _remove_host_routes_v6(f"{ip}/128")
+    if not over and not _live_mode["no_vpn_bypass"]:
+        # Back to direct mode with VPN endpoints still bypassed: re-shadow a
+        # connected VPN's injected routes (the startup condition, restored).
+        if _live_set_vpn_shadow(True):
+            lines.append("[*] VPN injected routes shadowed with Wintun "
+                         "(sole egress) - as on startup.")
+    lines.insert(0, "[*] VLESS transport -> "
+                 + ("Windows VPN" if over else "physical adapter bypass"))
+    return ok, lines
+
+
+def _live_switch_vpn_bypass(disable):
+    """disable=True: remove the Windows-VPN endpoint bypass routes (the VPN
+    traffic itself is tunneled). disable=False: resolve + install them (VPN
+    endpoints stay direct). The VPN-override shadowing follows, because at
+    startup it only ever coexists with bypassed VPN endpoints (the VPN's own
+    server endpoint must stay reachable outside the TUN)."""
+    lines = _live_apply_vpn_bypass_routes(not disable)
+    if disable:
+        if not _live_mode["vless_over_vpn"] and _live_set_vpn_shadow(False):
+            lines.append("[i] VPN route shadowing removed together with the "
+                         "bypass - the VPN connection must stay reachable.")
+    else:
+        if not _live_mode["vless_over_vpn"] and _live_set_vpn_shadow(True):
+            lines.append("[*] VPN injected routes shadowed with Wintun "
+                         "(sole egress) - as on startup.")
+    return True, lines
+
+
 def ensure_wintun_ipv6():
     """Ensure the Wintun IPv6 address (fd00:dead:beef::1/64) is present before
     pointing IPv6 routes at it - otherwise ::/0, ::/1 and 8000::/1 all fail to
@@ -1449,7 +1604,7 @@ def ensure_physical_metric_below_vpn(phys_iface):
 
     The original metric is saved globally and restored in cleanup()."""
     global phys_bypass_metric_saved, phys_bypass_iface
-    if not phys_iface or phys_iface.lower() == TUN.lower():
+    if not phys_iface or _is_wintun_alias(phys_iface):
         return
     vpn = get_vpn_ipv4_default()
     if not vpn:
@@ -1493,6 +1648,233 @@ def restore_physical_metric():
     phys_bypass_iface = None
 
 
+# ── Gateway-change auto re-route ─────────────────────────────────────────────
+# When the physical network changes under a running tunnel (Wi-Fi roam, a DHCP
+# renew handing out a different gateway, dock/undock), every route we PINNED
+# to the old gateway stays in the table pointing at a next-hop that no longer
+# exists: the VLESS endpoint /32s, the LAN bypasses and the geo bypasses all
+# go dark - the system "loses the internet" even though the new network is
+# fine. The monitor loop polls the default gateway every few seconds and
+# re-points every pinned route at the new one. TUN routes are untouched: they
+# ride the wintun adapter and are unaffected by the change.
+
+#: Seconds between gateway-change polls in the monitor loop.
+_GW_CHECK_EVERY = 5
+
+#: Serialises the geo re-point so a slow bulk move can never overlap itself.
+_geo_repoint_lock = threading.Lock()
+
+#: Guards EVERY mutation of geoip_added (registration during install,
+#: gateway re-point tracking rewrite, cleanup snapshot+clear). Without it a
+#: CIDR batch registered while cleanup() was snapshotting leaked untracked
+#: routes - the signal handler could then os._exit() with a half-installed
+#: country still in the table.
+_geo_state_lock = threading.Lock()
+
+#: Set by _on_signal: the background geo install skips its remaining
+#: netsh sub-batches so it cannot add routes behind cleanup()'s back.
+_geo_install_cancel = threading.Event()
+
+#: The geo-install daemon thread (set in main() so _on_signal can join it).
+_geo_install_thread = None
+
+#: Debounce state for the gateway monitor (candidate, first-seen timestamp).
+_gw_pending = None
+_gw_pending_since = 0.0
+
+
+def _repoint_geo_batch(rows):
+    """Batch-add (fam, dest, iface, gw) rows via netsh -f scripts - the SAME
+    fast path add_geoip_bypass() uses for the initial install. Never raises."""
+    if not rows:
+        return
+    chunks = [rows[i:i + GEO_SUB_BATCH] for i in range(0, len(rows), GEO_SUB_BATCH)]
+
+    def _add_chunk(grp):
+        lines = []
+        for fam, dest, iface, gw in grp:
+            verb = "ipv4" if fam == "v4" else "ipv6"
+            iface_dq = '"' + str(iface).replace('"', '') + '"'
+            gw_tok = (" %s" % str(gw)) if gw else ""
+            lines.append("interface %s add route %s %s%s metric=1 store=active"
+                         % (verb, dest, iface_dq, gw_tok))
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="geo_rep_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            run(["netsh", "-f", path], timeout=GEO_SUB_TIMEOUT)
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(chunks), GEO_MAX_WORKERS)) as ex:
+        for _fut in concurrent.futures.as_completed(
+                [ex.submit(_add_chunk, c) for c in chunks]):
+            try:
+                _fut.result()
+            except Exception:
+                pass
+
+
+def _repoint_geo_routes(old_iface, new_iface, new_gw):
+    """Re-point every geoip bypass route that was installed via the OLD
+    physical interface at the NEW default gateway (and, for IPv6, at the
+    current native v6 default). Bulk-deletes the old-gw copies, batch-adds
+    the replacements and rewrites geoip_added so a later cleanup() removes
+    exactly what is in the table. Returns how many routes were re-added."""
+    rows = [it for it in list(geoip_added)
+            if str(it[2]).lower() == str(old_iface).lower()]
+    if not rows:
+        return 0
+    new_rows = []
+    d6 = None
+    for fam, dest, iface, gw in rows:
+        if fam == "v4":
+            new_rows.append((fam, dest, new_iface, new_gw))
+        else:
+            if d6 is None:
+                d6 = get_ipv6_default()
+            if d6:
+                new_rows.append((fam, dest, d6["InterfaceAlias"],
+                                 d6.get("NextHop") or ""))
+    _remove_routes_bulk(rows)
+    if new_rows:
+        _repoint_geo_batch(new_rows)
+    # Tracking rewrite under the state lock: cleanup() may be snapshotting
+    # geoip_added concurrently (teardown during a gateway change) - without
+    # the lock a removed row could leak or a new row could vanish.
+    with _geo_state_lock:
+        for r in rows:
+            try:
+                geoip_added.remove(r)
+            except ValueError:
+                pass
+        for r in new_rows:
+            geoip_added.append(r)
+    return len(new_rows)
+
+
+def _repoint_pinned_routes(old_iface, old_gw, new_iface, new_gw,
+                           old6=None, new6=None):
+    """Re-point every route THIS helper pinned to the old physical egress
+    (added_routes: endpoint /32+/128 bypasses, LAN bypasses, proxy2 server
+    bypasses) at the new gateway. add_v4/add_v6 replace any drifted copy of
+    the same destination, so the old-gw route is gone after each re-add, and
+    the appended tracking tuple keeps cleanup() exact. Routes that were NOT
+    pinned to the old egress (TUN routes, VPN-transport endpoints in
+    over-VPN mode) never match and are left alone. Returns how many routes
+    moved."""
+    moved = 0
+    for item in list(added_routes):
+        fam, dest, iface, gw = item
+        if fam == "v4":
+            if (str(iface).lower() != str(old_iface).lower()
+                    or str(gw or "") != str(old_gw or "")):
+                continue
+            tgt = (new_iface, new_gw)
+            metric = added_routes.metric_of(item,
+                                            10 if dest in _LAN_BYPASS_RANGES
+                                            else 1)
+        else:
+            if not old6 or not new6:
+                continue
+            if (str(iface).lower() != str(old6[0]).lower()
+                    or str(gw or "") != str(old6[1] or "")):
+                continue
+            tgt = (new6[0], new6[1])
+            metric = added_routes.metric_of(item, 1)
+        try:
+            added_routes.remove(item)
+        except ValueError:
+            continue
+        ok = (add_v4(dest, tgt[0], tgt[1], metric=metric) if fam == "v4"
+              else add_v6(dest, tgt[0], tgt[1], metric))
+        if ok:
+            moved += 1
+        else:
+            print(f"[!] Could not re-point {dest} to {tgt[0]} ({tgt[1]}); "
+                  f"it stays on the old egress.", flush=True)
+    return moved
+
+
+def _check_gateway_change():
+    """Monitor-loop hook: detect a changed physical default gateway and
+    re-point every route pinned to the old one. Debounced - a candidate
+    gateway must be seen twice (>=2s apart) before anything moves - so a
+    mid-DHCP transition is never mistaken for the final state. Never raises;
+    prints [GATEWAY] markers the dashboard surfaces."""
+    global _gw_pending, _gw_pending_since
+    phys = _live_mode.get("phys")
+    if not phys:
+        return
+    # A missing default route is a normal moment during a network transition,
+    # never a reason to die here - the safe wrapper turns the legacy
+    # sys.exit() failure mode into a plain None.
+    res = RouteResult.unwrap(get_ipv4_default)
+    if not res.ok or not res.value:
+        return
+    cur = res.value
+    iface, gw = str(cur[0]), str(cur[1])
+    if (iface.lower() == str(phys[0]).lower()
+            and gw == str(phys[1] or "")):
+        _gw_pending = None          # back on the known egress - drop candidate
+        return
+    now = time.time()
+    cand = (iface, gw)
+    if _gw_pending != cand or (now - _gw_pending_since) < 2.0:
+        if _gw_pending != cand:
+            _gw_pending, _gw_pending_since = cand, now
+        return
+    _gw_pending = None
+    old_iface, old_gw = str(phys[0]), str(phys[1] or "")
+    print(f"[GATEWAY] Physical egress changed: "
+          f"{old_iface} ({old_gw}) -> {iface} ({gw})", flush=True)
+    print("[*] Re-pointing pinned routes to the new gateway...", flush=True)
+    old6 = _live_mode.get("phys6") or None
+    try:
+        d6 = get_ipv6_default()
+        new6 = ((d6["InterfaceAlias"], d6.get("NextHop") or "")
+                if d6 else None)
+    except Exception:
+        new6 = None
+    try:
+        moved = _repoint_pinned_routes(old_iface, old_gw, iface, gw,
+                                       old6=old6, new6=new6)
+        print(f"[+] {moved} endpoint/LAN route(s) re-pointed "
+              f"to {iface} ({gw}).", flush=True)
+    except Exception as e:
+        print(f"[!] Endpoint re-point failed: "
+              f"{e.__class__.__name__}: {e}", flush=True)
+    # Geo bypasses: potentially thousands of routes - move them on a worker
+    # thread so the monitor loop never stalls. Only the physical-egress rows
+    # are touched (geo via wintun/VPN never matches the old physical iface).
+    if any(str(it[2]).lower() == old_iface.lower() for it in list(geoip_added)):
+        def _worker():
+            try:
+                with _geo_repoint_lock:
+                    n = _repoint_geo_routes(old_iface, iface, gw)
+                if n:
+                    print(f"[+] geoip: {n} route(s) re-pointed to the new "
+                          f"gateway.", flush=True)
+            except Exception as e:
+                print(f"[!] geoip gateway re-point failed: "
+                      f"{e.__class__.__name__}: {e}", flush=True)
+        threading.Thread(target=_worker, name="geo-repoint",
+                         daemon=True).start()
+    # The metric lowering (if any) was applied to the OLD interface: put it
+    # back, then re-arm on the new one (no-op without a connected VPN).
+    try:
+        restore_physical_metric()
+        ensure_physical_metric_below_vpn(iface)
+    except Exception:
+        pass
+    _live_mode["phys"] = (iface, gw)
+    _live_mode["phys6"] = new6
+
+
 def ensure_wintun_ipv4():
     """Ensure the Wintun IPv4 address (192.168.123.1/24) is present before
     pointing IPv4 routes at it. If it is missing, every IPv4 wintun route add
@@ -1501,10 +1883,11 @@ def ensure_wintun_ipv4():
     return _ensure_wintun_address("IPv4", TUN4, TUN4_MASK)
 
 
-# The Wintun adapter owns these subnets; a bypass route that overlaps either
-# would shadow the tunnel's own next-hop and break every Wintun route add.
-_WINTUN4_NET = ipaddress.ip_network("192.168.123.0/24")
-_WINTUN6_NET = ipaddress.ip_network("fd00:dead:beef::/64")
+# The Wintun subnets are defined in tuntop.config.defaults
+# (WINTUN4_NET / WINTUN6_NET); a bypass route that overlaps either would
+# shadow the tunnel's own next-hop and break every Wintun route add.
+_WINTUN4_NET = WINTUN4_NET
+_WINTUN6_NET = WINTUN6_NET
 
 
 def _is_routable_bypass_cidr(cidr):
@@ -1597,13 +1980,9 @@ def collect_protected_geo_prefixes(server_v4=(), server_v6=(),
     return prot
 
 
-# Geo install tuning.  Sub-batch size (routes per `netsh -f` invocation), worker
-# cap (concurrent netsh writers against the Windows route store), and the hard
-# per-sub-batch timeout that lets a hung `netsh add route` be killed instead of
-# freezing the whole install.
-GEO_SUB_BATCH = 100
-GEO_MAX_WORKERS = 6
-GEO_SUB_TIMEOUT = 90
+# Geo install tuning (GEO_SUB_BATCH / GEO_MAX_WORKERS / GEO_SUB_TIMEOUT) is
+# imported from tuntop.config.defaults - the sweep paths in the dashboard and
+# the watchdog share the same script mechanism and must agree on it.
 
 
 def _geo_remove_conflicts(cidrs, iface, fam):
@@ -1641,7 +2020,7 @@ def _geo_remove_conflicts(cidrs, iface, fam):
         "%s | ForEach-Object { $null = $hs.Add($_) }; "
         "Get-NetRoute -AddressFamily '%s' -ErrorAction SilentlyContinue | "
         "Where-Object { $hs.Contains($_.DestinationPrefix) -and "
-        "$_.InterfaceAlias -ne 'wintun' -and $_.InterfaceAlias -ne 'wintun2' } | "
+        "$_.InterfaceAlias -notmatch '^wintun' } | "
         "ForEach-Object { \"$($_.DestinationPrefix)|$($_.InterfaceAlias)\" }"
     ) % (routes_lit, af)
     _code, out, _err = run_ps(ps, timeout=90)
@@ -1730,7 +2109,7 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
     if not cidrs:
         _geo_diag(("skip_nodefault", code),
                   f"[!] geoip:{code} bypass skipped (no usable non-default CIDRs).")
-        return
+        return []
     v4_all = [c for c in cidrs if ":" not in c]
     v6_all = [c for c in cidrs if ":" in c]
     v4 = [c for c in v4_all if _is_routable_bypass_cidr(c)]
@@ -1743,7 +2122,7 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
     if not v4 and not v6:
         _geo_diag(("skip_noroutable", code),
                   f"[!] geoip:{code} bypass skipped (no routable CIDRs remain after filtering).")
-        return
+        return []
     # PROTECTED PREFIXES OUTRANK GEOIP (endpoints + user bypass).  A geoip
     # country list can contain the VLESS/VPN server's own IP - even as an
     # exact /32 equal to the server's host route.  Without this guard the
@@ -1769,7 +2148,7 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
             _geo_diag(("skip_allprotected", code),
                       f"[!] geoip:{code} bypass skipped (every CIDR overlaps a "
                       f"protected endpoint/bypass prefix).")
-            return
+            return []
     print(f"[*] Installing geoip:{code} bypass ({len(v4)} IPv4, {len(v6)} IPv6) via {iface}...")
     # Heartbeat BEFORE the slow pre-install passes below.  The dashboard's
     # startup watchdog extends its grace window while [GEO-LOAD] markers keep
@@ -1782,7 +2161,7 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
     # routes for these exact CIDRs, so beating it requires the physical
     # interface metric to sit below the VPN's.  No-op when geo is routed via
     # wintun (--geoip-via-vpn) or the VPN itself (--geoip-via-win-vpn).
-    if iface and iface.lower() != TUN.lower():
+    if iface and not _is_wintun_alias(iface):
         vpn = get_vpn_ipv4_default()
         if not (vpn and vpn[0].lower() == iface.lower()):
             ensure_physical_metric_below_vpn(iface)
@@ -1821,19 +2200,26 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
     # once per family as a warning.  Routes are recorded in geoip_added for
     # cleanup() later.
     sub_batches = []
-    for fam, subset, ifa, gw in (("v4", v4, iface, gateway),
-                                 ("v6", v6, v6iface, v6gw)):
-        if not subset or not ifa or gw is None:
-            continue
-        for i in range(0, len(subset), GEO_SUB_BATCH):
-            grp = subset[i:i + GEO_SUB_BATCH]
-            sub_batches.append((fam, grp, ifa, gw))
-            for r in grp:
-                geoip_added.append((fam, r, ifa, gw))
+    # Registration is upfront (before any netsh runs) and lock-guarded, so a
+    # cleanup() racing this install always SEES every route it is about to
+    # install and can bulk-remove it - no untracked leftovers.
+    with _geo_state_lock:
+        registered = []
+        for fam, subset, ifa, gw in (("v4", v4, iface, gateway),
+                                     ("v6", v6, v6iface, v6gw)):
+            if not subset or not ifa or gw is None:
+                continue
+            for i in range(0, len(subset), GEO_SUB_BATCH):
+                grp = subset[i:i + GEO_SUB_BATCH]
+                sub_batches.append((fam, grp, ifa, gw))
+                for r in grp:
+                    row = (fam, r, ifa, gw)
+                    registered.append(row)
+                    geoip_added.append(row)
     if not sub_batches:
         _geo_diag(("skip_noiface", code),
                   f"[!] geoip:{code} bypass skipped (no usable CIDRs / no interface + next-hop).")
-        return
+        return []
     total = sum(len(g) for _, g, _, _ in sub_batches)
     loaded = 0
     geo_lock = threading.Lock()
@@ -1843,6 +2229,10 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
 
     def _install_sub(fam, grp, ifa, gw):
         nonlocal loaded
+        if _geo_install_cancel.is_set():
+            # Teardown started mid-install: skip the remaining sub-batches
+            # so we cannot add routes behind cleanup()'s bulk delete.
+            return
         netsh_verb = "ipv4" if fam == "v4" else "ipv6"
         iface_dq = '"' + str(ifa).replace('"', '') + '"'
         gw_part = str(gw) if gw else ""
@@ -1950,6 +2340,7 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
     # window on this marker and then hides the panel.
     if total:
         print(f"[GEO-DONE] code={code} loaded={loaded} total={total}", flush=True)
+    return registered
 
 
 def _remove_routes_bulk(routes):
@@ -2022,18 +2413,21 @@ def cleanup():
     # self-healing Windows VPN, before touching any other state.
     restore_physical_metric()
 
-    # Bulk-remove geoip bypass routes first (can be thousands of entries).
-    if geoip_added:
-        print(f"[*] Cleaning up {len(geoip_added)} geoip bypass routes...")
-        _remove_routes_bulk(geoip_added)
-        geoip_added.clear()
-
+    # ORDER MATTERS (this was the Alt+F4 hole): cleanup() runs inside the
+    # console-close window, and the OS may kill us mid-way when it expires.
+    # The old order did the SLOW bulk geo delete FIRST, so everything after
+    # it - the endpoint /32+/128 host routes, the VPN-override undo - never
+    # ran, and "the servers I added stay in the routing table after Alt+F4"
+    # was exactly that. Now every small, CRITICAL teardown runs before the
+    # one long pole (the thousands-of-routes geo bulk delete) so a kill
+    # mid-cleanup can only ever leave geo routes behind - those the exit
+    # sweeps and the detached watchdog still remove by CIDR matching.
     print("\n[*] Cleaning up routes...")
     # Remove the VPN-override routes we added to keep the tunnel the sole egress,
     # then restore the VPN's original injected routes we shadowed.
     if vpn_override_routes:
         print(f"[*] Removing {len(vpn_override_routes)} VPN-override routes...")
-        for item in reversed(vpn_override_routes):
+        for item in reversed(list(vpn_override_routes)):
             remove_route(item)
         vpn_override_routes.clear()
     if vpn_saved_routes:
@@ -2041,16 +2435,11 @@ def cleanup():
         for fam, dest, iface, gateway, metric in reversed(vpn_saved_routes):
             _raw_add_route(fam, dest, iface, gateway, metric)
         vpn_saved_routes.clear()
-    # Restore Wintun's original interface metric.
-    if wintun_saved_metric is not None:
-        try:
-            run_ps(f"Set-NetIPInterface -InterfaceAlias '{TUN}' "
-                    f"-InterfaceMetric {wintun_saved_metric}")
-        except Exception:
-            pass
-        wintun_saved_metric = None
-    for item in reversed(added_routes):
+    # Remove every route this helper installed (endpoint /32+/128 bypasses,
+    # LAN bypasses, TUN default/split routes) - small, fast, CRITICAL.
+    for item in reversed(list(added_routes)):
         remove_route(item)
+    added_routes.clear()
 
     if tun_proc is not None and tun_proc.poll() is None:
         print("[*] Stopping tun2socks...")
@@ -2067,6 +2456,27 @@ def cleanup():
             tun2_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             tun2_proc.kill()
+
+    # Restore Wintun's original interface metric.
+    if wintun_saved_metric is not None:
+        try:
+            run_ps(f"Set-NetIPInterface -InterfaceAlias '{TUN}' "
+                    f"-InterfaceMetric {wintun_saved_metric}")
+        except Exception:
+            pass
+        wintun_saved_metric = None
+
+    # LAST: the long pole. Bulk-remove geoip bypass routes (can be thousands
+    # of entries) - if the OS kills us during THIS, only geo routes survive,
+    # and the dashboard's exit sweep / the watchdog remove those by CIDR.
+    # Snapshot + clear under the state lock so a concurrently registering
+    # install (or a gateway re-point rewrite) can never leak untracked rows.
+    with _geo_state_lock:
+        geo_rows = list(geoip_added)
+        geoip_added.clear()
+    if geo_rows:
+        print(f"[*] Cleaning up {len(geo_rows)} geoip bypass routes...")
+        _remove_routes_bulk(geo_rows)
 
     print("[*] Done.")
 
@@ -2395,12 +2805,12 @@ def start_tun2socks_pipe(device_name, ip4, ip6, port, tun2socks_path,
 
 
 def main():
-    global tun_proc, tun2_proc
+    global tun_proc, tun2_proc, _geo_install_thread
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--server", nargs="+", required=True,
                     help="VLESS server hostname or IP (repeatable: --server a b)")
-    ap.add_argument("--port", type=int, default=10808,
+    ap.add_argument("--port", type=int, default=DEFAULT_SOCKS_PORT,
                     help="Local SOCKS5 port of your proxy client (v2rayN, Xray, "
                          "sing-box, Clash, etc.)")
     ap.add_argument("--tun2socks", default="tun2socks.exe",
@@ -2534,6 +2944,18 @@ def main():
     # sends CTRL_BREAK_EVENT) - not only on a clean interpreter exit. cleanup()
     # is idempotent, so a later atexit call is a harmless no-op.
     def _on_signal(signum, frame):
+        # Stop the background geo install FIRST and let it wind down
+        # briefly: os._exit() mid-install leaves a half-installed country's
+        # routes behind. The cancel flag makes the installer skip its
+        # remaining netsh sub-batches; the join bounds the wait so the
+        # signal handler never hangs.
+        try:
+            _geo_install_cancel.set()
+            _t = _geo_install_thread
+            if _t is not None and _t.is_alive():
+                _t.join(timeout=3.0)
+        except Exception:
+            pass
         try:
             cleanup()
         finally:
@@ -2547,6 +2969,21 @@ def main():
             except (ValueError, OSError, AttributeError, RuntimeError):
                 pass
     preflight_cleanup(tun2socks_path=getattr(args, "tun2socks", None))
+
+    # A second Wintun program (v2rayN/xray TUN mode = 'Wintun Tunnel') cannot
+    # coexist with this tunnel: whichever adapter owns the lowest-metric
+    # 0.0.0.0/0 silently steals all traffic. Say it out loud instead of
+    # letting the operator debug a "RUNNING but empty" tunnel.
+    for _fx_alias, _fx_def in get_foreign_tun_adapters():
+        if _fx_def == "yes":
+            print(f"[!] WARNING: another TUN program is active: adapter "
+                  f"'{_fx_alias}' has its own 0.0.0.0/0 route (e.g. v2rayN/xray "
+                  "TUN mode). Turn its TUN mode OFF (keep only its SOCKS "
+                  "127.0.0.1:10808) or browser traffic will bypass this "
+                  "tunnel entirely.")
+        else:
+            print(f"[*] Foreign Wintun adapter '{_fx_alias}' present (no "
+                  "default route) - left untouched.")
 
     iface, gateway, ifindex = get_ipv4_default()
     print(f"[*] Physical interface: {iface}  IfIndex={ifindex}  Gateway={gateway}")
@@ -2620,6 +3057,7 @@ def main():
                   "--vless-over-vpn (or --vpn-interface " + _vpn_def[0] + ").")
 
     vpn_v4, vpn_v6 = [], []
+    _live_vpn_routes = []   # exact VPN bypass routes installed (live [Y] undo)
     seen_vpn_servers = set()
     if vpn_servers:
         print("[*] Resolving Windows VPN endpoint bypasses...")
@@ -2694,6 +3132,8 @@ def main():
             eg = get_egress_for(ip) or (iface, gateway)
             if not add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
                 print(f"[!] Could not install VPN bypass route for {ip}; continuing.")
+            else:
+                _live_vpn_routes.append(("v4", f"{ip}/32", eg[0], eg[1]))
 
     # Only add IPv6 bypass if there's a usable IPv6 gateway to use for it.
     if v6:
@@ -2730,6 +3170,8 @@ def main():
             print("[*] Installing Windows VPN IPv6 bypass routes...")
             for ip in vpn_v6:
                 add_v6(f"{ip}/128", d6["InterfaceAlias"], d6["NextHop"], 1)
+                _live_vpn_routes.append(("v6", f"{ip}/128",
+                                         d6["InterfaceAlias"], d6["NextHop"]))
         else:
             print("[!] No usable native IPv6 gateway; IPv6 VPN bypass not installed.")
 
@@ -2956,9 +3398,14 @@ def main():
         # Background daemon: never blocks the startup sequence (see the
         # docstring on _geo_install). Daemon because a Ctrl+C/[T] stop must
         # not be held up by a half-finished geo install - the exit cleanup
-        # sweeps whatever routes actually made it into the table.
-        threading.Thread(target=_geo_install, name="geo-install",
-                         daemon=True).start()
+        # sweeps whatever routes actually made it into the table. The thread
+        # handle is published so _on_signal can cancel + join it before
+        # cleanup() (an os._exit mid-install leaves a half-installed country
+        # in the table).
+        _geo_install_thread = threading.Thread(target=_geo_install,
+                                               name="geo-install",
+                                               daemon=True)
+        _geo_install_thread.start()
 
     print("[*] Installing IPv4 default route through Wintun...")
     # The wintun IPv4 address (192.168.123.1) is the next-hop for every IPv4
@@ -3065,6 +3512,31 @@ def main():
     # public default/split routes during install ordering.
     _add_lan_bypass(iface, gateway)
 
+    # Arm the live [V]/[Y] channel with THIS run's route state (see
+    # _live_mode): the monitor loop's poll_control_file can then re-point
+    # these very endpoints when the dashboard toggles a mode at runtime -
+    # without a tunnel restart.
+    _live_mode["args"] = args
+    _live_mode["vless_over_vpn"] = bool(args.vless_over_vpn)
+    _live_mode["no_vpn_bypass"] = bool(args.no_vpn_bypass)
+    _live_mode["v4"] = list(v4)
+    _live_mode["v6"] = list(v6)
+    _live_mode["vpn_v4"] = list(vpn_v4)
+    _live_mode["vpn_v6"] = list(vpn_v6)
+    _live_mode["phys"] = (iface, gateway)
+    _live_mode["over"] = (vless_iface, vless_gateway)
+    _live_mode["vpn_conn"] = vpn_conn_name_for_check
+    _live_mode["vpn_routes"] = list(_live_vpn_routes)
+    # Native IPv6 egress at startup - the gateway monitor compares against it
+    # to re-point native-IPv6 endpoint /128s when the network changes.
+    try:
+        _d6 = get_ipv6_default()
+        _live_mode["phys6"] = ((str(_d6["InterfaceAlias"]),
+                                str(_d6.get("NextHop") or ""))
+                               if _d6 else None)
+    except Exception:
+        _live_mode["phys6"] = None
+
     print(flush=True)
     print("[+] TUNNEL ACTIVE", flush=True)
     if ipv4_ok:
@@ -3094,6 +3566,7 @@ def main():
     last_vpn_status = None
     last_probe = 0.0
     last_leak = None      # last leak verdict - report only on CHANGE
+    last_gw_check = 0.0   # gateway-change poll clock (see _check_gateway_change)
     fails = 0
     mon_interval = max(5, args.monitor_interval)
     mon_retries = max(1, args.monitor_retries)
@@ -3107,13 +3580,27 @@ def main():
                 poll_control_file()
             except Exception:
                 pass
-            if args.vless_over_vpn and vpn_conn_name_for_check and int(now) % 10 == 0:
-                status = get_vpn_connection_names_status().get(vpn_conn_name_for_check)
-                if status != last_vpn_status:
-                    if status and status != "Connected":
-                        print(f"[!] Windows VPN '{vpn_conn_name_for_check}' status changed: {status}",
-                              flush=True)
-                    last_vpn_status = status
+            # WiFi/network changed under the running tunnel? Re-point every
+            # route pinned to the old gateway (endpoints, LAN, geo) so the
+            # system keeps its internet. Cheap PowerShell poll, debounced.
+            if not args.no_monitor and (now - last_gw_check) >= _GW_CHECK_EVERY:
+                last_gw_check = now
+                try:
+                    _check_gateway_change()
+                except Exception:
+                    pass
+            if args.vless_over_vpn and int(now) % 10 == 0:
+                # The transport may have been switched TO over-VPN live ([V]
+                # toggle): then vpn_conn_name_for_check (the startup value)
+                # is None and the live channel names the connection instead.
+                _vpn_conn = vpn_conn_name_for_check or _live_mode.get("vpn_conn")
+                if _vpn_conn:
+                    status = get_vpn_connection_names_status().get(_vpn_conn)
+                    if status != last_vpn_status:
+                        if status and status != "Connected":
+                            print(f"[!] Windows VPN '{_vpn_conn}' status changed: {status}",
+                                  flush=True)
+                        last_vpn_status = status
             # Live monitor / debug loop: periodically verify the tunnel resolves
             # and carries traffic through the TUN. On repeated failure, self-heal
             # (re-apply Wintun DNS + default/split routes) instead of requiring a

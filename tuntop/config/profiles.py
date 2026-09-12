@@ -17,6 +17,10 @@ from __future__ import annotations
 import json
 import os
 
+from tuntop.config.defaults import (
+    DEFAULT_ENDPOINT_PORT, DEFAULT_SOCKS_PORT, DNS4,
+)
+
 
 #: Default profile-store filename (Phase 15 - portable, branded).
 PROFILE_FILENAME = "MyTunTopProfile.json"
@@ -33,10 +37,10 @@ def snapshot_from_args(ns) -> dict:
     v2rayN; this file must stay shareable)."""
     return {
         "server": list(getattr(ns, "server", []) or []),
-        "port": getattr(ns, "port", 10808),
-        "dns4": getattr(ns, "dns4", "8.8.8.8"),
+        "port": getattr(ns, "port", DEFAULT_SOCKS_PORT),
+        "dns4": getattr(ns, "dns4", DNS4),
         "dns6": getattr(ns, "dns6", None),
-        "endpoint_port": getattr(ns, "endpoint_port", 443),
+        "endpoint_port": getattr(ns, "endpoint_port", DEFAULT_ENDPOINT_PORT),
         "bypass_ip": list(getattr(ns, "bypass_ip", []) or []),
         "vpn_bypass_ip": list(getattr(ns, "vpn_bypass_ip", []) or []),
         "proxy2_bypass_ip": list(getattr(ns, "proxy2_bypass_ip", []) or []),
@@ -71,8 +75,9 @@ def save_snapshot(path: str, name: str, snapshot: dict) -> tuple:
     name = (name or "").strip()
     if not name:
         return False, "[!] Empty profile name - not saved."
-    if name == DEFAULT_KEY:
-        return False, "[!] '_default' is a reserved name - not saved."
+    if name == DEFAULT_KEY or name == UI_KEY:
+        return False, (f"[!] '{name}' is a reserved name "
+                       "(default marker / UI settings) - not saved.")
     try:
         data, err = load_store(path)
         if err and err != "missing":
@@ -82,13 +87,19 @@ def save_snapshot(path: str, name: str, snapshot: dict) -> tuple:
             json.dump(data, f, indent=2)
     except Exception as e:
         return False, f"[!] Could not write profiles.json: {e}"
-    return True, (f"[+] Profile '{name}' saved "
-                  f"({len(data)} profile(s) total).")
+    # Count only real profiles - the reserved _default/_ui keys are settings,
+    # not setups, and inflating the number read like a bug.
+    n = sum(1 for k in data if k not in (DEFAULT_KEY, UI_KEY))
+    return True, f"[+] Profile '{name}' saved ({n} profile(s) total)."
 
 
 #: Store key holding the DEFAULT (auto-load) profile's name. Reserved -
 #: save_snapshot refuses it as a profile name.
 DEFAULT_KEY = "_default"
+
+#: Store key holding UI preferences (last used theme, ...). Reserved -
+#: never a profile: the [I] picker and every profile count skip it.
+UI_KEY = "_ui"
 
 
 def delete_profile(path: str, name: str) -> tuple:
@@ -155,6 +166,43 @@ def get_default_profile(path: str):
     if isinstance(name, str) and name in data:
         return name
     return None
+
+
+# ── UI preferences (reserved _ui store key) ────────────────────────────────
+# Small per-install settings that are NOT a setup (nothing here routes a
+# single packet): the last theme chosen with [M], and whatever else the UI
+# wants remembered across runs. They live in the SAME MyTunTopProfile.json
+# file under a reserved key so the store stays one human-editable JSON.
+
+def load_ui_state(path: str) -> dict:
+    """The reserved _ui preferences dict ({} when absent/unreadable).
+    Never raises - a missing or corrupt store just means defaults."""
+    data, err = load_store(path)
+    if err:
+        return {}
+    ui = data.get(UI_KEY)
+    return dict(ui) if isinstance(ui, dict) else {}
+
+
+def save_ui_state(path: str, updates: dict) -> tuple:
+    """Merge `updates` into the reserved _ui preferences (read-modify-write,
+    so a theme save never clobbers other keys). Returns (ok, err) where err
+    is None on success - callers log failures best-effort and never let a
+    preference save take the UI down."""
+    try:
+        data, err = load_store(path)
+        if err and err != "missing":
+            return False, f"could not read the profiles store: {err}"
+        ui = data.get(UI_KEY)
+        if not isinstance(ui, dict):
+            ui = {}
+        ui.update(updates)
+        data[UI_KEY] = ui
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 def apply_to_args(ns, snap: dict, normalise_host=None) -> list:

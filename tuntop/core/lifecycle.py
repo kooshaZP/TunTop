@@ -23,10 +23,15 @@ def make_launch() -> Callable[[], None]:
 
 
 def make_teardown() -> Callable[[], None]:
-    """Return a callable that cleanly tears the tunnel down via helper."""
+    """Return a callable that cleanly tears the tunnel down via helper.
+
+    NOTE: the manager calls this and THEN transitions to STOPPED, so the
+    callable must RETURN - it must never exit the process. (The old name
+    cleanup_and_exit() never existed in helper.py and would have raised
+    AttributeError on the first wire_default_manager() use.)"""
     def _teardown():
         from tuntop.tunnel import helper
-        helper.cleanup_and_exit()
+        helper.cleanup()
     return _teardown
 
 

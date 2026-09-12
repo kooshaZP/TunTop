@@ -200,21 +200,18 @@ def kill_pid(pid: int, log=None) -> bool:
     return False
 
 
-#: LAN bypass prefixes TunTop's helper installs EVERY run
-#: (mirror of tuntop/tunnel/helper.py:_add_lan_bypass - keep in sync).
-#: Swept after an unclean exit only when the live route's next-hop matches
-#: the CURRENT default gateway (or is on-link) on that same interface, so
-#: a foreign static route to one of these ranges (corporate VPN split
-#: routes, admin-configured) via a different gateway is never touched.
-LAN_BYPASS_PREFIXES = [
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "169.254.0.0/16",
-    "100.64.0.0/10",
-    "224.0.0.0/4",
-    "255.255.255.255/32",
-]
+#: LAN bypass prefixes TunTop's helper installs EVERY run: imported from
+#: tuntop.config.defaults (LAN_BYPASS_PREFIXES) - the single copy shared with
+#: the helper and the dashboard's sweep.
+from tuntop.config.defaults import LAN_BYPASS_PREFIXES  # noqa: E402
+
+
+def _lan_victims(rows, iface, gw):
+    """Victim selection for sweep_lan_routes - DELEGATES to the shared rule
+    in tuntop.network.routeops.sweeps (one implementation for the dashboard,
+    the helper and this watchdog). Thin alias kept for the unit tests."""
+    from tuntop.network.routeops.sweeps import lan_victims
+    return lan_victims(rows, iface, gw, prefixes=LAN_BYPASS_PREFIXES)
 
 
 def sweep_lan_routes(log=None) -> int:
@@ -240,19 +237,7 @@ def sweep_lan_routes(log=None) -> int:
             if isinstance(data, dict):
                 data = [data]
             rows = data
-        victims = []
-        for r in rows:
-            dp = str(r.get("DestinationPrefix", ""))
-            if dp not in LAN_BYPASS_PREFIXES:
-                continue
-            alias = str(r.get("InterfaceAlias", "") or "")
-            nh = str(r.get("NextHop", "") or "")
-            # Gateway/iface match keeps foreign static routes alive.
-            if alias != str(iface):
-                continue
-            if nh and nh not in (str(gw), "0.0.0.0", "On-link"):
-                continue
-            victims.append((dp, alias, nh))
+        victims = _lan_victims(rows, iface, gw)
         if not victims:
             return 0
         lines = [f'interface ipv4 delete route {dp} "{alias}"'

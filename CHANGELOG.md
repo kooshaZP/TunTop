@@ -2,6 +2,175 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.24] - 2026-09-12
+
+### Fixed (competing TUN programs + [V] mode self-sabotage)
+- **Foreign Wintun adapters defeated every egress decision** - all
+  "exclude the tunnel adapter" route lookups compared the alias EXACTLY to
+  `wintun`/`wintun2`. v2rayN/xray in TUN mode create an adapter named
+  `Wintun Tunnel` (next-hop `172.18.0.1`, usually with a metric-0 default
+  route): it was invisible to those filters, so TunTop could treat another
+  program's dead tunnel as the physical egress - pinning VLESS/VPN/LAN
+  bypass routes into it while the browser's traffic went there too. Every
+  exclusion now matches the whole `^wintun` family
+  (`config/defaults.py: WINTUN_FAMILY_RE`, `tunnel/helper.py`,
+  `network/routing.py`, `ui/dashboard.py`); the VPN-adapter fallback scans
+  in `get_vpn_ipv4_default` explicitly reject wintun aliases so a foreign
+  tunnel is never mistaken for the Windows VPN.
+- **[V] VLESS-over-VPN killed the VPN it needs to ride** -
+  `_toggle_vless_over_vpn` auto-set `no_vpn_bypass = True` (meaning "install
+  NO bypass") while its comment promised the opposite: the press tore down
+  the VPN-endpoint bypass, the VPN transport fell into the TUN, the VPN
+  dropped, and the helper's next VPN-route check refused - leaving the UI
+  showing "VLESS via VPN" while every VLESS route stayed on Wi-Fi. It now
+  sets the bypass correctly (`False` = bypass enabled).
+- **Startup now warns when another TUN program is live** - the helper
+  reports any foreign Wintun adapter and whether it owns a default route
+  (read-only; foreign adapters are never touched), and the dashboard gained
+  a "No competing TUN adapter" health check that FAILS (red) while e.g.
+  v2rayN TUN mode steals the default route - the "RUNNING but the browser
+  gets nothing" state is now self-explaining instead of a mystery.
+- **Per-server "Proxy loop detection" accepted a foreign tunnel** -
+  `-ne 'wintun'` passed a server bypassed through v2rayN's `Wintun Tunnel`;
+  the check now rejects any `^wintun` egress.
+
+## [1.0.23] - 2026-09-12
+
+### Fixed (exit-path correctness)
+- **Clean-exit detection was inverted** - `clear_marker()` (and the watchdog
+  sidecar retirement) ran only in the atexit FAILURE branch, so every clean
+  quit left the crash marker behind: the detached watchdog classified clean
+  exits as unclean and ran pointless (and potentially racy) post-exit
+  sweeps, while a genuinely FAILED cleanup cleared the marker and hid itself
+  from the next launch's recovery. Now the success path clears the marker
+  and retires the sidecar; the failure path deliberately keeps it.
+- **atexit never stopped the helper child** - the final atexit pass now
+  signals the helper (CTRL_BREAK, bounded wait, then terminate) BEFORE
+  sweeping, so its self-heal loop can no longer re-assert default/split
+  routes behind the dashboard's cleanup.
+- **Alt+F4 handler serialized with [Q]/[T]** - the console-close handler
+  used to run its sweeps regardless of an in-flight teardown; two
+  concurrent teardowns (and two snapshot-restore passes resurrecting each
+  other's deletes) could fight over the table. The handler now waits for
+  an in-flight teardown, or claims the same teardown lock a [T] worker
+  would, and restores the route snapshot LAST - same ordering as [Q].
+- **`geoip_added` is now lock-guarded everywhere** - the background geo
+  install registers routes under a state lock, the gateway re-point
+  rewrites its tracking under the same lock, and cleanup() snapshots +
+  clears under it. A signal during an install sets a cancel flag (the
+  installer skips its remaining netsh sub-batches) and joins the install
+  thread briefly, so a half-installed country can no longer leak untracked
+  routes on teardown.
+- **`lifecycle.make_teardown()` called a nonexistent
+  `helper.cleanup_and_exit`** (latent AttributeError) - it now calls
+  `helper.cleanup()` and returns, as the TunnelManager contract requires.
+
+### Changed (architecture)
+- **Route tracking ledger** (`tuntop.network.routeops`) - the helper's
+  tracking lists are now thread-safe `RouteLedger` registries that keep
+  FULL fidelity (metric + store, not just prefix/iface/next-hop). A LAN
+  bypass installed at metric 10 survives a gateway re-point at metric 10;
+  the old hardcoded metric=1 re-point is gone.
+- **One sweep-rule implementation** - LAN victims, geo victims and the
+  endpoint host-route statement builder live in
+  `tuntop.network.routeops.sweeps`; the dashboard's exit sweeps and the
+  detached watchdog share them instead of carrying drifting copies.
+- **`add_geoip_bypass()` returns the rows it registered** - the dashboard's
+  live geo re-apply takes ownership from the return value; the UI no longer
+  reads/slices/rebinds the helper module's `geoip_added` global.
+- **Single source for shared constants** (`tuntop.config.defaults`) - the
+  LAN prefix list (was 3 hand-synced copies), the VPN interface regex (was
+  7 inline copies), TUN adapter names/addresses/subnets, geo batch tuning
+  (was 3 divergent copies) and the default ports are defined once and
+  imported everywhere.
+- **State-free exec primitives extracted** (`tuntop.tunnel.exec`) -
+  `run`/`ps_json`/`run_ps`/`_clean_err` moved out of helper.py; the
+  geo-install `sys.exit()` failure mode is wrapped as a RouteResult for
+  library callers (the monitor loop no longer needs `except SystemExit`).
+
+## [1.0.22] - 2026-09-12
+
+### Added
+- **Auto re-route on Wi-Fi/network change** - the helper's monitor loop now
+  polls the physical default gateway every few seconds. When the network
+  changes under a running tunnel (Wi-Fi roam, DHCP renew, dock/undock), every
+  route pinned to the old gateway - the VLESS endpoint /32+/128s, the LAN
+  bypasses, the [A] bypass IPs, the proxy2 server bypasses and (on a worker
+  thread) the whole geoip country set - is re-pointed at the new gateway
+  without touching the TUN routes or restarting tun2socks. The change is
+  debounced (confirmed twice, 2s apart) so a mid-DHCP transition is never
+  mistaken for the final state, and the physical-interface metric lowering
+  is re-armed on the new adapter. `[GATEWAY]` markers in the log surface the
+  transition - and the dashboard reacts to them: routes IT installed live
+  ([A]-added bypass entries and live geo re-apply routes, which the helper
+  does not track) are re-pointed to the new egress too, batched, so nothing
+  keeps steering traffic at the dead gateway.
+
+### Fixed
+- **Alt+F4 left the SERVER routes behind** - the helper's `cleanup()` ran the
+  slow bulk geo delete FIRST, so an OS kill inside the ~5s close window
+  skipped everything after it: exactly the endpoint /32+/128 host routes and
+  the VPN-override undo ("the servers I added stay in the routing table").
+  `cleanup()` now removes every small CRITICAL route group first (VPN
+  overrides, endpoint/LAN/TUN routes - also clearing its tracking list) and
+  leaves the long geo bulk delete for last, so a mid-cleanup kill can only
+  ever leave geo routes behind (which the sweeps + watchdog still remove by
+  CIDR). The close handler also runs the batched endpoint host-route sweep
+  and LAN sweep itself now, so the table is clean even when the helper hangs.
+- **[Q] no longer drifts the routing table** - the pre-session table is
+  snapshotted at launch, and every exit path ([Q], [T], atexit, window
+  close) restores the diff: entries the session removed or replaced (the
+  helper's `add_v4` "stale-route replacement", the geo conflict sweep) are
+  re-created with their original interface/next-hop/metric/store, and a
+  modified copy left in place is deleted first. Windows-managed noise
+  (defaults, multicast, link-local, wintun) never participates.
+- **Stale-gateway LAN leftovers after switching networks** - the LAN sweep
+  only matched routes via the CURRENT gateway, so routes pinned to the old
+  network's gateway on the same adapter survived every cleanup and kept
+  blackholing RFC1918 traffic on the new network (the "Wi-Fi changed and the
+  routing prevents internet" report). The sweep now also removes LAN-prefix
+  routes on the current physical adapter whose real next-hop is NOT the
+  current gateway, at startup and on every exit.
+
+## [1.0.21] - 2026-09-11
+
+### Fixed
+- **Routes survived Alt+F4** - closing the window ([X] / Alt+F4) never asked
+  the HELPER child to clean up: it owns the server-endpoint /32+/128 routes,
+  the LAN bypass and (at startup) the geo routes, and its own console-close
+  handling could race the OS's ~5s kill window. The close handler now
+  signals the helper (CTRL_BREAK) so its `cleanup()` runs - overlapped with
+  the dashboard's own sweeps - then gives it a bounded window before the
+  force-quit; the detached watchdog sweeps whatever is left as before.
+
+### Changed
+- **[V] / [Y] now apply LIVE** - toggling VLESS-over-VPN or the VPN endpoint
+  bypass no longer stops and restarts the tunnel (no more TUN reset). The
+  dashboard pushes the new modes through the helper's live-reconfig control
+  file (the same channel the [N] DNS handoff uses); the helper re-points its
+  endpoint /32+/128 routes at the new egress, installs/removes the VPN
+  endpoint bypasses and undoes/re-establishes the VPN-route shadowing, all
+  while tun2socks keeps running. The dashboard re-points its own live-added
+  bypass routes to match and invalidates its stale egress cache (a [V] flip
+  used to leave [A] adding routes through the OLD egress). A switch to
+  VLESS-over-VPN with no connected Windows VPN is refused on both sides -
+  the old mode stays active instead of silently failing after a restart.
+
+### Added
+- **DNS leak test** - [L] now runs the DNS half of the leak test alongside
+  the IP-egress probe: (1) the system resolver's public identity
+  (whoami.akamai.net) compared against the direct (ISP) egress, and
+  (2) a forced UDP/53 query to public resolvers whose echoed egress IP is
+  compared against the tunnel exit. A passing IP test with leaking name
+  queries is now reported as `DNS LEAK` with the fix hint.
+
+### Fixed (UI)
+- **The last theme is remembered** - [M] saves the choice under a reserved
+  `_ui` key in MyTunTopProfile.json and the very first frame comes up in
+  that palette on the next start. The `_ui` key is never offered as a
+  profile, never saved as one, and never counted in the "N profile(s)"
+  messages.
+
 ## [1.0.20] - 2026-09-11
 
 ### Fixed

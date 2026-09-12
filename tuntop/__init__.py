@@ -1,4 +1,4 @@
-"""TunTop - route all of Windows through any local SOCKS5 proxy, beautifully.
+﻿"""TunTop - route all of Windows through any local SOCKS5 proxy, beautifully.
 
 One-line pitch: TunTop drives every byte your PC sends through a local
 SOCKS5 proxy (v2rayN, Xray, sing-box, Clash, ...) over a Wintun TUN
@@ -18,7 +18,7 @@ for backward compatibility.
 """
 from __future__ import annotations
 
-__version__ = "1.0.20"
+__version__ = "1.0.24"
 
 # Public, layered surface. Legacy flat names still resolve via shims.
 __all__ = [
