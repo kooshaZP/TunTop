@@ -191,7 +191,7 @@ def _get_egress_for(ip):
 $r = Find-NetRoute -RemoteIPAddress '{ps_quote(ip)}' -ErrorAction SilentlyContinue
 if ($r) {{
     $r = @($r) | Where-Object {{ $_.InterfaceAlias -notmatch '^wintun' }} |
-        Sort-Object -Property @{{Expression={{ ($_.DestinationPrefix -split '/')[1] -as [int] }}; Descending=$true}}, RouteMetric, InterfaceMetric |
+        Sort-Object -Property @{{Expression={{ ($_.DestinationPrefix -split '/')[1] -as [int] }}; Descending=$true}}, @{{Expression={{ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} }} |
         Select-Object -First 1
 }}
 if (-not $r) {{

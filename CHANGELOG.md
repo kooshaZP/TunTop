@@ -2,6 +2,34 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.25] - 2026-09-12
+
+### Fixed (VLESS-over-VPN actually rides the VPN)
+- **[V] mode switch was a silent no-op while our own stale /32 existed** -
+  the VLESS endpoint host routes are pinned via `get_egress_for()` →
+  `Find-NetRoute`, which answers with the LONGEST match first: the previous
+  mode's /32 itself. Re-resolving an endpoint that was already pinned to
+  Wi-Fi therefore returned Wi-Fi again, `add_v4` saw "already correct", and
+  the table kept VLESS on Wi-Fi while the dashboard claimed "VLESS via VPN"
+  (live-verified: VPN connected, all three /32s still `Wi-Fi/10.x`, server
+  198.51.100.1:443 timing out). Every install path (startup VLESS/extra-
+  bypass loops, `_live_switch_vless`) now deletes existing host routes for
+  the destination BEFORE resolving the new egress.
+- **Egress tiebreak used RouteMetric alone, not the EFFECTIVE metric** -
+  full-tunnel Windows VPNs inject `0.0.0.0/0` at RouteMetric 1 +
+  InterfaceMetric ~25 (Shirazu-VPN: effective 26) while Wi-Fi sits at
+  RouteMetric 0 + InterfaceMetric 4270 (effective 4270). Sorting by
+  `RouteMetric, InterfaceMetric` separately made Wi-Fi win the tie;
+  `get_egress_for` (helper) and `_get_egress_for` (dashboard/routing) now
+  sort by `RouteMetric + InterfaceMetric` summed - how Windows itself
+  picks. This was also why a FRESH over-vpn start pinned to Wi-Fi.
+- **VPN transport flaps no longer blackhole the tunnel** - when the VPN
+  drops while `--vless-over-vpn` is active, the /32s point into a gateway
+  that no longer exists: the tunnel runs but nothing flows. The helper's
+  status poll now re-points VLESS to the physical egress on disconnect and
+  rides the VPN again automatically when it reconnects (the DESIRED mode
+  from the launch flags is preserved; only the routed egress moves).
+
 ## [1.0.24] - 2026-09-12
 
 ### Fixed (competing TUN programs + [V] mode self-sabotage)

@@ -451,7 +451,7 @@ def get_egress_for(ip, exclude_vpn=True):
         "$r = Find-NetRoute -RemoteIPAddress '" + ps_quote(ip) + "' -ErrorAction SilentlyContinue\n"
         "if ($r) {\n"
         "    $r = @($r) | Where-Object { $_.InterfaceAlias -notmatch '^wintun'" + vpn_clause + " } |\n"
-        "        Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true}, RouteMetric, InterfaceMetric |\n"
+        "        Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true}, @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |\n"
         "        Select-Object -First 1\n"
         "}\n"
         "if (-not $r) {\n"
@@ -1408,6 +1408,18 @@ def _remove_host_routes_v6(dest):
                       str(r.get("NextHop", "") or "")))
 
 
+def _remove_host_routes_v4(dest):
+    """Delete every existing IPv4 route for `dest` before a (re-)install.
+    A stale host route pinned via the OLD egress is the longest match for
+    the endpoint IP, so Find-NetRoute inside get_egress_for() returns the
+    stale route itself - which makes a direct->over-VPN mode switch a
+    silent no-op (the VPN's lower-metric default can never beat our own
+    /32). Removing first lets egress resolution see the real table."""
+    for r in get_existing_v4_routes(dest):
+        remove_route(("v4", dest, str(r.get("InterfaceAlias", "")),
+                      str(r.get("NextHop", "") or "")))
+
+
 def _live_set_vpn_shadow(active):
     """Undo (active=False) or (re)establish (active=True) the low-metric
     Wintun shadowing of a connected Windows VPN's injected routes. Mirrors
@@ -1526,6 +1538,10 @@ def _live_switch_vless(over):
         eg6 = (v6d["InterfaceAlias"], v6d["NextHop"]) if v6d else None
     ok = True
     for ip in _live_mode["v4"]:
+        # Drop our stale /32 FIRST: while it exists via the old egress it is
+        # the longest match in Find-NetRoute and would make this re-point a
+        # silent no-op (the exact bug that left VLESS on Wi-Fi after [V]).
+        _remove_host_routes_v4(f"{ip}/32")
         if over:
             eg = get_egress_for(ip, exclude_vpn=False) or _live_mode["over"]
         else:
@@ -2970,6 +2986,13 @@ def main():
                 pass
     preflight_cleanup(tun2socks_path=getattr(args, "tun2socks", None))
 
+    # Arm the live-mode args as early as any route decision exists: helpers
+    # like ensure_physical_metric_below_vpn need to know whether THIS run is
+    # in vless-over-vpn mode, and the geo install below already runs before
+    # the tunnel is fully up (the later re-assignment at the monitor-loop
+    # arm point is a harmless duplicate).
+    _live_mode["args"] = args
+
     # A second Wintun program (v2rayN/xray TUN mode = 'Wintun Tunnel') cannot
     # coexist with this tunnel: whichever adapter owns the lowest-metric
     # 0.0.0.0/0 silently steals all traffic. Say it out loud instead of
@@ -3100,6 +3123,11 @@ def main():
     # (incl. IPv6) fails to come up.
     failed_vless = []
     for ip in v4:
+        # Clear any stale /32 (e.g. a previous direct-mode run, or a crash
+        # that skipped the exit sweep) BEFORE resolving the egress: it would
+        # otherwise out-match the VPN default in Find-NetRoute and pin the
+        # route to the old egress again.
+        _remove_host_routes_v4(f"{ip}/32")
         eg = get_egress_for(ip, exclude_vpn=not args.vless_over_vpn) or (vless_iface, vless_gateway)
         print(f"    VLESS {ip} -> via {eg[0]} ({eg[1]})")
         if not add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
@@ -3121,6 +3149,7 @@ def main():
             print(f"    [bypass-ip] {entry} -> {', '.join((ep4 or []) + (ep6 or []))}")
 
     for ip in extra_bypass_v4:
+        _remove_host_routes_v4(f"{ip}/32")
         eg = get_egress_for(ip, exclude_vpn=not args.vless_over_vpn) or (vless_iface, vless_gateway)
         print(f"    bypass {ip} -> via {eg[0]} ({eg[1]})")
         if not add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
@@ -3597,10 +3626,45 @@ def main():
                 if _vpn_conn:
                     status = get_vpn_connection_names_status().get(_vpn_conn)
                     if status != last_vpn_status:
+                        last_vpn_status = status
                         if status and status != "Connected":
                             print(f"[!] Windows VPN '{_vpn_conn}' status changed: {status}",
                                   flush=True)
-                        last_vpn_status = status
+                            if _live_mode["vless_over_vpn"]:
+                                # The VPN died under us: /32s pinned to its
+                                # (now absent) gateway are blackholes - fall
+                                # back to the physical egress so the tunnel
+                                # keeps working, and ride the VPN again below
+                                # when it reconnects.
+                                print("[*] VPN down - VLESS transport falls back "
+                                      "to the physical adapter.", flush=True)
+                                try:
+                                    _ok, _lines = _live_switch_vless(False)
+                                    for _ln in _lines:
+                                        print(_ln, flush=True)
+                                    if _ok:
+                                        _live_mode["vless_over_vpn"] = False
+                                except Exception as _e:
+                                    print(f"[!] VPN-down fallback failed: {_e}",
+                                          flush=True)
+                        elif status == "Connected" and not _live_mode["vless_over_vpn"]:
+                            # args.vless_over_vpn (the DESIRED mode, this
+                            # branch's guard) is True while the ROUTED mode
+                            # fell back during the outage: re-ride the VPN.
+                            print("[*] VPN back - re-pointing VLESS transport "
+                                  "onto it.", flush=True)
+                            try:
+                                _ok, _lines = _live_switch_vless(True)
+                                for _ln in _lines:
+                                    print(_ln, flush=True)
+                                if _ok:
+                                    _live_mode["vless_over_vpn"] = True
+                                else:
+                                    print("[!] VPN re-point refused - staying "
+                                          "on the physical adapter.", flush=True)
+                            except Exception as _e:
+                                print(f"[!] VPN reconnect re-point failed: {_e}",
+                                      flush=True)
             # Live monitor / debug loop: periodically verify the tunnel resolves
             # and carries traffic through the TUN. On repeated failure, self-heal
             # (re-apply Wintun DNS + default/split routes) instead of requiring a
