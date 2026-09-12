@@ -73,7 +73,7 @@ if _PKG_PARENT not in _sys.path:
 from tuntop.psshell import ps_quote  # noqa: E402
 from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
     TUN, TUN4, TUN4_MASK, TUN6, TUN2, TUN2_IP4, TUN2_IP6,
-    DNS4, DNS6, LAN_BYPASS_PREFIXES, VPN_IFACE_RE, WINTUN_FAMILY_RE,
+    DNS4, DNS6, LAN_BYPASS_PREFIXES, VPN_IFACE_RE,
     GEO_SUB_BATCH, GEO_MAX_WORKERS, GEO_SUB_TIMEOUT,
     DEFAULT_SOCKS_PORT, DEFAULT_ENDPOINT_PORT,
     WINTUN4_NET, WINTUN6_NET,
@@ -288,10 +288,23 @@ def _v4_default_filter(strict):
     VPN exclusion logic is defined in exactly one place.
     """
     clause = (r"$_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and "
-              r"$_.InterfaceAlias -notmatch '%s'" % WINTUN_FAMILY_RE)
+              r"$tunAliases -notcontains $_.InterfaceAlias")
     if strict:
         clause += r" -and $_.InterfaceAlias -notmatch '%s'" % VPN_IFACE_RE
     return clause
+
+
+def _tun_alias_powershell(var="$tunAliases"):
+    """PowerShell preamble: collect EVERY Wintun-driver adapter name (ours
+    'wintun'/'wintun2' AND foreign full-tunnel tools like v2rayN/xray's
+    'xray_tun' / 'Wintun Tunnel') into $tunAliases. Alias-prefix matching is
+    NOT enough: xray names its adapter 'xray_tun', which '^wintun' misses
+    while its metric-0 default route still wins every egress decision. The
+    driver description is the reliable test. Consumers prepend this snippet
+    and filter with `$tunAliases -notcontains $_.InterfaceAlias`."""
+    return (var + " = @(Get-NetAdapter -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.InterfaceDescription -match 'Wintun' } | "
+            "Select-Object -ExpandProperty Name)\n")
 
 
 def _vpn_alias_powershell():
@@ -344,14 +357,14 @@ def get_ipv4_default():
         only ever used as an absolute last resort when nothing physical exists.
     """
     ps = (
-        _vpn_alias_powershell() + r"""
+        _tun_alias_powershell() + _vpn_alias_powershell() + r"""
 $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -notmatch '^wintun' -and
+        $tunAliases -notcontains $_.InterfaceAlias -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
-    Sort-Object RouteMetric, InterfaceMetric |
+    Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
     Select-Object -First 1 NextHop, InterfaceAlias, InterfaceIndex
 if ($null -eq $r) {
     # Full-tunnel VPN likely removed the physical default route.  Recover the
@@ -375,7 +388,7 @@ if ($null -eq $r) {
 if ($null -eq $r) {
     # Last resort only: any non-wintun 0.0.0.0/0 route (may be the VPN).
     $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' } |
+        Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
         Sort-Object RouteMetric, InterfaceMetric |
         Select-Object -First 1 NextHop, InterfaceAlias, InterfaceIndex
 }
@@ -403,20 +416,20 @@ def get_ipv6_default():
     be absent, so this must NOT sys.exit() the way get_ipv4_default() does.
     """
     ps = (
-        _vpn_alias_powershell() + r"""
+        _tun_alias_powershell() + _vpn_alias_powershell() + r"""
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -notmatch '^wintun' -and
+        $tunAliases -notcontains $_.InterfaceAlias -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
-    Sort-Object RouteMetric, InterfaceMetric |
+    Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
     Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {
     # Last resort only: any non-wintun IPv6 default route (may be the VPN).
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' } |
-        Sort-Object RouteMetric, InterfaceMetric |
+        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
+        Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
         Select-Object -First 1 NextHop, InterfaceAlias
 }
 if ($null -eq $r) { exit 1 }
@@ -448,9 +461,10 @@ def get_egress_for(ip, exclude_vpn=True):
     """
     vpn_clause = (" -and $_.InterfaceAlias -notmatch '%s'" % VPN_IFACE_RE) if exclude_vpn else ""
     ps = (
+        _tun_alias_powershell() +
         "$r = Find-NetRoute -RemoteIPAddress '" + ps_quote(ip) + "' -ErrorAction SilentlyContinue\n"
         "if ($r) {\n"
-        "    $r = @($r) | Where-Object { $_.InterfaceAlias -notmatch '^wintun'" + vpn_clause + " } |\n"
+        "    $r = @($r) | Where-Object { $tunAliases -notcontains $_.InterfaceAlias" + vpn_clause + " } |\n"
         "        Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true}, @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |\n"
         "        Select-Object -First 1\n"
         "}\n"
@@ -460,12 +474,12 @@ def get_egress_for(ip, exclude_vpn=True):
         "    # nothing non-VPN exists do we relax to wintun-only.\n"
         "    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |\n"
         "        Where-Object { " + _v4_default_filter(True) + " } |\n"
-        "        Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1\n"
+        "        Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} | Select-Object -First 1\n"
         "}\n"
         "if (-not $r) {\n"
         "    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |\n"
         "        Where-Object { " + _v4_default_filter(False) + " } |\n"
-        "        Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1\n"
+        "        Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} | Select-Object -First 1\n"
         "}\n"
         "if ($null -eq $r) { exit 1 }\n"
         "$r | Select-Object InterfaceAlias, NextHop | ConvertTo-Json -Compress\n"
@@ -536,7 +550,7 @@ $r | ConvertTo-Json -Compress
             return None
         return d["InterfaceAlias"], d["NextHop"], int(d["InterfaceIndex"])
 
-    ps = r"""
+    ps = (_tun_alias_powershell() + r"""
 $names = @(
     @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
     @(Get-VpnConnection -ErrorAction SilentlyContinue) |
@@ -553,7 +567,7 @@ if ($null -eq $best) {
     # Fallback for VPN clients Get-VpnConnection does not expose.
     $best = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
         Where-Object {
-            $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' -and
+            $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias -and
             $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
         } |
         Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
@@ -577,7 +591,7 @@ if ($null -eq $best) {
     # for ANY Alive IPv4 route, not just a default route.
     $best = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object {
-            $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' -and
+            $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias -and
             $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
         } |
         Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true},
@@ -585,7 +599,7 @@ if ($null -eq $best) {
 }
 if ($null -eq $best) { exit 1 }
 $best | Select-Object NextHop, InterfaceAlias, InterfaceIndex | ConvertTo-Json -Compress
-"""
+""")
     d = ps_json(ps)
     if not d:
         return None
@@ -2029,14 +2043,16 @@ def _geo_remove_conflicts(cidrs, iface, fam):
     af = "IPv4" if fam == "v4" else "IPv6"
     routes_lit = ",".join("'%s'" % ps_quote(r) for r in cidrs)
     # Read-only scan only: list "prefix|iface" for every route whose prefix is
-    # one of ours and which does NOT live on a tunnel adapter (wintun/wintun2).
+    # one of ours and which does NOT live on a tunnel adapter (any
+    # Wintun-driver adapter, ours or a foreign TUN: xray's 'xray_tun' etc.).
     # (geo-via-wintun mode installs ON the tunnel adapters - those must stay.)
     ps = (
+        _tun_alias_powershell() +
         "$hs = [System.Collections.Generic.HashSet[string]]::new(); "
         "%s | ForEach-Object { $null = $hs.Add($_) }; "
         "Get-NetRoute -AddressFamily '%s' -ErrorAction SilentlyContinue | "
         "Where-Object { $hs.Contains($_.DestinationPrefix) -and "
-        "$_.InterfaceAlias -notmatch '^wintun' } | "
+        "$tunAliases -notcontains $_.InterfaceAlias } | "
         "ForEach-Object { \"$($_.DestinationPrefix)|$($_.InterfaceAlias)\" }"
     ) % (routes_lit, af)
     _code, out, _err = run_ps(ps, timeout=90)

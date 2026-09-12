@@ -111,6 +111,15 @@ def _teardown_wintun():
 # as everything else in this file - these mirror get_ipv4_default() and
 # get_vpn_ipv4_default() there closely enough to pick the same interface.
 
+def _tun_alias_powershell(var="$tunAliases"):
+    """Mirror of tuntop.tunnel.helper._tun_alias_powershell (kept local, like
+    everything else here): every Wintun-driver adapter name - ours AND
+    foreign TUNs (v2rayN/xray 'xray_tun', 'Wintun Tunnel') - since alias
+    prefix matching misses adapters xray names itself."""
+    return (var + " = @(Get-NetAdapter -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.InterfaceDescription -match 'Wintun' } | "
+            "Select-Object -ExpandProperty Name)\n")
+
 def _get_ipv4_default():
     """IPv4 default route used to reach the Internet (interface + gateway).
 
@@ -119,7 +128,7 @@ def _get_ipv4_default():
     into the VPN), and recovers the physical NIC's configured gateway via CIM
     when a full-tunnel VPN has deleted the Wi-Fi default route.  The VPN
     gateway is only used as an absolute last resort."""
-    ps = r"""
+    ps = _tun_alias_powershell() + r"""
 $vpnAliases = @(
     @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
     @(Get-VpnConnection -ErrorAction SilentlyContinue) |
@@ -141,7 +150,7 @@ $vpnAliases = @($vpnAliases | Where-Object { $_ } | Select-Object -Unique)
 $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -notmatch '^wintun' -and
+        $tunAliases -notcontains $_.InterfaceAlias -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
     Sort-Object RouteMetric, InterfaceMetric |
@@ -159,12 +168,12 @@ if ($null -eq $r) {
                 }
             }
         } |
-        Where-Object { $_.InterfaceAlias -notmatch '^wintun' -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
+        Where-Object { $tunAliases -notcontains $_.InterfaceAlias -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
         Select-Object -First 1
 }
 if ($null -eq $r) {
     $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object {$_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun'} |
+        Where-Object {$_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias} |
         Sort-Object RouteMetric, InterfaceMetric |
         Select-Object -First 1 NextHop, InterfaceAlias
 }
@@ -187,16 +196,16 @@ def _get_egress_for(ip):
     reachable only via the VPN gets that gateway), unlike _get_ipv4_default()
     which only knows the system default route. Prefers the most-specific
     non-wintun route, then falls back to the real default route."""
-    ps = rf"""
+    ps = _tun_alias_powershell() + rf"""
 $r = Find-NetRoute -RemoteIPAddress '{ps_quote(ip)}' -ErrorAction SilentlyContinue
 if ($r) {{
-    $r = @($r) | Where-Object {{ $_.InterfaceAlias -notmatch '^wintun' }} |
+    $r = @($r) | Where-Object {{ $tunAliases -notcontains $_.InterfaceAlias }} |
         Sort-Object -Property @{{Expression={{ ($_.DestinationPrefix -split '/')[1] -as [int] }}; Descending=$true}}, @{{Expression={{ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} }} |
         Select-Object -First 1
 }}
 if (-not $r) {{
     $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object {{ $_.InterfaceAlias -notmatch '^wintun' -and $_.NextHop -ne '0.0.0.0' }} |
+        Where-Object {{ $tunAliases -notcontains $_.InterfaceAlias -and $_.NextHop -ne '0.0.0.0' }} |
         Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
 }}
 if ($null -eq $r) {{ exit 1 }}
@@ -236,7 +245,7 @@ if ($null -eq $r) {{ exit 1 }}
 $r | ConvertTo-Json -Compress
 """
     else:
-        ps = r"""
+        ps = _tun_alias_powershell() + r"""
 $names = @(
     @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
     @(Get-VpnConnection -ErrorAction SilentlyContinue) |
@@ -267,7 +276,7 @@ if ($null -eq $best) {
     # for ANY Alive IPv4 route, not just a default route.
     $best = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object {
-            $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' -and
+            $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias -and
             $_.InterfaceAlias -match '__VPN_IFACE_RE__'
         } |
         Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true},
@@ -496,7 +505,7 @@ if ($null -eq $r) {{ exit 1 }}
 $r | ConvertTo-Json -Compress
 """
     else:
-        ps = r"""
+        ps = _tun_alias_powershell() + r"""
 $vpnAliases = @(
     @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
     @(Get-VpnConnection -ErrorAction SilentlyContinue) |
@@ -516,14 +525,14 @@ $vpnAliases = @($vpnAliases | Where-Object { $_ } | Select-Object -Unique)
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and
-        $_.InterfaceAlias -notmatch '^wintun' -and
+        $tunAliases -notcontains $_.InterfaceAlias -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
     Sort-Object RouteMetric, InterfaceMetric |
     Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $_.InterfaceAlias -notmatch '^wintun' } |
+        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
         Sort-Object RouteMetric, InterfaceMetric |
         Select-Object -First 1 NextHop, InterfaceAlias
 }

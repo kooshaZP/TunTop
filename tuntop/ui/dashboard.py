@@ -1288,7 +1288,9 @@ def build_checks(ns):
         checks.append(q(f"VLESS server route ({_s})",
                         f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; if ($r) {{'via ' + $r.InterfaceAlias}} else {{Write-Output 'no route found'; exit 1}}"))
         checks.append(q(f"Proxy loop detection ({_s})",
-                        f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; if ($r -and $r.InterfaceAlias -notmatch '^wintun') {{'VLESS endpoint bypassed through ' + $r.InterfaceAlias}} else {{Write-Output 'VLESS endpoint NOT bypassed (loops into tunnel!)'; exit 1}}"))
+                        f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; "
+                        f"$t = (Get-NetAdapter -Name $r.InterfaceAlias -ErrorAction SilentlyContinue).InterfaceDescription -match 'Wintun'; "
+                        f"if ($r -and -not $t) {{'VLESS endpoint bypassed through ' + $r.InterfaceAlias}} else {{Write-Output 'VLESS endpoint NOT bypassed (loops into tunnel!)'; exit 1}}"))
 
     return checks
 

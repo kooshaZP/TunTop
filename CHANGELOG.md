@@ -2,6 +2,23 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.26] - 2026-09-12
+
+### Fixed (foreign-TUN exclusion by driver, not alias)
+- **v2rayN's `xray_tun` slipped past every tunnel filter** - 1.0.24/1.0.25
+  excluded "any tunnel" by alias prefix (`^wintun`), but xray names its own
+  adapter `xray_tun` (description "Wintun Tunnel"). Live-verified on this
+  machine: with v2rayN's TUN up, `get_egress_for()` answered
+  `('xray_tun', '0.0.0.0')` for every VLESS server - so bypass/VPN pins
+  landed inside the foreign tunnel and the dashboard's "RUNNING" tunnel
+  carried nothing. All egress lookups (helper + dashboard-side mirror)
+  now build the exclusion from the DRIVER
+  (`InterfaceDescription -match 'Wintun'` -> `$tunAliases`), which no
+  adapter rename can defeat; verified live that every lookup returns Wi-Fi
+  again with `xray_tun` up.
+- The competing-TUN warning, VPN-default fallbacks, geo conflict sweep and
+  the proxy-loop health check all use the same driver test now.
+
 ## [1.0.25] - 2026-09-12
 
 ### Fixed (VLESS-over-VPN actually rides the VPN)
