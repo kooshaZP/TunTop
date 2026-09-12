@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from tuntop.config.defaults import (
-    DEFAULT_ENDPOINT_PORT, DEFAULT_SOCKS_PORT, DNS4,
+    DEFAULT_ENDPOINT_PORT, DEFAULT_SOCKS_PORT, DNS4, DEFAULT_DNS_POLICY,
 )
 
 
@@ -23,6 +23,7 @@ class Profile:
     port: int = DEFAULT_SOCKS_PORT
     dns4: str = DNS4
     dns6: Optional[str] = None   # None = not chosen (v4-only or defaults apply)
+    dns_policy: str = DEFAULT_DNS_POLICY   # availability | strict (see defaults)
     endpoint_port: int = DEFAULT_ENDPOINT_PORT
     bypass_ip: list = field(default_factory=list)
     vpn_bypass_ip: list = field(default_factory=list)   # targets via Windows VPN
@@ -51,6 +52,7 @@ class Profile:
             "port": self.port,
             "dns4": self.dns4,
             "dns6": self.dns6,
+            "dns_policy": self.dns_policy,
             "endpoint_port": self.endpoint_port,
             "bypass_ip": list(self.bypass_ip),
             "vpn_bypass_ip": list(self.vpn_bypass_ip),

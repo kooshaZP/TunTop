@@ -16,6 +16,16 @@ from __future__ import annotations
 DNS4 = "8.8.8.8"
 DNS6 = "2606:4700:4700::1111"
 
+# Resolution-fallback policy. 'availability' (default): if the system
+# resolver fails while the tunnel is up, fall back to direct UDP/53 + DoH
+# queries - resolution beats perfection, but a half-broken tunnel CAN leak
+# those lookups over the physical NIC. 'strict': while a tunnel is up,
+# NEVER send DNS outside it - failed resolution is reported instead of
+# silently escaped. Bootstrap (tunnel down/starting) always allows
+# fallback; only a live-or-expected-live tunnel is fail-closed.
+DNS_POLICIES = ("availability", "strict")
+DEFAULT_DNS_POLICY = "availability"
+
 # ── Wintun TUN adapters ──────────────────────────────────────────────────────
 # Primary tunnel adapter (matches the project's Windows example).
 TUN = "wintun"

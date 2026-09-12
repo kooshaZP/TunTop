@@ -2,6 +2,43 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.28] - 2026-09-12
+
+### Changed (architecture: one source for the egress script text)
+- **New `tuntop/network/egress_scripts.py`** - the PowerShell preambles and
+  filters every default-route / egress lookup emits (`$tunAliases` by
+  DRIVER, `$vpnAliases` by Get-VpnConnection correlation, the v4 default
+  filter) now live in exactly ONE module, imported by both the helper
+  process and the dashboard mirror. They had been copy-pasted twice since
+  the restructure and every 1.0.x fix (the '^wintun' -> driver switch in
+  1.0.26 most recently) had to be applied twice - the exact drift class
+  this ends. `tests/routing/test_egress_scripts_drift.py` now fails the
+  suite if a copy-paste reappears (identical-text assertions + a
+  no-hardcoded-VPN-regex source scan).
+
+### Fixed
+- **routing.py `_get_ipv4_default`/`_get_ipv6_default` still sorted by the
+  SEPARATE `RouteMetric, InterfaceMetric`** - 1.0.25 fixed the effective
+  metric sum only in the helper's copy, so the dashboard could still pick
+  a Wi-Fi RM=0 route over a VPN RM=1/IM=25 one. Now both sum.
+
+### Added (DNS policy - honest leak semantics)
+- **`--dns-policy availability|strict`** (CLI, profile, model, control
+  channel - the helper stores and live-updates it). The README said
+  "DNS leak protection with UDP/53 and DoH fallback" - true of detection,
+  false of the fallback stack, which by design escapes to the physical
+  NIC when the tunnel's resolution path dies. That default stays
+  ('availability'), but 'strict' now flips the trade: while a tunnel is
+  up (or supposed to be), the dashboard's bypass resolver NEVER sends
+  UDP/53 or DoH queries - a failed lookup is reported instead. Bootstrap
+  with the tunnel down always allows fallback.
+- README feature line rewritten to "resolution fallback with active leak
+  detection"; FAQ gained "Is my DNS leaking?" and "Traffic isn't going
+  through the tunnel" entries (competing TUN, stale-pin history); the
+  auto-download trust model is documented honestly: binaries verify
+  against repo-pinned SHA-256, geoip.dat updates are TOFU (checksum from
+  the same release channel).
+
 ## [1.0.27] - 2026-09-12
 
 ### Fixed (route transactions now verify ROUTES, not prefixes)

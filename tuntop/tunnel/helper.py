@@ -78,6 +78,7 @@ from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
     DEFAULT_SOCKS_PORT, DEFAULT_ENDPOINT_PORT,
     WINTUN4_NET, WINTUN6_NET,
 )
+from tuntop.network import egress_scripts as _es
 from tuntop.network.routeops import RouteLedger, RouteResult, sweeps as _rsweeps  # noqa: E402
 from tuntop.tunnel.exec import (  # noqa: E402  (moved Phase 4: state-free primitives)
     run, ps_json, run_ps, _clean_err,
@@ -125,6 +126,11 @@ _ACTIVE_DNS6 = DNS6
 # proxy), "doh" = DNS-over-HTTPS over TCP/443 (works whenever TCP relays),
 # "auto" = start plain, escalate to DoH if resolution through the TUN fails.
 _ACTIVE_DNS_MODE = "plain"
+#: Resolution-fallback policy ('availability' | 'strict'). The helper
+#: itself never queries the UDP/53+DoH fallback stack (that lives in the
+#: dashboard's bypass resolver), but it carries the setting through the
+#: control channel and any future self-heal resolver must honor it.
+_ACTIVE_DNS_POLICY = "availability"
 _ACTIVE_DOH_TEMPLATE = None
 
 added_routes = RouteLedger("helper")
@@ -148,6 +154,7 @@ def poll_control_file():
     transport-mode toggles). Returns True when a change was applied.
     Never raises - a malformed/partial write must not take the tunnel down."""
     global _ACTIVE_DNS4, _ACTIVE_DNS6, _control_mtime
+    global _ACTIVE_DNS_POLICY
     try:
         mtime = os.path.getmtime(CONTROL_FILE)
     except OSError:
@@ -176,6 +183,13 @@ def poll_control_file():
         if d6 != _ACTIVE_DNS6:
             _ACTIVE_DNS6 = d6
             changed.append(f"DNS6 -> {d6 or '(cleared - IPv6 DNS unset)'}")
+    if "dns_policy" in data:
+        pol = str(data["dns_policy"] or "availability")
+        if pol not in ("availability", "strict"):
+            pol = "availability"
+        if pol != _ACTIVE_DNS_POLICY:
+            _ACTIVE_DNS_POLICY = pol
+            changed.append(f"DNS policy -> {pol}")
     dns_changed = bool(changed)
     # [V]/[Y] mode toggles (same channel as the DNS): an absent key = no
     # change; a present bool = the mode the dashboard now runs. The helper
@@ -279,60 +293,24 @@ def _is_wintun_alias(alias):
 
 
 def _v4_default_filter(strict):
-    """Return the PowerShell Where-Object clause that selects the real IPv4
-    default route, excluding the wintun adapter.  When `strict`, also excludes
-    VPN-pattern interface aliases; the non-strict variant is the last-resort
-    fallback used only when no non-VPN route exists at all.
-
-    Both get_ipv4_default() and get_egress_for()'s fallback share this so the
-    VPN exclusion logic is defined in exactly one place.
-    """
-    clause = (r"$_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and "
-              r"$tunAliases -notcontains $_.InterfaceAlias")
-    if strict:
-        clause += r" -and $_.InterfaceAlias -notmatch '%s'" % VPN_IFACE_RE
-    return clause
+    """The real-IPv4-default-route Where-Object clause. Lives in
+    tuntop.network.egress_scripts so the dashboard-side mirror emits
+    byte-identical script text (see test_egress_scripts_drift)."""
+    return _es.v4_default_filter_ps(strict)
 
 
 def _tun_alias_powershell(var="$tunAliases"):
-    """PowerShell preamble: collect EVERY Wintun-driver adapter name (ours
-    'wintun'/'wintun2' AND foreign full-tunnel tools like v2rayN/xray's
-    'xray_tun' / 'Wintun Tunnel') into $tunAliases. Alias-prefix matching is
-    NOT enough: xray names its adapter 'xray_tun', which '^wintun' misses
-    while its metric-0 default route still wins every egress decision. The
-    driver description is the reliable test. Consumers prepend this snippet
-    and filter with `$tunAliases -notcontains $_.InterfaceAlias`."""
-    return (var + " = @(Get-NetAdapter -ErrorAction SilentlyContinue | "
-            "Where-Object { $_.InterfaceDescription -match 'Wintun' } | "
-            "Select-Object -ExpandProperty Name)\n")
+    """PowerShell preamble collecting EVERY Wintun-driver adapter name
+    (ours AND foreign TUNs like v2rayN/xray's 'xray_tun'). Delegates to
+    tuntop.network.egress_scripts - single source for both processes."""
+    return _es.tun_alias_ps(var)
 
 
 def _vpn_alias_powershell():
-    """Return a PowerShell snippet that builds $vpnAliases: every connected
-    Windows VPN interface alias (correlated via Get-VpnConnection, which is
-    name-reliable for built-in VPNs) plus any route whose alias text-matches
-    the VPN heuristic.  Used by get_ipv4_default()/get_ipv6_default() so a VPN
-    is excluded regardless of how the user named the connection."""
-    return r"""
-$vpnAliases = @(
-    @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
-    @(Get-VpnConnection -ErrorAction SilentlyContinue) |
-    Where-Object { $_.ConnectionStatus -eq 'Connected' } |
-    Select-Object -ExpandProperty Name -Unique |
-    ForEach-Object {
-        $n = $_
-        $_
-        Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty InterfaceAlias -Unique
-        Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty InterfaceAlias -Unique
-    }
-)
-Get-NetRoute -ErrorAction SilentlyContinue |
-    Where-Object { $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)' } |
-    Select-Object -ExpandProperty InterfaceAlias -Unique | ForEach-Object { $vpnAliases += $_ }
-$vpnAliases = @($vpnAliases | Where-Object { $_ } | Select-Object -Unique)
-"""
+    """PowerShell preamble building $vpnAliases (connected Windows VPN
+    interfaces, name-correlated via Get-VpnConnection plus the alias-text
+    heuristic). Delegates to tuntop.network.egress_scripts."""
+    return _es.vpn_alias_ps()
 
 
 def get_ipv4_default():
@@ -459,7 +437,8 @@ def get_egress_for(ip, exclude_vpn=True):
     VPN (or, worse, loops back into the TUN). Pass exclude_vpn=False only when
     running with --vless-over-vpn, where riding the VPN is intentional.
     """
-    vpn_clause = (" -and $_.InterfaceAlias -notmatch '%s'" % VPN_IFACE_RE) if exclude_vpn else ""
+    vpn_clause = ((" -and $_.InterfaceAlias -notmatch "
+                   + _es.VPN_ALIAS_PS_RE) if exclude_vpn else "")
     ps = (
         _tun_alias_powershell() +
         "$r = Find-NetRoute -RemoteIPAddress '" + ps_quote(ip) + "' -ErrorAction SilentlyContinue\n"
@@ -568,7 +547,7 @@ if ($null -eq $best) {
     $best = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
         Where-Object {
             $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias -and
-            $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
+            $_.InterfaceAlias -match __VPN_RE__
         } |
         Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
 }
@@ -592,14 +571,14 @@ if ($null -eq $best) {
     $best = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object {
             $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias -and
-            $_.InterfaceAlias -match '(?i)(pptp|l2tp|sstp|ikev2|vpn|wan miniport)'
+            $_.InterfaceAlias -match __VPN_RE__
         } |
         Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true},
             RouteMetric, InterfaceMetric | Select-Object -First 1
 }
 if ($null -eq $best) { exit 1 }
 $best | Select-Object NextHop, InterfaceAlias, InterfaceIndex | ConvertTo-Json -Compress
-""")
+""").replace("__VPN_RE__", _es.VPN_ALIAS_PS_RE)
     d = ps_json(ps)
     if not d:
         return None
@@ -2897,6 +2876,13 @@ def main():
     ap.add_argument("--vpn-interface", default=None, metavar="ALIAS",
                     help="Manually specify the Windows VPN adapter's InterfaceAlias for "
                          "--vless-over-vpn, if auto-detection via Get-VpnConnection fails")
+    ap.add_argument("--dns-policy", choices=["availability", "strict"],
+                    default="availability",
+                    help="Resolution-fallback policy mirrored to the dashboard "
+                         "(it is the fallback-resolver owner). 'strict': while "
+                         "a tunnel is up the dashboard must not resolve via "
+                         "direct UDP/53 or DoH - failures are reported instead "
+                         "of leaking over the physical NIC.")
     ap.add_argument("--dns4", default=None, metavar="IP",
                     help=f"IPv4 DNS server to set on the Wintun adapter. Pass --dns4 "
                          f"(and/or --dns6) and the tunnel uses EXACTLY what you gave: a "
@@ -2986,8 +2972,10 @@ def main():
     # (called on every route install, and again if tun2socks recreates the adapter)
     # uses them instead of falling back to the hardcoded DNS4/DNS6 defaults.
     global _ACTIVE_DNS4, _ACTIVE_DNS6, _ACTIVE_DNS_MODE, _ACTIVE_DOH_TEMPLATE
+    global _ACTIVE_DNS_POLICY
     global _control_mtime
     global vpn_override_iface
+    _ACTIVE_DNS_POLICY = args.dns_policy
     _ACTIVE_DNS4, _ACTIVE_DNS6 = _resolve_dns_choice(args.dns4, args.dns6)
     if _ACTIVE_DNS4 and _ACTIVE_DNS6:
         print(f"[*] DNS: IPv4 {_ACTIVE_DNS4} + IPv6 {_ACTIVE_DNS6}")

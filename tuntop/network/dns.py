@@ -66,6 +66,19 @@ def _host_from_url(value):
     return h.strip().rstrip(".").lower()
 
 
+def _dns_fallback_allowed(policy, tunnel_up):
+    """Pure policy gate for the UDP/53 + DoH resolution fallbacks.
+
+    'availability' (default): always allow - resolution wins.
+    'strict': while a tunnel is up, resolution must not escape it, so a
+    failed system lookup is reported as failed instead of leaking plain
+    queries over the physical NIC. No tunnel (bootstrap/stopped) always
+    allows fallback: nothing can leak through a tunnel that isn't there.
+    See CHANGELOG 1.0.28 / README 'DNS resolution fallback + leak
+    detection'."""
+    return True if (policy or "availability") != "strict" else not tunnel_up
+
+
 def _dns_build_query(host, qtype):
     """Build a minimal DNS query packet. Returns (transaction_id, bytes)."""
     import random

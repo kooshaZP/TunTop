@@ -78,6 +78,7 @@ from tuntop.routing import (          # noqa: E402
 from tuntop.psshell import ps_quote   # noqa: E402
 from tuntop.netdns import (           # noqa: E402
     _host_from_url, _resolve, _resolve_cached, _resolve_detail,
+    _dns_fallback_allowed,
     _dns_cache_clear, _dns_build_query, _dns_parse_answers,
     _dns_query_udp, _dns_query_doh,
 )
@@ -2959,7 +2960,16 @@ class BTopTui:
     def _bypass_resolve_entry(self, entry, log=True, target="direct"):
         """Resolve ONE entry (full fallback stack) and install its routes if it
         resolved. Updates the shared state. Returns the state dict copy."""
-        ep4, ep6, err, src = _resolve_detail(entry, use_cache=False, fallback=True)
+        # DNS policy: under 'strict' the UDP/53+DoH fallback must never run
+        # while a tunnel is (or should be) up - a failed lookup is reported
+        # instead of silently escaping over the physical NIC. Stopped =
+        # bootstrap = fallback allowed.
+        _st = self.state
+        _allow_fb = _dns_fallback_allowed(
+            getattr(self.ns, "dns_policy", "availability"),
+            _st not in ("STOPPED", "STOPPING"))
+        ep4, ep6, err, src = _resolve_detail(entry, use_cache=False,
+                                             fallback=_allow_fb)
         now = time.time()
         ips = list(ep4) + list(ep6)
         state, cache = self._bypass_stores(target)
@@ -4417,7 +4427,8 @@ class BTopTui:
         never fight each other."""
         path = _control_file_path()
         payload = {"dns4": getattr(self.ns, "dns4", None),
-                   "dns6": getattr(self.ns, "dns6", None)}
+                   "dns6": getattr(self.ns, "dns6", None),
+                   "dns_policy": getattr(self.ns, "dns_policy", "availability")}
         if extra:
             payload.update(extra)
         try:
@@ -6841,6 +6852,8 @@ class BTopTui:
             cmd += ["--dns6", _dns6]
         if getattr(self.ns, "no_vpn_bypass", False):
             cmd.append("--no-vpn-bypass")
+        if getattr(self.ns, "dns_policy", "availability") != "availability":
+            cmd += ["--dns-policy", self.ns.dns_policy]
         if getattr(self.ns, "vless_over_vpn", False):
             cmd.append("--proxy-over-vpn")
         if getattr(self.ns, "vpn_interface", None):
@@ -8289,6 +8302,14 @@ def main():
     ap.add_argument("--port", type=int, default=10808, help="SOCKS5 inbound port")
     ap.add_argument("--tun2socks", default=os.path.join(app_dir(), "tun2socks-windows-amd64-v3.exe"))
     ap.add_argument("--no-vpn-bypass", action="store_true")
+    ap.add_argument("--dns-policy", choices=["availability", "strict"],
+                    default="availability",
+                    help="'availability' (default): if the system resolver "
+                         "fails while the tunnel is up, resolution may fall "
+                         "back to direct UDP/53+DoH (availability over "
+                         "perfection). 'strict': while a tunnel is up, DNS "
+                         "must never leave it - failed lookups are reported "
+                         "instead of leaking over the physical NIC.")
     ap.add_argument("--no-auto-recover", action="store_true",
                     help="Disable automatic crash/degradation recovery "
                          "(auto-restart of a dead helper is off; the state "

@@ -9,6 +9,7 @@ import tempfile
 
 from tuntop.psshell import ps_quote
 from tuntop.config.defaults import TUNNEL_ALIASES, VPN_IFACE_RE  # noqa: F401
+from tuntop.network import egress_scripts
 
 # Windows caps a whole CreateProcess command line at 32767 characters.
 # -EncodedCommand puts the ENTIRE script on the command line (base64 of
@@ -107,18 +108,16 @@ def _teardown_wintun():
 
 
 # ─── Live route helpers (for in-dashboard bypass-IP editing) ─────────────────
-# Re-implemented locally rather than imported from tuntop/helper.py, same
-# as everything else in this file - these mirror get_ipv4_default() and
-# get_vpn_ipv4_default() there closely enough to pick the same interface.
+# The PowerShell SCRIPT TEXT these emit lives in exactly one place -
+# tuntop.network.egress_scripts - shared with the helper process (the old
+# copy-paste mirror caused real drift bugs; see that module's docstring and
+# tests/routing/test_egress_scripts_drift.py).
 
 def _tun_alias_powershell(var="$tunAliases"):
-    """Mirror of tuntop.tunnel.helper._tun_alias_powershell (kept local, like
-    everything else here): every Wintun-driver adapter name - ours AND
-    foreign TUNs (v2rayN/xray 'xray_tun', 'Wintun Tunnel') - since alias
-    prefix matching misses adapters xray names itself."""
-    return (var + " = @(Get-NetAdapter -ErrorAction SilentlyContinue | "
-            "Where-Object { $_.InterfaceDescription -match 'Wintun' } | "
-            "Select-Object -ExpandProperty Name)\n")
+    return egress_scripts.tun_alias_ps(var)
+
+def _vpn_alias_powershell():
+    return egress_scripts.vpn_alias_ps()
 
 def _get_ipv4_default():
     """IPv4 default route used to reach the Internet (interface + gateway).
@@ -128,32 +127,14 @@ def _get_ipv4_default():
     into the VPN), and recovers the physical NIC's configured gateway via CIM
     when a full-tunnel VPN has deleted the Wi-Fi default route.  The VPN
     gateway is only used as an absolute last resort."""
-    ps = _tun_alias_powershell() + r"""
-$vpnAliases = @(
-    @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
-    @(Get-VpnConnection -ErrorAction SilentlyContinue) |
-    Where-Object { $_.ConnectionStatus -eq 'Connected' } |
-    Select-Object -ExpandProperty Name -Unique |
-    ForEach-Object {
-        $n = $_
-        $_
-        Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty InterfaceAlias -Unique
-        Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty InterfaceAlias -Unique
-    }
-)
-Get-NetRoute -ErrorAction SilentlyContinue |
-    Where-Object { $_.InterfaceAlias -match '__VPN_IFACE_RE__' } |
-    Select-Object -ExpandProperty InterfaceAlias -Unique | ForEach-Object { $vpnAliases += $_ }
-$vpnAliases = @($vpnAliases | Where-Object { $_ } | Select-Object -Unique)
+    ps = _tun_alias_powershell() + _vpn_alias_powershell() + r"""
 $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and
         $tunAliases -notcontains $_.InterfaceAlias -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
-    Sort-Object RouteMetric, InterfaceMetric |
+    Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
     Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {
     $r = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue |
@@ -595,40 +576,24 @@ if ($null -eq $r) {{ exit 1 }}
 $r | ConvertTo-Json -Compress
 """
     else:
-        ps = _tun_alias_powershell() + r"""
-$vpnAliases = @(
-    @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
-    @(Get-VpnConnection -ErrorAction SilentlyContinue) |
-    Where-Object { $_.ConnectionStatus -eq 'Connected' } |
-    Select-Object -ExpandProperty Name -Unique |
-    ForEach-Object {
-        $n = $_
-        $_
-        Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty InterfaceAlias -Unique
-    }
-)
-Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-    Where-Object { $_.InterfaceAlias -match '__VPN_IFACE_RE__' } |
-    Select-Object -ExpandProperty InterfaceAlias -Unique | ForEach-Object { $vpnAliases += $_ }
-$vpnAliases = @($vpnAliases | Where-Object { $_ } | Select-Object -Unique)
+        ps = _tun_alias_powershell() + _vpn_alias_powershell() + r"""
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
     Where-Object {
         $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and
         $tunAliases -notcontains $_.InterfaceAlias -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
-    Sort-Object RouteMetric, InterfaceMetric |
+    Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
     Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
         Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
-        Sort-Object RouteMetric, InterfaceMetric |
+        Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
         Select-Object -First 1 NextHop, InterfaceAlias
 }
 if ($null -eq $r) { exit 1 }
 $r | ConvertTo-Json -Compress
-""".replace("__VPN_IFACE_RE__", VPN_IFACE_RE)
+"""
     ok, out = _ps(ps)
     if not ok:
         return None

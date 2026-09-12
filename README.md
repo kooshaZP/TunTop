@@ -24,7 +24,9 @@ v2rayN, Xray, sing-box, Clash Meta — any proxy client with a local SOCKS5 inbo
 ## Features
 
 - IPv4 and IPv6 full-tunnel routing via Wintun + tun2socks
-- DNS leak protection with UDP/53 and DoH fallback
+- DNS resolution fallback (UDP/53 + DoH) with active leak detection —
+  and an optional `--dns-policy strict` that refuses to resolve outside
+  a live tunnel instead of falling back
 - Kill-safe cleanup — verified teardown on every exit
 - Live bypass add/remove without restarting the tunnel
 - Geo-IP country routing from `geoip.dat`
@@ -233,6 +235,15 @@ when you run it, and what has / has not been verified:
   compute locally (`certutil -hashfile TunTop.exe SHA256`) proves the bytes
   match what CI produced. That proves integrity (no tampering in transit),
   **not** safety — the difference matters.
+- **Auto-download trust model:** the vendored `tun2socks.exe` / `wintun.dll`
+  are checked against SHA-256 pins that live IN THE REPO
+  (`tuntop/core/integrity.py`) — the expected hash does not come from the
+  download channel, so a compromised mirror cannot swap the binary. The
+  `geoip.dat` auto-update is weaker by design: its checksum comes from the
+  same v2fly GitHub release as the file itself (trust-on-first-use).
+  A hostile source could serve a wrong geo database — it could not achieve
+  code execution, but it could route countries incorrectly; pin/ship your
+  own `geoip.dat` if that threat matters to you.
 - **Battle-testing:** the automation suite (see [Tests](#tests)) runs on every push, but
   real-world exposure is still low — few outside users, no broad hardware /
   network matrix coverage beyond the

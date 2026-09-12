@@ -19,6 +19,7 @@ import os
 
 from tuntop.config.defaults import (
     DEFAULT_ENDPOINT_PORT, DEFAULT_SOCKS_PORT, DNS4,
+    DEFAULT_DNS_POLICY, DNS_POLICIES,
 )
 
 
@@ -40,6 +41,7 @@ def snapshot_from_args(ns) -> dict:
         "port": getattr(ns, "port", DEFAULT_SOCKS_PORT),
         "dns4": getattr(ns, "dns4", DNS4),
         "dns6": getattr(ns, "dns6", None),
+        "dns_policy": getattr(ns, "dns_policy", DEFAULT_DNS_POLICY),
         "endpoint_port": getattr(ns, "endpoint_port", DEFAULT_ENDPOINT_PORT),
         "bypass_ip": list(getattr(ns, "bypass_ip", []) or []),
         "vpn_bypass_ip": list(getattr(ns, "vpn_bypass_ip", []) or []),
@@ -216,6 +218,12 @@ def apply_to_args(ns, snap: dict, normalise_host=None) -> list:
         if attr in snap:
             setattr(ns, attr, snap[attr])
             applied.append(attr)
+    if "dns_policy" in snap:
+        # An unknown/legacy value falls back to the default rather than
+        # crashing the load: profiles are hand-editable and shareable.
+        ns.dns_policy = (snap["dns_policy"] if snap["dns_policy"] in DNS_POLICIES
+                         else DEFAULT_DNS_POLICY)
+        applied.append("dns_policy")
     ns.server = list(snap.get("server") or [])
     if normalise_host:
         ns.bypass_ip = [h for h in (normalise_host(x)
