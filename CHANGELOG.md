@@ -2,6 +2,35 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.29] - 2026-09-13
+
+### Fixed (the server bypass looped into the TUN)
+- **`get_ipv4_default()`'s CIM fallback had a literal `'%s'` where the
+  VPN-alias regex belonged** - the `%`-substitution was never applied, and
+  as a PowerShell regex `'%s'` matches nothing, so the "exclude VPN
+  interfaces" filter in that fallback was a silent NO-OP. With a
+  full-tunnel Windows VPN connected (which deletes the physical default
+  route), the fallback happily returned the **VPN adapter's gateway** as
+  the "physical" egress. The VLESS **server** `/32` bypass then rode the
+  VPN, the server transport was captured by the tunnel and looped back
+  into 127.0.0.1 - "the server traffic isn't bypassed, it wants to go into
+  the TUN". The dashboard mirror (routing `_get_ipv4_default`) carried the
+  CORRECT predicate all along: pure copy drift between the two processes.
+
+### Changed (finish the 1.0.28 single-sourcing)
+- **The full physical-IPv4-default lookup script body now lives in
+  `tuntop/network/egress_scripts.py` (`ipv4_default_ps()`)** alongside the
+  preambles: both `helper.get_ipv4_default()` and the dashboard mirror
+  `routing._get_ipv4_default()` run ONE byte-identical script. 1.0.28
+  shared only the preambles/filters and left the bodies copy-pasted - the
+  exact drift class it set out to kill. The drift-guard test
+  (`tests/routing/test_egress_scripts_drift.py`) now pins the body too:
+  both consumers must reference `ipv4_default_ps()`, the emitted script
+  must contain the real VPN exclusion in the CIM fallback, and no
+  `'%s'`/placeholder leftovers may ever return. The stale no-op
+  `.replace("__VPN_IFACE_RE__", ...)` in routing.py is gone with the
+  duplicated body.
+
 ## [1.0.28] - 2026-09-12
 
 ### Changed (architecture: one source for the egress script text)

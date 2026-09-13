@@ -122,46 +122,15 @@ def _vpn_alias_powershell():
 def _get_ipv4_default():
     """IPv4 default route used to reach the Internet (interface + gateway).
 
-    Mirrors tuntop/helper.py:get_ipv4_default(): never returns a connected
-    Windows VPN as the "physical" gateway (so geo/bypass traffic is not routed
-    into the VPN), and recovers the physical NIC's configured gateway via CIM
-    when a full-tunnel VPN has deleted the Wi-Fi default route.  The VPN
-    gateway is only used as an absolute last resort."""
-    ps = _tun_alias_powershell() + _vpn_alias_powershell() + r"""
-$r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and
-        $tunAliases -notcontains $_.InterfaceAlias -and
-        ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
-    } |
-    Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
-    Select-Object -First 1 NextHop, InterfaceAlias
-if ($null -eq $r) {
-    $r = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue |
-        Where-Object { $_.DefaultIPGateway } |
-        ForEach-Object {
-            $gw = @($_.DefaultIPGateway) | Where-Object { $_ -and $_ -ne '0.0.0.0' -and $_ -ne '::' } | Select-Object -First 1
-            if ($gw) {
-                $na = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue
-                [PSCustomObject]@{
-                    NextHop = $gw
-                    InterfaceAlias = if ($na) { $na.InterfaceAlias } else { $_.Description }
-                }
-            }
-        } |
-        Where-Object { $tunAliases -notcontains $_.InterfaceAlias -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
-        Select-Object -First 1
-}
-if ($null -eq $r) {
-    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object {$_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias} |
-        Sort-Object RouteMetric, InterfaceMetric |
-        Select-Object -First 1 NextHop, InterfaceAlias
-}
-if ($null -eq $r) { exit 1 }
-$r | ConvertTo-Json -Compress
-""".replace("__VPN_IFACE_RE__", VPN_IFACE_RE)
-    ok, out = _ps(ps)
+    The script text is single-sourced in tuntop.network.egress_scripts
+    (ipv4_default_ps) and is byte-identical to the helper's
+    get_ipv4_default(): never returns a connected Windows VPN as the
+    "physical" gateway (so geo/bypass traffic is not routed into the VPN),
+    and recovers the physical NIC's configured gateway via CIM when a
+    full-tunnel VPN has deleted the Wi-Fi default route.  The VPN gateway is
+    only used as an absolute last resort.
+    """
+    ok, out = _ps(egress_scripts.ipv4_default_ps())
     if not ok:
         return None
     try:

@@ -80,3 +80,66 @@ def v4_default_filter_ps(strict=True):
 def var_tun_notcontains(var="$tunAliases"):
     """The standard 'this route is not on a TUN' predicate."""
     return var + " -notcontains $_.InterfaceAlias"
+
+
+# ─── The FULL physical-IPv4-default lookup script (single source) ────────────
+# Both processes run this EXACT text:
+#   * helper process:  tunnel/helper.get_ipv4_default()
+#   * dashboard mirror: network/routing._get_ipv4_default()
+#
+# History: the two sides each carried their own copy of this BODY. 1.0.28
+# single-sourced only the preambles/filters above, so the bodies kept
+# drifting - and the helper's CIM fallback carried a literal '%s' where the
+# VPN-alias regex belonged. A literal '%s' regex never matches anything, so
+# the VPN exclusion in that fallback was a silent NO-OP: with a full-tunnel
+# VPN connected (which deletes the physical default route - exactly the
+# VPN+TunTop scenario) the fallback returned the VPN adapter's gateway as
+# the "physical" egress, the VLESS server's /32 bypass rode the VPN, and the
+# server transport looped back into the TUN ("bypass doesn't work"). The
+# dashboard mirror had the CORRECT predicate all along - pure copy drift.
+
+_IPV4_DEFAULT_BODY = r"""
+$r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and
+        $tunAliases -notcontains $_.InterfaceAlias -and
+        ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
+    } |
+    Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
+    Select-Object -First 1 NextHop, InterfaceAlias, InterfaceIndex
+if ($null -eq $r) {
+    # Full-tunnel VPN likely removed the physical default route.  Recover the
+    # physical NIC's configured gateway (survives the route being deleted).
+    $r = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue |
+        Where-Object { $_.DefaultIPGateway } |
+        ForEach-Object {
+            $gw = @($_.DefaultIPGateway) | Where-Object { $_ -and $_ -ne '0.0.0.0' -and $_ -ne '::' } | Select-Object -First 1
+            if ($gw) {
+                $na = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue
+                [PSCustomObject]@{
+                    NextHop = $gw
+                    InterfaceAlias = if ($na) { $na.InterfaceAlias } else { $_.Description }
+                    InterfaceIndex = $_.InterfaceIndex
+                }
+            }
+        } |
+        Where-Object { $tunAliases -notcontains $_.InterfaceAlias -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
+        Select-Object -First 1
+}
+if ($null -eq $r) {
+    # Last resort only: any non-wintun 0.0.0.0/0 route (may be the VPN).
+    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
+        Sort-Object RouteMetric, InterfaceMetric |
+        Select-Object -First 1 NextHop, InterfaceAlias, InterfaceIndex
+}
+if ($null -eq $r) { exit 1 }
+$r | ConvertTo-Json -Compress
+"""
+
+
+def ipv4_default_ps():
+    """The complete physical-IPv4-default-route lookup script (see
+    _IPV4_DEFAULT_BODY for the bug history). Returns NextHop, InterfaceAlias
+    AND InterfaceIndex - the helper needs the index; the mirror ignores it."""
+    return tun_alias_ps() + vpn_alias_ps() + _IPV4_DEFAULT_BODY

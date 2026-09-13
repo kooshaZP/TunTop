@@ -84,5 +84,42 @@ class TestScriptShape(unittest.TestCase):
         self.assertNotIn(VPN_IFACE_RE, es.v4_default_filter_ps(False))
 
 
+class TestIpv4DefaultBodySingleSourced(unittest.TestCase):
+    """The FULL physical-default lookup script (preambles + 3-stage
+    fallback) must also be shared. 1.0.28 single-sourced only the
+    preambles - and the two get_ipv4_default() BODIES kept drifting: the
+    helper's CIM fallback had a literal '%s' where the VPN-alias regex
+    belonged. A '%s' regex matches nothing, so the VPN exclusion there was
+    a silent NO-OP: with a full-tunnel VPN connected (which deletes the
+    physical default route) the fallback returned the VPN's gateway as the
+    "physical" egress, the VLESS server's /32 bypass rode the VPN and
+    looped back into the TUN. Both sides now run ONE script from
+    egress_scripts.ipv4_default_ps()."""
+
+    def test_both_consumers_use_the_shared_script(self):
+        self.assertIn("ipv4_default_ps()",
+                      inspect.getsource(h.get_ipv4_default))
+        self.assertIn("ipv4_default_ps()",
+                      inspect.getsource(routing._get_ipv4_default))
+
+    def test_no_stale_placeholder_or_literal_substitution(self):
+        ps = es.ipv4_default_ps()
+        self.assertNotIn("'%s'", ps)      # the 1.0.27/28 silent no-op bug
+        self.assertNotIn("__VPN", ps)     # no unsubstituted placeholder
+        self.assertNotIn("__SELECT__", ps)
+
+    def test_cim_fallback_excludes_vpns(self):
+        ps = es.ipv4_default_ps()
+        start = ps.index("Win32_NetworkAdapterConfiguration")
+        end = ps.index("Last resort only")
+        cim = ps[start:end]
+        self.assertIn("$tunAliases -notcontains", cim)
+        self.assertIn("$vpnAliases -contains", cim)
+
+    def test_effective_metric_sort_everywhere(self):
+        ps = es.ipv4_default_ps()
+        self.assertIn("[int]$_.RouteMetric + [int]$_.InterfaceMetric", ps)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -334,46 +334,7 @@ def get_ipv4_default():
         rather than falling through to the VPN gateway.  The VPN gateway is
         only ever used as an absolute last resort when nothing physical exists.
     """
-    ps = (
-        _tun_alias_powershell() + _vpn_alias_powershell() + r"""
-$r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and
-        $tunAliases -notcontains $_.InterfaceAlias -and
-        ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
-    } |
-    Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
-    Select-Object -First 1 NextHop, InterfaceAlias, InterfaceIndex
-if ($null -eq $r) {
-    # Full-tunnel VPN likely removed the physical default route.  Recover the
-    # physical NIC's configured gateway (survives the route being deleted).
-    $r = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue |
-        Where-Object { $_.DefaultIPGateway } |
-        ForEach-Object {
-            $gw = @($_.DefaultIPGateway) | Where-Object { $_ -and $_ -ne '0.0.0.0' -and $_ -ne '::' } | Select-Object -First 1
-            if ($gw) {
-                $na = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue
-                [PSCustomObject]@{
-                    NextHop = $gw
-                    InterfaceAlias = if ($na) { $na.InterfaceAlias } else { $_.Description }
-                    InterfaceIndex = $_.InterfaceIndex
-                }
-            }
-        } |
-        Where-Object { $_.InterfaceAlias -notmatch '%s' -and ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias)) } |
-        Select-Object -First 1
-}
-if ($null -eq $r) {
-    # Last resort only: any non-wintun 0.0.0.0/0 route (may be the VPN).
-    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
-        Sort-Object RouteMetric, InterfaceMetric |
-        Select-Object -First 1 NextHop, InterfaceAlias, InterfaceIndex
-}
-if ($null -eq $r) { exit 1 }
-$r | ConvertTo-Json -Compress
-"""
-    )
+    ps = _es.ipv4_default_ps()
     d = ps_json(ps)
     if not d:
         sys.exit("[!] Cannot determine the active IPv4 gateway/interface.")
