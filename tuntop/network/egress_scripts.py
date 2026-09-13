@@ -13,13 +13,28 @@ mirrored wrappers keep resolving to this module.
 Pure strings: no Windows imports, no execution. Callers embed these
 preambles in their own script and run them through their own runner.
 """
+import re
+
 from tuntop.config.defaults import VPN_IFACE_RE
 
-#: Every wintun-driver adapter is a TUN, whatever alias its owner picked:
-#: ours are 'wintun'/'wintun2'; v2rayN/xray names theirs 'xray_tun' or
-#: 'Wintun Tunnel'. Alias-prefix matching silently misses renames (the
-#: 1.0.26 lesson) - the DRIVER DESCRIPTION is the reliable test.
-TUN_DRIVER_RE = "Wintun"
+#: Foreign full-tunnel TUN detection. 'Wintun' alone was NOT enough: Throne's
+#: 'sing-tun Tunnel' adapter (a sing-box TUN) owns 176.0.0.0/4 - a quarter of
+#: the IPv4 space - so Find-NetRoute resolved the VLESS server IP ONTO that
+#: TUN, the "bypass" /32 got pinned to it, and vanished when the adapter
+#: churned. The server's traffic then fell into OUR TUN and looped. ANY
+#: adapter whose description matches this is a tunnel: never an egress.
+#: (PS -match is case-insensitive already; (?i) kept for the Python twin.)
+TUN_DRIVER_RE = ("(?i)(wintun|sing-tun|\\btun\\b|\\btap\\b|tunnel|wireguard"
+                 "|tailscale|openvpn|softether|zerotier|nekoray|mihomo|clash)")
+
+
+def is_tun_iface(alias):
+    """Python-side twin of the $tunAliases PS filter: True when an adapter
+    alias/description looks like ANY tunnel adapter (ours, foreign TUN
+    drivers, VPN tunnel clients). Used by the endpoint-route self-heal to
+    recognise a bypass route that got pinned to the WRONG (tunnel) interface.
+    Physical NIC descriptions (Intel Wi-Fi, Realtek GbE, ...) never match."""
+    return bool(alias) and bool(re.search(TUN_DRIVER_RE, str(alias)))
 
 #: VPN alias regex as embedded PS literal (built from the single-source
 #: config.defaults.VPN_IFACE_RE - never re-hardcode it).
@@ -27,9 +42,11 @@ VPN_ALIAS_PS_RE = "'" + VPN_IFACE_RE + "'"
 
 
 def tun_alias_ps(var="$tunAliases"):
-    """PowerShell preamble building ``$tunAliases``: names of ALL
-    Wintun-driver adapters (ours AND foreign full-tunnel tools).
-    Consumers filter with ``$tunAliases -notcontains $_.InterfaceAlias``."""
+    """PowerShell preamble building ``$tunAliases``: names of ALL tunnel
+    adapters (ours, AND foreign full-tunnel tools - v2rayN/xray Wintuns,
+    Throne's 'sing-tun Tunnel', WireGuard/Tailscale/OpenVPN clients; see
+    TUN_DRIVER_RE). Consumers filter with
+    ``$tunAliases -notcontains $_.InterfaceAlias``."""
     return (var + " = @(Get-NetAdapter -ErrorAction SilentlyContinue | "
             "Where-Object { $_.InterfaceDescription -match '"
             + TUN_DRIVER_RE + "' } | "

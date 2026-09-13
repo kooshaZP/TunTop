@@ -1610,6 +1610,84 @@ def _live_switch_vpn_bypass(disable):
     return True, lines
 
 
+def _heal_endpoint_routes():
+    """Periodic self-heal for the tracked endpoint bypass routes. The /32s
+    can vanish WITHOUT any local fault - seen live (1.0.30): a foreign TUN
+    adapter (Throne's 'sing-tun Tunnel', missed by the then-Wintun-only
+    driver filter) owns 176.0.0.0/4, the egress resolver pinned the server
+    bypass ONTO it, and the route disappeared when that adapter churned.
+    The server's traffic then falls into OUR TUN and loops - the
+    '192.168.123.1 -> server:443' rows in the connections panel, while the
+    BYPASS LIST still claims ROUTED DIRECT. Verify every tracked endpoint:
+    a MISSING bypass, or one pinned to a TUN-family interface, gets
+    re-resolved and re-installed via the mode-appropriate egress. Returns
+    log lines (empty = everything healthy). Idempotent; runs in the single
+    monitor thread, so it never races the [V]/[Y] switches."""
+    lines = []
+    over = _live_mode["vless_over_vpn"]
+    for ip in list(_live_mode["v4"]):
+        dest = f"{ip}/32"
+        rows = get_existing_v4_routes(dest)
+        bad = [r for r in rows
+               if _es.is_tun_iface(r.get("InterfaceAlias", ""))]
+        if rows and not bad:
+            continue                       # healthy - leave it alone
+        for r in bad:
+            remove_route(("v4", dest, str(r.get("InterfaceAlias", "")),
+                          str(r.get("NextHop", "") or "")))
+        if over:
+            eg = get_egress_for(ip, exclude_vpn=False) or _live_mode.get("over")
+        else:
+            eg = get_egress_for(ip, exclude_vpn=True) or _live_mode.get("phys")
+        if not eg or not eg[0]:
+            lines.append(f"[HEAL] VLESS {ip} bypass is gone but no usable "
+                         "egress was found - retrying next cycle.")
+            continue
+        if add_v4(dest, eg[0], eg[1], metric=1):
+            lines.append(f"[HEAL] VLESS {ip} bypass re-installed via "
+                         f"{eg[0]} ({eg[1]})")
+        else:
+            lines.append(f"[HEAL] VLESS {ip} bypass re-install FAILED - "
+                         "retrying next cycle.")
+    for ip in list(_live_mode["v6"]):
+        dest = f"{ip}/128"
+        rows = get_existing_v6_routes(dest)
+        bad = [r for r in rows
+               if _es.is_tun_iface(r.get("InterfaceAlias", ""))]
+        if rows and not bad:
+            continue
+        for r in bad:
+            remove_route(("v6", dest, str(r.get("InterfaceAlias", "")),
+                          str(r.get("NextHop", "") or "")))
+        if over:
+            v6d = get_vpn_ipv6_default(
+                getattr(_live_mode.get("args"), "vpn_interface", None))
+            eg = (v6d[0], v6d[1]) if v6d else None
+        else:
+            d6 = get_ipv6_default()
+            eg = (d6["InterfaceAlias"], d6["NextHop"]) if d6 else None
+        if not eg:
+            continue                       # no native v6 - same as startup
+        if add_v6(dest, eg[0], eg[1], 1):
+            lines.append(f"[HEAL] VLESS {ip} (v6) bypass re-installed via {eg[0]}")
+    for entry in list(_live_mode.get("vpn_routes") or []):
+        fam, dest, _iface, _gw = entry
+        if fam != "v4":
+            continue
+        rows = get_existing_v4_routes(dest)
+        if rows and not any(_es.is_tun_iface(r.get("InterfaceAlias", ""))
+                            for r in rows):
+            continue
+        ip = dest.split("/")[0]
+        eg = get_egress_for(ip, exclude_vpn=True) or _live_mode.get("phys")
+        if not eg or not eg[0]:
+            continue
+        if add_v4(dest, eg[0], eg[1], metric=1):
+            lines.append(f"[HEAL] VPN endpoint {ip} bypass re-installed via "
+                         f"{eg[0]} ({eg[1]})")
+    return lines
+
+
 def ensure_wintun_ipv6():
     """Ensure the Wintun IPv6 address (fd00:dead:beef::1/64) is present before
     pointing IPv6 routes at it - otherwise ::/0, ::/1 and 8000::/1 all fail to
@@ -1690,6 +1768,10 @@ def restore_physical_metric():
 
 #: Seconds between gateway-change polls in the monitor loop.
 _GW_CHECK_EVERY = 5
+# Endpoint bypass self-heal cadence (see _heal_endpoint_routes): foreign TUN
+# churn can silently strip the server /32s - cheap identity checks, re-resolve
+# + re-add only for the broken ones.
+_HEAL_EVERY = 15
 
 #: Serialises the geo re-point so a slow bulk move can never overlap itself.
 _geo_repoint_lock = threading.Lock()
@@ -3621,6 +3703,7 @@ def main():
     last_probe = 0.0
     last_leak = None      # last leak verdict - report only on CHANGE
     last_gw_check = 0.0   # gateway-change poll clock (see _check_gateway_change)
+    last_heal_check = 0.0  # endpoint-bypass self-heal clock (see _HEAL_EVERY)
     fails = 0
     mon_interval = max(5, args.monitor_interval)
     mon_retries = max(1, args.monitor_retries)
@@ -3641,6 +3724,17 @@ def main():
                 last_gw_check = now
                 try:
                     _check_gateway_change()
+                except Exception:
+                    pass
+            # Endpoint bypass self-heal (see _heal_endpoint_routes): a foreign
+            # TUN (Throne's sing-tun owns 176.0.0.0/4) can steal or strip the
+            # server /32s - the loop the connections panel shows as
+            # '192.168.123.1 -> server:443'. Re-resolve + re-add when broken.
+            if not args.no_monitor and (now - last_heal_check) >= _HEAL_EVERY:
+                last_heal_check = now
+                try:
+                    for _heal_ln in _heal_endpoint_routes():
+                        print(_heal_ln, flush=True)
                 except Exception:
                     pass
             if args.vless_over_vpn and int(now) % 10 == 0:

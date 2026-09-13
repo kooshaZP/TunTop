@@ -2,6 +2,37 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.31] - 2026-09-13
+
+### Fixed (the VLESS server bypass vanished - "192.168.123.1 -> server:443
+### loops" while BYPASS LIST claims ROUTED DIRECT)
+- **ROOT CAUSE (diagnosed live): Throne's `sing-tun Tunnel` adapter owns
+  `176.0.0.0/4` - a quarter of the IPv4 space, covering Cloudflare server
+  IPs like 188.114.97.6.** The foreign-TUN filter only matched the
+  "Wintun" DRIVER description, so `Find-NetRoute` resolved the server's
+  egress ONTO throne-tun, the "bypass" /32 got pinned to it, and vanished
+  when the adapter churned. With no /32 left, the server's traffic fell
+  into TunTop's own Wintun - the loop visible in the connections panel -
+  while the config panel kept showing "ROUTED DIRECT" (it displays the
+  configured list, not verified routes).
+- **Fix 1 - foreign-TUN detection broadened** (single source
+  `egress_scripts.TUN_DRIVER_RE`, shared by EVERY egress lookup in both
+  processes): now matches sing-tun, WireGuard, Tailscale, OpenVPN,
+  TAP/Tunnel-family descriptions and more. Live-verified on the reporter's
+  machine: `throne-tun (sing-tun Tunnel)` and `VeePN-TAP` are now detected
+  as TUNs; physical NICs and plain-named Windows VPNs stay egress-eligible.
+- **Fix 2 - endpoint bypass self-heal** (`_heal_endpoint_routes`, every
+  15 s in the monitor loop): every tracked VLESS and VPN endpoint route is
+  identity-checked; a MISSING or TUN-pinned bypass is evicted and
+  re-installed via the mode-appropriate egress (physical, or the VPN in
+  [V] mode) and reported as `[HEAL] ...` in the log. Healthy routes are
+  left untouched; no route is ever added without a usable egress.
+- **Tests** (+10: `tests/unit/test_endpoint_heal.py`): detector matches
+  sing-tun/WireGuard/Tailscale/OpenVPN/TAP and never physical NICs or
+  plain-named VPNs; heal re-installs missing routes, evicts TUN-pinned
+  ones, respects [V] mode, heals VPN endpoints, keeps retrying without a
+  usable egress, and never touches healthy routes.
+
 ## [1.0.30] - 2026-09-13
 
 ### Fixed (the VPN's own server traffic went into the TUN - "the server
