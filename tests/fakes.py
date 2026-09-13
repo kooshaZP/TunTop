@@ -70,6 +70,8 @@ class FakeExactRouter:
     `calls` records every operation for ordering assertions."""
 
     def __init__(self):
+        import threading
+        self._lock = threading.Lock()       # real Windows serializes route
         self.table = {}          # (family, dest) -> list of row dicts
         self.ifmetric = {}       # iface -> interface metric
         self.fail_on = {}
@@ -92,15 +94,20 @@ class FakeExactRouter:
 
     def add(self, dest, iface, gateway, metric=1):
         fam = self._fam(dest)
-        self.calls.append(("add", fam, dest, iface, gateway, metric))
         if dest in self.fail_on:
+            with self._lock:
+                self.calls.append(("add", fam, dest, iface, gateway, metric))
             return False
         if dest in self.silent_fail:
+            with self._lock:
+                self.calls.append(("add", fam, dest, iface, gateway, metric))
             return True                     # claims success, installs nothing
         if dest in self.misdirect:
             iface, gateway = self.misdirect[dest]
-        self._rows(dest).append({"iface": iface, "gateway": gateway,
-                                 "metric": int(metric)})
+        with self._lock:
+            self.calls.append(("add", fam, dest, iface, gateway, metric))
+            self._rows(dest).append({"iface": iface, "gateway": gateway,
+                                     "metric": int(metric)})
         return True
 
     def exists(self, dest):
@@ -127,17 +134,18 @@ class FakeExactRouter:
 
     def remove(self, dest, iface, gateway):
         fam = self._fam(dest)
-        self.calls.append(("del", fam, dest, iface, gateway))
-        if self.fail_deletes:
-            return (True, False)            # claims success, removes nothing
-        rows = self.table.get((fam, dest), [])
-        want = self._norm(fam, gateway)
-        keep = [r for r in rows
-                if not (r["iface"].lower() == str(iface or "").lower()
-                        and self._norm(fam, r["gateway"]) == want)]
-        removed = len(keep) != len(rows)
-        self.table[(fam, dest)] = keep
-        return (removed, bool(keep))        # (removed, foreign-left-behind)
+        with self._lock:
+            self.calls.append(("del", fam, dest, iface, gateway))
+            if self.fail_deletes:
+                return (True, False)        # claims success, removes nothing
+            rows = self.table.get((fam, dest), [])
+            want = self._norm(fam, gateway)
+            keep = [r for r in rows
+                    if not (r["iface"].lower() == str(iface or "").lower()
+                            and self._norm(fam, r["gateway"]) == want)]
+            removed = len(keep) != len(rows)
+            self.table[(fam, dest)] = keep
+            return (removed, bool(keep))    # (removed, foreign-left-behind)
 
     def backend(self):
         from tuntop.routes_txn import Backend

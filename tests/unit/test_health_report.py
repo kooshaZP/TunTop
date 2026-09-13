@@ -38,6 +38,57 @@ class TestOverallStatus(unittest.TestCase):
         r = [_fail("A"), _fail("B")]
         self.assertEqual(overall_status(r), "UNHEALTHY")
 
+    def test_single_critical_failure_is_unhealthy(self):
+        # Reviewer issue #9: ONE tunnel-integrity failure must dominate
+        # even when 50 cosmetic probes pass.
+        r = [_ok(f"probe {i}") for i in range(50)] + \
+            [_fail("Wintun adapter", "not present")]
+        self.assertEqual(overall_status(r), "UNHEALTHY")
+
+    def test_ipv6_only_failure_is_not_unhealthy(self):
+        # An IPv4-only network failing every IPv6 probe is a shrug, not a
+        # broken tunnel - even when combined with several passes.
+        r = [_ok("Wintun adapter"), _ok("Default IPv4 route"),
+             _fail("Default IPv6 route", "no ::/0"),
+             _fail("Wintun IPv6", "no fd00:dead:beef::/64")]
+        self.assertEqual(overall_status(r), "DEGRADED")
+
+    def test_proxy_loop_is_critical(self):
+        self.assertEqual(
+            overall_status([_fail("Proxy loop detection (1.2.3.4)",
+                                  "NOT bypassed (loops into tunnel!)")]),
+            "UNHEALTHY")
+
+    def test_endpoint_timeout_is_warning(self):
+        # One flaky server timeout must not flip the whole badge red.
+        self.assertEqual(
+            overall_status([_ok("TUN default route"),
+                            _fail("Configured endpoint TCP/443 (1.2.3.4)",
+                                  "timed out")]),
+            "DEGRADED")
+
+    def test_severity_longest_prefix_wins(self):
+        from tuntop.health_report import severity
+        self.assertEqual(severity("Wintun adapter"), "CRITICAL")
+        self.assertEqual(severity("Wintun IPv6"), "WARNING")
+        self.assertEqual(severity("Default IPv4 route"), "CRITICAL")
+        self.assertEqual(severity("Default IPv6 route"), "WARNING")
+        self.assertEqual(severity("some unknown probe"), "WARNING")
+        self.assertEqual(severity("v2rayN SOCKS TCP"), "CRITICAL")
+
+    def test_counts_tally(self):
+        from tuntop.health_report import counts
+        r = [_ok("A"), _fail("Wintun adapter"), _fail("Wintun IPv6"),
+             _fail("Windows version")]
+        c = counts(r)
+        self.assertEqual(c["CRITICAL"], 1)
+        self.assertEqual(c["WARNING"], 1)
+        self.assertEqual(c["INFO"], 1)
+
+    def test_panel_shows_critical_tally(self):
+        lines = format_panel([_ok("A"), _fail("Wintun adapter", "gone")])
+        self.assertTrue(any("critical" in l.lower() for l in lines))
+
 
 class TestFormatPanel(unittest.TestCase):
     def test_empty(self):
