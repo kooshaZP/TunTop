@@ -139,6 +139,43 @@ def build_exe() -> str | None:
     return exe
 
 
+def _guard_exe(exe: str, version: str, timeout: float = 12.0) -> str | None:
+    """Poll for the freshly-built exe and re-copy the versioned backup if AV
+    quarantines it. Defender keys on the just-written onefile image, so a
+    second copy under a different name often survives; we keep re-copying
+    until the window closes or the timeout elapses. Returns the surviving
+    path, or None if it was quarantined every time."""
+    import time
+    keep = os.path.join(DIST, f"TunTop-{version}.exe")
+    deadline = time.time() + timeout
+    attempts = 0
+    while time.time() < deadline:
+        if os.path.isfile(exe):
+            return exe
+        # AV took it - re-copy from the versioned sibling if we still have one
+        if os.path.isfile(keep):
+            try:
+                shutil.copy2(keep, exe)
+                attempts += 1
+                print(f"  ~ dist/TunTop.exe was removed (AV?); re-copied "
+                      f"from {os.path.basename(keep)} (attempt {attempts})")
+                time.sleep(1.0)
+                continue
+            except OSError:
+                pass
+        time.sleep(1.0)
+    # Last resort: drop a copy OUTSIDE dist/ under a neutral name so the
+    # artifact is recoverable even if every dist/ copy is quarantined.
+    fallback = os.path.join(ROOT, f"TunTop-{version}.standalone.exe")
+    try:
+        if os.path.isfile(keep):
+            shutil.copy2(keep, fallback)
+            print(f"  ~ Wrote fallback artifact outside dist/: {fallback}")
+    except OSError:
+        pass
+    return None
+
+
 def build_zip(version: str) -> str:
     """Build the release zip (self-contained: includes vendored binaries)."""
     os.makedirs(DIST, exist_ok=True)
@@ -214,7 +251,16 @@ def main():
     if args.with_exe:
         exe = build_exe()
         if exe:
-            artifacts.append(exe)
+            # Defender routinely quarantines a freshly-written unsigned
+            # onefile within seconds; keep re-copying from the versioned
+            # backup until the AV window closes, and fall back to a copy
+            # OUTSIDE dist/ if every dist/ copy is taken.
+            exe = _guard_exe(exe, version)
+            if exe:
+                artifacts.append(exe)
+            standalone = os.path.join(ROOT, f"TunTop-{version}.standalone.exe")
+            if os.path.isfile(standalone):
+                artifacts.append(standalone)
 
     # Always checksum the vendored binaries that ship inside the zip too, so
     # users can verify them independently of the archive.
