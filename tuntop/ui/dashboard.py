@@ -1805,9 +1805,16 @@ class BTopTui:
         self._bypass_res_thread = None
         # Resolve every configured server (repeatable --server) and combine
         # the resulting IPs for display and endpoint health checks.
+        # DNS policy: at startup the tunnel is stopped (bootstrap), so the
+        # UDP/53+DoH fallback is always allowed - resolution wins over a
+        # broken system resolver. IP literals short-circuit below anyway.
+        _allow_fb_startup = _dns_fallback_allowed(
+            getattr(self.ns, "dns_policy", "availability"),
+            self.state not in ("STOPPED", "STOPPING"))
         self.endpoint_v4, self.endpoint_v6 = [], []
         for _srv in (args.server or []):
-            _v4, _v6 = _resolve(_srv)
+            _v4, _v6, _err, _src = _resolve_detail(
+                _srv, use_cache=False, fallback=_allow_fb_startup)
             for ip in _v4:
                 if ip not in self.endpoint_v4:
                     self.endpoint_v4.append(ip)
@@ -3871,9 +3878,16 @@ class BTopTui:
             self.ns.server = list(self.ns.server or []) + added
             added_hosts = added
         # Re-resolve the endpoints for display/health immediately (best effort).
+        # DNS policy: under 'strict' the UDP/53+DoH fallback must never run
+        # while a tunnel is (or should be) up; stopped/bootstrap always
+        # allows it. Matches the [A] bypass path exactly.
+        _allow_fb_edit = _dns_fallback_allowed(
+            getattr(self.ns, "dns_policy", "availability"),
+            self.state not in ("STOPPED", "STOPPING"))
         self.endpoint_v4, self.endpoint_v6 = [], []
         for srv in self.ns.server:
-            v4, v6 = _resolve(srv)
+            v4, v6, _err, _src = _resolve_detail(
+                srv, use_cache=False, fallback=_allow_fb_edit)
             for ip in v4:
                 if ip not in self.endpoint_v4:
                     self.endpoint_v4.append(ip)
@@ -3930,7 +3944,14 @@ class BTopTui:
             if gone:
                 self._blog(f"[-] Old server host routes removed: {', '.join(gone)}")
             for srv in hosts:
-                v4, v6 = _resolve(srv)
+                # DNS policy: under 'strict' the UDP/53+DoH fallback must
+                # never run while a tunnel is (or should be) up; stopped/
+                # bootstrap always allows it. Matches the [A] bypass path.
+                _allow_fb_worker = _dns_fallback_allowed(
+                    getattr(self.ns, "dns_policy", "availability"),
+                    self.state not in ("STOPPED", "STOPPING"))
+                v4, v6, _err, _src = _resolve_detail(
+                    srv, use_cache=False, fallback=_allow_fb_worker)
                 if not v4 and not v6:
                     self._blog(f"[!] Could not resolve new server '{srv}' - "
                                "its host route will be retried automatically. "
@@ -4241,8 +4262,15 @@ class BTopTui:
         snap = data[name]
         profiles.apply_to_args(self.ns, snap, normalise_host=_host_from_url)
         self.endpoint_v4, self.endpoint_v6 = [], []
+        # DNS policy: under 'strict' the UDP/53+DoH fallback must never run
+        # while a tunnel is (or should be) up; stopped/bootstrap always
+        # allows it. Matches the [A] bypass path exactly.
+        _allow_fb_profile = _dns_fallback_allowed(
+            getattr(self.ns, "dns_policy", "availability"),
+            self.state not in ("STOPPED", "STOPPING"))
         for srv in self.ns.server:
-            v4, v6 = _resolve(srv)
+            v4, v6, _err, _src = _resolve_detail(
+                srv, use_cache=False, fallback=_allow_fb_profile)
             for ip in v4 + v6:
                 bucket = self.endpoint_v4 if ":" not in ip else self.endpoint_v6
                 if ip not in bucket:

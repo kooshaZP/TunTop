@@ -32,6 +32,20 @@ All notable changes to TunTop are documented here.
   plain-named VPNs; heal re-installs missing routes, evicts TUN-pinned
   ones, respects [V] mode, heals VPN endpoints, keeps retrying without a
   usable egress, and never touches healthy routes.
+- **Fix 3 - [U] edit-servers route installation now uses DNS fallback**
+  (`tuntop/ui/dashboard.py`). The [A] bypass path resolves with
+  `_resolve_detail(entry, use_cache=False, fallback=_allow_fb)` (UDP/53 +
+  DoH fallback, policy-gated by `_dns_fallback_allowed`), but the [U]
+  edit-servers path and the startup/profile-load re-resolution used bare
+  `_resolve(srv)` → `use_cache=True, fallback=False`. When system DNS
+  failed (e.g. Windows resolver pointed at a dead tunnel), those paths
+  returned a stale 120 s cache or empty, so the server's /32//128 host
+  route was never installed and the VLESS transport looped into the TUN
+  even though the config panel showed the server as configured. All four
+  call sites (startup display, [U] re-resolve, [U] route-install worker,
+  profile load) now use the same `_resolve_detail(..., use_cache=False,
+  fallback=...)` pattern as [A]. IP-literal servers are unaffected
+  (`ipaddress.ip_address` short-circuits before cache/fallback).
 
 ## [1.0.30] - 2026-09-13
 
