@@ -2,6 +2,45 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.30] - 2026-09-13
+
+### Fixed (the VPN's own server traffic went into the TUN - "the server
+### (reza_U) traffic is not bypassed")
+- **A Windows VPN connecting AFTER tunnel start never got its endpoint
+  bypass.** Startup resolves only the VPNs that are ALREADY connected
+  (`get_active_windows_vpn_servers()` at start), and the only other path
+  that installed the VPN endpoint bypass was the manual [Y] toggle. The
+  dashboard's `_on_vpn_arrived` reconciliation (fires within ~5 s of a VPN
+  appearing) re-applied the dashboard's own [vpn] bypass entries and
+  geo-via-VPN - but never told the helper. So for the typical "start
+  TunTop, then connect `reza_U`" order, the VPN's server
+  (`vpn.shirazu.ac.ir`) had NO /32 bypass, the Wintun split-defaults
+  (0.0.0.0/1 + 128.0.0.0/1) captured the VPN's own control/data traffic,
+  and the VPN died inside the tunnel. The endpoint IP visible in the
+  startup/health logs was the bypass that never existed.
+- **Fix (both ends of the existing control channel):**
+  - dashboard `_on_vpn_arrived` writes a one-shot
+    `{"vpn_endpoint_reapply": true}` control-file key (skipped when [Y]
+    disabled the bypass or [V] rides the VPN);
+  - helper `poll_control_file` consumes it by running the enable side of
+    the [Y] toggle - resolve every CURRENTLY connected VPN's ServerAddress,
+    install /32+/128 bypasses via the physical egress (idempotent), and
+    re-establish the sole-egress shadowing exactly as startup would have.
+    Gated on the same startup conditions.
+- **Tests** (`tests/unit/test_live_mode_channel.py`, +7): the key triggers
+  `_live_apply_vpn_bypass_routes(True)` + shadow; shadow refusal alone does
+  not cancel the apply; both mode gates skip it; the dashboard writes the
+  key on arrival and stays silent in the two excluded modes.
+
+### Note (antivirus)
+- The v1.0.29 `TunTop.exe` was reported deleted by antivirus. This is the
+  classic false positive for an UNSIGNED PyInstaller onefile build - the
+  1.0.29 exe was built by CI and shipped with a version resource and
+  SHA-256 checksums (`checksums.txt`), nothing changed in the vendored
+  binaries. Long term: sign the exe or submit the false positive to
+  Microsoft; short term: restore from quarantine / add an exclusion for
+  the folder you run it from.
+
 ## [1.0.29] - 2026-09-13
 
 ### Fixed (the server bypass looped into the TUN)

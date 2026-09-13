@@ -108,6 +108,7 @@ from tuntop.structured_log import (              # noqa: E402
 from tuntop.health_report import (              # noqa: E402
     format_panel as _health_format_panel,
     format_compact as _health_compact,
+    counts as _health_counts, CRITICAL as _HEALTH_CRIT,
 )
 from tuntop.monitor.leak import (               # noqa: E402
     run_leak_probe as _run_leak_probe,
@@ -3808,6 +3809,19 @@ class BTopTui:
                         target=self._reapply_geo_bypass_worker,
                         args=(self.ns.geoip, code, "winvpn"),
                         daemon=True).start()
+            # 3) The HELPER bypasses the endpoints of the VPNs that were
+            #    ALREADY connected at tunnel start only. This one connected
+            #    NOW: without a live re-apply its server has no /32 bypass,
+            #    the Wintun default captures the VPN's own control/data
+            #    traffic and the VPN dies inside the tunnel. One-shot
+            #    control-file key; the helper gates it on the [V]/[Y] mode
+            #    and no-ops when the current mode does not want it.
+            if not getattr(self.ns, "no_vpn_bypass", False) and \
+                    not getattr(self.ns, "vless_over_vpn", False):
+                self._write_control_file(
+                    extra={"vpn_endpoint_reapply": True})
+                self._blog("[*] VPN connected after start - asked the helper "
+                           "to re-apply the VPN endpoint bypass routes.")
         except Exception as e:
             self._blog(f"[!] VPN-arrival re-apply failed: {e}")
 
@@ -5672,9 +5686,13 @@ class BTopTui:
             (ping_col, "PING", ping_val, ping_bar, False),
         ]
         if "checks" not in self._hidden:
+            _hv = _health_counts(self.results) if done else {}
+            _hc = _hv.get(_HEALTH_CRIT, 0)
             cards.append((
-                GREEN if failed == 0 and done > 0 else YELLOW,
-                "HEALTH", (f"{passed} pass / {failed} fail" if done > 0 else "-"),
+                (RED if _hc else (GREEN if failed == 0 and done > 0 else YELLOW)),
+                "HEALTH", ((f"{passed} pass / {failed} fail"
+                            + (f" \u26a0{_hc} CRIT" if _hc else ""))
+                           if done > 0 else "-"),
                 pct / 100, done > 0))
         cards.append((CYAN, "TOTAL", f"{total_mb:6.1f} MiB", 0.0, False))
 

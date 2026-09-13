@@ -222,6 +222,28 @@ def poll_control_file():
                 changed.append("VPN endpoint bypass -> "
                                + ("removed (VPN traffic is tunneled)" if want
                                   else "installed (VPN endpoints stay direct)"))
+    if data.get("vpn_endpoint_reapply"):
+        # ONE-SHOT (the dashboard's _on_vpn_arrived writes this): a Windows
+        # VPN connected AFTER this helper started. Startup only bypasses the
+        # endpoints of VPNs ALREADY connected, so this VPN's server has no
+        # /32 bypass - the Wintun split-defaults (0/1+128/1) then capture the
+        # VPN's own control/data traffic and the VPN dies inside the tunnel
+        # ("the VPN server traffic goes into the tuntop"). Re-run the enable
+        # side of the [Y] toggle: resolve every CURRENTLY connected VPN's
+        # ServerAddress and install /32+/128 bypasses via the physical
+        # egress, then re-establish the sole-egress shadowing exactly as
+        # startup would have. Idempotent (add_v4 keeps identical routes).
+        # Gated on the same startup conditions: skipped when the user turned
+        # the VPN bypass off ([Y]) or VLESS rides the VPN ([V]).
+        if not _live_mode["no_vpn_bypass"] and not _live_mode["vless_over_vpn"]:
+            lines = _live_apply_vpn_bypass_routes(True)
+            if _live_set_vpn_shadow(True):
+                lines.append("[*] VPN injected routes shadowed with Wintun "
+                             "(sole egress) - as on startup.")
+            for ln in lines:
+                print(ln, flush=True)
+            changed.append("VPN endpoint bypass re-applied "
+                           "(VPN connected after tunnel start)")
     if not changed:
         return False
     print(f"[*] Live config change applied: {'; '.join(changed)}", flush=True)
