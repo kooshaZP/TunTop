@@ -138,6 +138,40 @@ class TestHealEndpointRoutes(unittest.TestCase):
                                     "192.168.1.1", metric=1)
         self.assertTrue(any("VPN endpoint" in ln for ln in lines))
 
+    def test_vpn_pinned_bypass_is_evicted_in_direct_mode(self):
+        # DIRECT mode: the transport must NOT ride a Windows VPN. A /32 the
+        # (1.0.31-and-before) dashboard had pinned onto a VPN-pattern
+        # interface is broken and gets evicted + re-installed via physical.
+        with mock.patch.object(helper, "get_existing_v4_routes",
+                               return_value=[_row("Shirazu-VPN",
+                                                  "10.8.0.1")]), \
+                mock.patch.object(helper, "remove_route") as rm, \
+                mock.patch.object(helper, "get_egress_for",
+                                  return_value=("Wi-Fi", "192.168.1.1")), \
+                mock.patch.object(helper, "add_v4", return_value=True) as add:
+            lines = helper._heal_endpoint_routes()
+        rm.assert_called_once_with(("v4", "188.114.97.6/32",
+                                    "Shirazu-VPN", "10.8.0.1"))
+        add.assert_called_once_with("188.114.97.6/32", "Wi-Fi",
+                                    "192.168.1.1", metric=1)
+        self.assertTrue(any("[HEAL]" in ln for ln in lines))
+
+    def test_vpn_pinned_bypass_is_healthy_in_over_vpn_mode(self):
+        # [V] mode: riding the VPN IS the point - a VPN-pinned bypass must
+        # be left completely alone (never re-pinned to physical).
+        helper._live_mode["vless_over_vpn"] = True
+        helper._live_mode["over"] = ("Shirazu-VPN", "10.8.0.1")
+        with mock.patch.object(helper, "get_existing_v4_routes",
+                               return_value=[_row("Shirazu-VPN",
+                                                  "10.8.0.1")]), \
+                mock.patch.object(helper, "remove_route") as rm, \
+                mock.patch.object(helper, "get_egress_for") as eg, \
+                mock.patch.object(helper, "add_v4") as add:
+            self.assertEqual(helper._heal_endpoint_routes(), [])
+        rm.assert_not_called()
+        eg.assert_not_called()
+        add.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

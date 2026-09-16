@@ -2,6 +2,75 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.32] - 2026-09-16
+
+### Fixed (the server bypass STILL didn't work with a Windows VPN connected)
+- **ROOT CAUSE: copy drift in the dashboard's egress resolver.**
+  `network/routing._get_egress_for` - the dashboard-side copy of the helper's
+  `get_egress_for` used by EVERY live bypass install ([A], [U], profiles) -
+  filtered TUN adapters but **NOT VPN-pattern interfaces**. With a Windows VPN
+  connected, `Find-NetRoute` resolved the server's egress onto the VPN
+  adapter, the dashboard pinned the server's /32 bypass ONTO the VPN, and the
+  "direct" bypass rode the VPN or looped back into the TUN - the exact
+  "bypass doesn't work / ROUTED DIRECT but loops" report. The helper's copy
+  had the exclusion; the mirror did not. The WHOLE per-IP egress script is now
+  single-sourced (`egress_scripts.egress_lookup_ps`, consumed by BOTH
+  processes) with a placeholder-substitution guard against the 1.0.28
+  silent-no-op bug class; the helper's hand-built copy is gone.
+- **Endpoint self-heal recognizes VPN-pinned bypasses** (helper): in DIRECT
+  mode a /32 or /128 pinned onto a VPN-pattern interface is now evicted and
+  re-installed via the physical egress, same as TUN-pinned ones. In [V]
+  vless-over-vpn mode a VPN-pinned bypass stays healthy (riding the VPN is the
+  point there).
+- **Bypass pre-clean now evicts foreign-TUN routes** (dashboard): the
+  same-prefix delete scope was "planned egress + our own adapters", so a stale
+  /32 pinned to a foreign TUN (Throne's sing-tun owned 176.0.0.0/4) survived
+  the pre-clean and outranked the fresh bypass. The scope now includes every
+  LIVE tunnel-family adapter (`routing._tun_family_aliases`); foreign routes
+  on physical interfaces are still preserved and reported.
+- **The BYPASS LIST no longer lies about ROUTED DIRECT** (dashboard): the
+  resolver only re-installed routes when the resolved IPs CHANGED; if the
+  route silently vanished (or got TUN-pinned) the panel kept claiming ROUTED
+  DIRECT forever. The 300 s refresh now verifies the routes still exist
+  outside tunnel-family adapters (`_bypass_routes_healthy`) and re-installs +
+  logs `[HEAL]` when they don't. Verification is best effort - it can never
+  block the resolver.
+- `routing._get_vpn_ipv4_default` ran its PowerShell script TWICE (a
+  duplicated `ok, out = _ps(ps)` line) - doubled latency and process churn on
+  every [V]-mode lookup.
+
+### Build (AV kept deleting TunTop.exe)
+- **build_release.py survives AV quarantine properly**: the guarded window is
+  12 s -> 45 s; BOTH protected copies (the versioned sibling AND the
+  outside-dist standalone) are written the MOMENT the exe lands (previously
+  the standalone only appeared at timeout, after AV could have eaten
+  everything); ANY vanished copy is restored from whichever survives,
+  repeatedly, with a 5 s settle re-check (AV verdicts land 5-30 s after the
+  write, not instantly); the build now returns the best surviving artifact
+  instead of a bare None, so checksums still get written.
+- **New `--onedir` build**: `python build_release.py --with-exe --onedir`
+  produces dist/TunTop/ (exe + support files) instead of the self-extracting
+  onefile - no temp-dir payload drop at startup means dramatically fewer AV
+  false positives (the spec's own comment calls onefile the #1 trigger).
+- **New `--defender-exclude`**: best-effort Add-MpPreference of the repo +
+  dist/ before building (elevated shell); prints the manual commands when
+  not elevated.
+
+### Tests
+- +9 `tests/unit/test_egress_lookup_shared.py`: both processes emit the
+  IDENTICAL egress script (per exclude_vpn variant), the VPN exclusion is
+  present by default and only the primary lookup relaxes in over-vpn mode,
+  IP quoting incl. hostile input, no unsubstituted placeholders, no VPN regex
+  re-fragmented into consumers; `is_vpn_iface` matches VPN aliases and never
+  physical NICs.
+- +2 `tests/unit/test_endpoint_heal.py`: VPN-pinned bypass evicted in DIRECT
+  mode; VPN-pinned bypass left alone in [V] mode.
+- +13 `tests/unit/test_bypass_resilience.py`: route-health verification
+  (physical healthy / TUN-pinned and missing unhealthy, /128 mapping,
+  never blocks the resolver), pre-clean scope includes + dedupes TUN aliases,
+  `_tun_family_aliases` parsing and fail-soft, `_route_rows` parsing,
+  VPN-default lookup runs once.
+
 ## [1.0.31] - 2026-09-13
 
 ### Fixed (the VLESS server bypass vanished - "192.168.123.1 -> server:443

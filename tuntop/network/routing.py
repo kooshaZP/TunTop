@@ -140,28 +140,22 @@ def _get_ipv4_default():
         return None
 
 
-def _get_egress_for(ip):
+def _get_egress_for(ip, exclude_vpn=True):
     """Return (interface, gateway) Windows would actually use to reach `ip`
     over its real (non-wintun) path. Respects split-tunnel VPNs (a destination
     reachable only via the VPN gets that gateway), unlike _get_ipv4_default()
-    which only knows the system default route. Prefers the most-specific
-    non-wintun route, then falls back to the real default route."""
-    ps = _tun_alias_powershell() + rf"""
-$r = Find-NetRoute -RemoteIPAddress '{ps_quote(ip)}' -ErrorAction SilentlyContinue
-if ($r) {{
-    $r = @($r) | Where-Object {{ $tunAliases -notcontains $_.InterfaceAlias }} |
-        Sort-Object -Property @{{Expression={{ ($_.DestinationPrefix -split '/')[1] -as [int] }}; Descending=$true}}, @{{Expression={{ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} }} |
-        Select-Object -First 1
-}}
-if (-not $r) {{
-    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object {{ $tunAliases -notcontains $_.InterfaceAlias -and $_.NextHop -ne '0.0.0.0' }} |
-        Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
-}}
-if ($null -eq $r) {{ exit 1 }}
-$r | Select-Object InterfaceAlias, NextHop | ConvertTo-Json -Compress
-"""
-    ok, out = _ps(ps)
+    which only knows the system default route.
+
+    The WHOLE script is single-sourced in egress_scripts.egress_lookup_ps()
+    - the same text the helper process runs. 1.0.31-and-before drift: this
+    mirror filtered TUN adapters but NOT VPN-pattern interfaces, so with a
+    Windows VPN connected the server's bypass /32 was pinned ONTO the VPN
+    (the exact "bypass doesn't work / ROUTED DIRECT but loops" report).
+    exclude_vpn=True - the default every direct bypass install uses -
+    restores the helper's protection; riding the VPN stays possible via the
+    explicit [V]-mode VPN lookups."""
+    ok, out = _ps(egress_scripts.egress_lookup_ps(ip, exclude_vpn=exclude_vpn),
+                  timeout=10)
     if not ok:
         return None
     try:
@@ -173,6 +167,53 @@ $r | Select-Object InterfaceAlias, NextHop | ConvertTo-Json -Compress
     if not iface:
         return None
     return iface, (gw or "0.0.0.0")
+
+
+def _tun_family_aliases():
+    """Aliases of EVERY tunnel-family adapter currently present: ours, plus
+    foreign full-tunnel TUNs (Throne's 'sing-tun Tunnel', WireGuard,
+    Tailscale, v2rayN/xray Wintuns, ...). The bypass pre-clean extends its
+    delete scope with these so a stale same-prefix route pinned to a
+    foreign TUN is evicted before the fresh bypass lands - a TUN adapter is
+    never a 'foreign user static route' worth preserving. Best effort:
+    returns [] on any failure."""
+    try:
+        ok, out = _ps(_tun_alias_powershell() +
+                      "if ($tunAliases) { $tunAliases -join '|' } "
+                      "else { 'none' }")
+    except Exception:
+        return []
+    if not ok or not out:
+        return []
+    s = out.strip().strip('"')
+    if not s or s in ("none", "No result"):
+        return []
+    return [a for a in s.split("|") if a]
+
+
+def _route_rows(dest, fam="v4"):
+    """Existing routes for an EXACT prefix - the dashboard-process twin of
+    the helper's get_existing_v4/v6_routes. Returns a list of dicts with
+    DestinationPrefix, InterfaceAlias, NextHop and RouteMetric keys (empty
+    when the prefix has no route). Never raises."""
+    fam_ps = "IPv4" if fam == "v4" else "IPv6"
+    ps = rf"""
+$r = Get-NetRoute -AddressFamily {fam_ps} -DestinationPrefix '{ps_quote(dest)}' -ErrorAction SilentlyContinue |
+    Select-Object DestinationPrefix, InterfaceAlias, NextHop, RouteMetric
+if ($null -eq $r) {{ exit 0 }}
+@($r) | ConvertTo-Json -Compress
+"""
+    try:
+        ok, out = _ps(ps)
+    except Exception:
+        return []
+    if not ok or not out:
+        return []
+    try:
+        d = json.loads(out)
+    except Exception:
+        return []
+    return d if isinstance(d, list) else [d]
 
 
 def _get_vpn_ipv4_default(vpn_interface=None):
@@ -235,7 +276,6 @@ if ($null -eq $best) {
 if ($null -eq $best) { exit 1 }
 $best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
 """.replace("__VPN_IFACE_RE__", VPN_IFACE_RE)
-    ok, out = _ps(ps)
     ok, out = _ps(ps)
     if not ok:
         return None

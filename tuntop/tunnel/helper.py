@@ -420,33 +420,11 @@ def get_egress_for(ip, exclude_vpn=True):
     VPN (or, worse, loops back into the TUN). Pass exclude_vpn=False only when
     running with --vless-over-vpn, where riding the VPN is intentional.
     """
-    vpn_clause = ((" -and $_.InterfaceAlias -notmatch "
-                   + _es.VPN_ALIAS_PS_RE) if exclude_vpn else "")
-    ps = (
-        _tun_alias_powershell() +
-        "$r = Find-NetRoute -RemoteIPAddress '" + ps_quote(ip) + "' -ErrorAction SilentlyContinue\n"
-        "if ($r) {\n"
-        "    $r = @($r) | Where-Object { $tunAliases -notcontains $_.InterfaceAlias" + vpn_clause + " } |\n"
-        "        Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true}, @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |\n"
-        "        Select-Object -First 1\n"
-        "}\n"
-        "if (-not $r) {\n"
-        "    # Fallback to the real default route.  Exclude wintun AND VPN-pattern\n"
-        "    # interfaces (same protection as get_ipv4_default); only if literally\n"
-        "    # nothing non-VPN exists do we relax to wintun-only.\n"
-        "    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |\n"
-        "        Where-Object { " + _v4_default_filter(True) + " } |\n"
-        "        Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} | Select-Object -First 1\n"
-        "}\n"
-        "if (-not $r) {\n"
-        "    $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |\n"
-        "        Where-Object { " + _v4_default_filter(False) + " } |\n"
-        "        Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} | Select-Object -First 1\n"
-        "}\n"
-        "if ($null -eq $r) { exit 1 }\n"
-        "$r | Select-Object InterfaceAlias, NextHop | ConvertTo-Json -Compress\n"
-    )
-    d = ps_json(ps, timeout=10)
+    # The WHOLE lookup script is single-sourced in egress_scripts
+    # (egress_lookup_ps) - the dashboard mirror used to run a drifted copy
+    # WITHOUT the VPN exclusion and pinned server bypasses onto a connected
+    # Windows VPN (see egress_scripts.egress_lookup_ps for the history).
+    d = ps_json(_es.egress_lookup_ps(ip, exclude_vpn=exclude_vpn), timeout=10)
     if not d:
         return None
     iface = str(d.get("InterfaceAlias", ""))
@@ -1619,8 +1597,10 @@ def _heal_endpoint_routes():
     The server's traffic then falls into OUR TUN and loops - the
     '192.168.123.1 -> server:443' rows in the connections panel, while the
     BYPASS LIST still claims ROUTED DIRECT. Verify every tracked endpoint:
-    a MISSING bypass, or one pinned to a TUN-family interface, gets
-    re-resolved and re-installed via the mode-appropriate egress. Returns
+    a MISSING bypass, one pinned to a TUN-family interface, or (in DIRECT
+    mode) one pinned onto a VPN-pattern interface - the transport may ride
+    the VPN only in [V] mode - gets re-resolved and re-installed via the
+    mode-appropriate egress. Returns
     log lines (empty = everything healthy). Idempotent; runs in the single
     monitor thread, so it never races the [V]/[Y] switches."""
     lines = []
@@ -1629,7 +1609,8 @@ def _heal_endpoint_routes():
         dest = f"{ip}/32"
         rows = get_existing_v4_routes(dest)
         bad = [r for r in rows
-               if _es.is_tun_iface(r.get("InterfaceAlias", ""))]
+               if _es.is_tun_iface(r.get("InterfaceAlias", ""))
+               or (not over and _es.is_vpn_iface(r.get("InterfaceAlias", "")))]
         if rows and not bad:
             continue                       # healthy - leave it alone
         for r in bad:
@@ -1653,7 +1634,8 @@ def _heal_endpoint_routes():
         dest = f"{ip}/128"
         rows = get_existing_v6_routes(dest)
         bad = [r for r in rows
-               if _es.is_tun_iface(r.get("InterfaceAlias", ""))]
+               if _es.is_tun_iface(r.get("InterfaceAlias", ""))
+               or (not over and _es.is_vpn_iface(r.get("InterfaceAlias", "")))]
         if rows and not bad:
             continue
         for r in bad:

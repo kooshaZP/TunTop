@@ -70,11 +70,12 @@ def app_dir() -> str:
 from tuntop.routing import (          # noqa: E402
     _ps, _netsh, _teardown_wintun,
     _add_route_v4, _del_route_v4, _add_route_v6, _del_route_v6,
-    _del_route_scoped,
+    _del_route_scoped, _tun_family_aliases, _route_rows,
     _route_exists_v4, _route_exists_v6,
     _get_ipv4_default, _get_ipv6_default,
     _get_egress_for, _get_vpn_ipv4_default, _get_vpn_ipv6_default,
 )
+from tuntop.network.egress_scripts import is_tun_iface as _is_tun_iface  # noqa: E402
 from tuntop.psshell import ps_quote   # noqa: E402
 from tuntop.netdns import (           # noqa: E402
     _host_from_url, _resolve, _resolve_cached, _resolve_detail,
@@ -2919,12 +2920,19 @@ class BTopTui:
         # gateway entirely and could wipe a foreign static route on a
         # physical adapter just because it happened to share the prefix.
         for _ip, (fam_pc, dest_pc, _if_pc, _gw_pc) in planned:
+            # Scope = the planned egress + every LIVE TUN-family adapter
+            # (plus our own adapters, added inside _del_route_scoped). A
+            # stale same-prefix route pinned to a foreign TUN (Throne's
+            # sing-tun owned 176.0.0.0/4) used to survive this pre-clean
+            # and outrank the fresh bypass. A TUN adapter is never a
+            # foreign user static route worth preserving; foreign routes on
+            # physical interfaces still are, and stay untouched.
+            _known = list(dict.fromkeys(
+                ([_if_pc] if _if_pc else []) + _tun_family_aliases()))
             if fam_pc == "v4":
-                _removed, foreign = _del_route_scoped(
-                    dest_pc, "v4", [_if_pc] if _if_pc else [])
+                _removed, foreign = _del_route_scoped(dest_pc, "v4", _known)
             else:
-                _removed, foreign = _del_route_scoped(
-                    dest_pc, "v6", [_if_pc] if _if_pc else [])
+                _removed, foreign = _del_route_scoped(dest_pc, "v6", _known)
             if foreign and log:
                 self._blog(f"[!] {dest_pc}: a same-prefix route exists on a "
                            "non-tunnel interface (user static route / VPN "
@@ -2953,6 +2961,27 @@ class BTopTui:
             # Bookkeeping for stop()/exit sweeps (same tuples as before).
             self._live_bypass_added.append((fam, dest, iface, gw))
         return applied
+
+    def _bypass_routes_healthy(self, ips):
+        """True when EVERY resolved IP still has a live host route that is
+        NOT pinned to a tunnel-family adapter. The refresh cycle runs this
+        for DIRECT-target entries whose resolved IPs did NOT change: a route
+        stripped or stolen by a foreign TUN otherwise leaves the panel
+        claiming ROUTED DIRECT while the traffic loops. proxy2/vpn targets
+        are pinned to tunnel adapters ON PURPOSE - the caller skips this
+        check for them. Verification is best effort: any failure means
+        'healthy' so the resolver is never blocked."""
+        try:
+            for ip in ips:
+                fam = "v6" if ":" in str(ip) else "v4"
+                dest = f"{ip}/128" if fam == "v6" else f"{ip}/32"
+                rows = _route_rows(dest, fam)
+                if not any(not _is_tun_iface(str(r.get("InterfaceAlias", "")))
+                           for r in rows):
+                    return False
+            return True
+        except Exception:
+            return True
 
     def _bypass_stores(self, target):
         """(state_dict, cache_dict) for a routing target. Deliberately SEPARATE
@@ -2985,20 +3014,35 @@ class BTopTui:
             st = state.setdefault(entry, self._bypass_new_state())
             prev_ips = list(st.get("ips") or [])
             prev_status = st.get("status")
+            prev_routed = bool(st.get("routed"))
             st["last"] = now
         if ips:
             changed = (ips != prev_ips) or not prev_ips
             applied = []
+            healed = False
             if changed or not prev_ips:
                 applied = self._install_bypass_routes(entry, ep4, ep6, log=log,
                                                       target=target)
+            elif (target == "direct" and prev_routed
+                    and not self._bypass_routes_healthy(ips)):
+                # SAME resolved IPs, but the routes themselves died or were
+                # pinned to a TUN-family adapter (foreign TUN churn strips
+                # /32s - Throne's sing-tun owned 176.0.0.0/4). Without this
+                # verification the panel kept claiming ROUTED DIRECT forever
+                # while the server's traffic looped into the TUN.
+                if log:
+                    self._blog(f"[HEAL] {entry}: bypass route missing or "
+                               "TUN-pinned - re-installing.")
+                applied = self._install_bypass_routes(entry, ep4, ep6, log=log,
+                                                      target=target)
+                healed = True
             with self._bypass_res_lock:
                 st = state.setdefault(entry, self._bypass_new_state())
                 st.update(status="ok", ips=ips, err=None, tries=0, source=src,
                           next=now + self._BYPASS_REFRESH)
                 if applied:
                     st["routed"] = True
-                elif changed:
+                elif changed or healed:
                     st["routed"] = False
                 out = dict(st)
             cache[entry] = (list(ep4), list(ep6))

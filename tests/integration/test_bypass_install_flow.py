@@ -38,6 +38,9 @@ def run_install(ep4, ep6, router, log=False):
     fs = FakeSelf()
     with mock.patch.object(dash, "_get_egress_for",
                            lambda ip: ("Wi-Fi", "192.168.1.1")), \
+         mock.patch.object(dash, "_tun_family_aliases", lambda: []), \
+         mock.patch.object(dash, "_del_route_scoped",
+                           lambda dest, fam, known=(): (True, False)), \
          mock.patch.object(dash, "RouteTransaction",
                            lambda log=None:
                            RouteTransaction(backend=router.backend(),
