@@ -107,6 +107,129 @@ class TestPollControlFileModeKeys(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class TestPollControlFileServers(unittest.TestCase):
+    """The 'servers'/'server_endpoints' keys carry a live [U] server change
+    from the dashboard into the helper's tracked endpoint list."""
+
+    def setUp(self):
+        self.helper = helper
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.path = path
+        self._saved = (helper.CONTROL_FILE, helper._control_mtime)
+        helper.CONTROL_FILE = path
+        helper._control_mtime = 0.0
+
+    def tearDown(self):
+        (h) = self.helper
+        (h.CONTROL_FILE, h._control_mtime) = self._saved
+        os.unlink(self.path)
+
+    def _write(self, payload):
+        time.sleep(0.02)          # mtime resolution guard
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def test_servers_key_is_applied(self):
+        self._write({"servers": ["1.2.3.4"],
+                     "server_endpoints": {"1.2.3.4": {"v4": ["1.2.3.4"],
+                                                      "v6": []}}})
+        with mock.patch.object(self.helper, "_live_apply_servers",
+                               return_value=["[+] [U] ok"]) as apply_:
+            self.assertTrue(self.helper.poll_control_file())
+        apply_.assert_called_once_with(["1.2.3.4"],
+                                       {"1.2.3.4": {"v4": ["1.2.3.4"],
+                                                    "v6": []}})
+
+    def test_non_list_servers_is_ignored(self):
+        self._write({"servers": "1.2.3.4"})     # malformed: not a list
+        with mock.patch.object(self.helper, "_live_apply_servers") as apply_:
+            self.assertFalse(self.helper.poll_control_file())
+        apply_.assert_not_called()
+
+
+class TestLiveApplyServers(unittest.TestCase):
+    """_live_apply_servers reconciles the helper's tracked endpoints with a
+    live [U] server change. Mocked route primitives - no Windows."""
+
+    def setUp(self):
+        self.helper = helper
+        self._saved = copy.deepcopy(helper._live_mode)
+        helper._live_mode.update({
+            "args": SimpleNamespace(vless_over_vpn=False, no_vpn_bypass=False,
+                                    server=["9.9.9.9"]),
+            "v4": ["9.9.9.9"], "v6": [],
+            "vless_over_vpn": False, "no_vpn_bypass": False,
+            "phys": ("Wi-Fi", "192.168.1.1"),
+        })
+
+    def tearDown(self):
+        helper._live_mode.clear()
+        helper._live_mode.update(self._saved)
+
+    def test_replace_drops_old_and_installs_new(self):
+        with mock.patch.object(helper, "_remove_host_routes_v4") as rm, \
+             mock.patch.object(helper, "get_egress_for",
+                               return_value=("Wi-Fi", "192.168.1.1")) as eg, \
+             mock.patch.object(helper, "add_v4", return_value=True) as add:
+            lines = helper._live_apply_servers(
+                ["1.2.3.4"], {"1.2.3.4": {"v4": ["1.2.3.4"], "v6": []}})
+        # Called for the dropped old server AND as the pre-clean before the
+        # fresh install (the startup pattern - a stale copy can never
+        # outrank the new route).
+        rm.assert_any_call("9.9.9.9/32")
+        rm.assert_any_call("1.2.3.4/32")
+        self.assertEqual(rm.call_count, 2)
+        eg.assert_called_once_with("1.2.3.4", exclude_vpn=True)
+        add.assert_called_once_with("1.2.3.4/32", "Wi-Fi", "192.168.1.1",
+                                    metric=1)
+        self.assertEqual(helper._live_mode["v4"], ["1.2.3.4"])
+        self.assertEqual(helper._live_mode["args"].server, ["1.2.3.4"])
+        self.assertTrue(any("9.9.9.9" in ln for ln in lines))
+
+    def test_add_mode_keeps_untouched_server_endpoints(self):
+        # ADD mode: the map from the dashboard covers EVERY current server
+        # (the dashboard completes it), so the untouched server's endpoint
+        # is re-installed (adopted under the helper's tracking), not lost.
+        with mock.patch.object(helper, "_remove_host_routes_v4") as rm, \
+             mock.patch.object(helper, "get_egress_for",
+                               return_value=("Wi-Fi", "192.168.1.1")), \
+             mock.patch.object(helper, "add_v4", return_value=True):
+            helper._live_apply_servers(
+                ["9.9.9.9", "1.2.3.4"],
+                {"9.9.9.9": {"v4": ["9.9.9.9"], "v6": []},
+                 "1.2.3.4": {"v4": ["1.2.3.4"], "v6": []}})
+        self.assertEqual(sorted(helper._live_mode["v4"]),
+                         ["1.2.3.4", "9.9.9.9"])
+
+    def test_unresolved_everything_keeps_tracked_state(self):
+        """A transient resolution failure must NEVER strip the tracked
+        endpoints - the self-heal would stop covering working servers."""
+        with mock.patch.object(helper, "_remove_host_routes_v4") as rm, \
+             mock.patch.object(helper, "add_v4") as add:
+            lines = helper._live_apply_servers(
+                ["1.2.3.4"], {"1.2.3.4": {"v4": [], "v6": []}})
+        rm.assert_not_called()
+        add.assert_not_called()
+        self.assertEqual(helper._live_mode["v4"], ["9.9.9.9"])
+        self.assertEqual(helper._live_mode["args"].server, ["9.9.9.9"])
+        self.assertTrue(any("kept unchanged" in ln for ln in lines))
+
+    def test_egress_falls_back_to_last_known_good_phys(self):
+        # egress lookup fails: the install rides the last-known-good
+        # physical egress captured at startup (never the tunnel), and the
+        # tracked list still carries the new server so the self-heal and
+        # the gateway re-point cover it.
+        with mock.patch.object(helper, "_remove_host_routes_v4"), \
+             mock.patch.object(helper, "get_egress_for", return_value=None), \
+             mock.patch.object(helper, "add_v4", return_value=True) as add:
+            helper._live_apply_servers(
+                ["1.2.3.4"], {"1.2.3.4": {"v4": ["1.2.3.4"], "v6": []}})
+        add.assert_called_once_with("1.2.3.4/32", "Wi-Fi", "192.168.1.1",
+                                    metric=1)
+        self.assertEqual(helper._live_mode["v4"], ["1.2.3.4"])
+
+
 class TestLiveSwitchVless(unittest.TestCase):
     """_live_switch_vless(True/False) with the Windows primitives mocked."""
 

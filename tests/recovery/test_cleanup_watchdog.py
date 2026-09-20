@@ -19,6 +19,7 @@ from tuntop.core.cleanup_watchdog import (
     main,
     sweep_after_unclean_exit,
     sweep_geo_routes,
+    sweep_lan_routes,
     wait_for_exit,
 )
 
@@ -139,12 +140,46 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
         path = make_marker(pid=999, helper_pid=5555)
         p, state = self._make_probes(killed=2)
 
-        result = sweep_after_unclean_exit(999, hosts=("example.com",), helper_pid=5555, marker_path=path, probes=p)
+        with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
+                   return_value=0):
+            result = sweep_after_unclean_exit(999, hosts=("example.com",),
+                                              helper_pid=5555,
+                                              marker_path=path, probes=p)
 
         self.assertTrue(result)
         self.assertEqual(state["killed"], 2)
         self.assertTrue(state["torn_down"])
         self.assertIsNone(read_marker(path))  # marker cleared
+
+    def test_failed_sweep_keeps_marker(self):
+        """A HALF-FAILED sweep must NOT clear the crash marker: the log used
+        to say "system is clean" while leftover routes stayed (field: the
+        frozen watchdog's lazy imports died with Errno 2 on base_library.zip
+        after the parent's _MEI dir was deleted - the geo/LAN sweeps no-op'd
+        and the marker was cleared anyway). With the marker left, the next
+        launch re-runs the whole startup recovery."""
+        path = make_marker(pid=999, helper_pid=5555)
+        p, state = self._make_probes()
+        with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
+                   return_value=None):   # sweep FAILED
+            sweep_after_unclean_exit(999, hosts=(), helper_pid=5555,
+                                     marker_path=path, probes=p)
+        self.assertIsNotNone(read_marker(path))  # marker KEPT
+
+    def test_geo_sweep_failure_keeps_marker_too(self):
+        path = make_marker(pid=999)
+        p, state = self._make_probes()
+        with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
+                   return_value=None), \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
+                   return_value=0):
+            sweep_after_unclean_exit(999, hosts=(), marker_path=path,
+                                     probes=p)
+        self.assertIsNotNone(read_marker(path))  # marker KEPT
 
     def test_helper_killed_before_sweep(self):
         """The watchdog must kill the helper BEFORE scanning/sweeping."""
@@ -167,7 +202,12 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
         p.sweep_host_routes.return_value = 0
 
         path = make_marker(pid=888)
-        sweep_after_unclean_exit(888, helper_pid=4444, marker_path=path, probes=p)
+        with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
+                   return_value=0):
+            sweep_after_unclean_exit(888, helper_pid=4444, marker_path=path,
+                                     probes=p)
 
         self.assertEqual(call_order[0], "kill", "helper must die before teardown")
 
@@ -248,6 +288,30 @@ class TestSweepGeoRoutes(unittest.TestCase):
 
     def test_none_geoip_returns_zero(self):
         self.assertEqual(sweep_geo_routes(None, "ir"), 0)
+
+    def test_empty_geoip_code_is_a_quiet_noop(self):
+        """geoip set but no country code = geo bypass never active. The old
+        code ran this into parse_geoip and logged a scary 'no CIDR entries
+        found for geoip code '''' failure on every unclean-exit sweep."""
+        import tuntop.geoip as geoip_mod
+        with patch.object(geoip_mod, "parse_geoip",
+                          side_effect=AssertionError("must not be called")):
+            self.assertEqual(sweep_geo_routes(r"C:\anywhere\geoip.dat", ""), 0)
+
+    def test_geo_sweep_failure_returns_none_not_zero(self):
+        """None (= sweep FAILED) is distinct from 0 (= ran, found nothing) -
+        the marker-clearing logic keeps the marker only on None."""
+        import tuntop.geoip as geoip_mod
+        with patch("os.path.isfile", return_value=True), \
+             patch.object(geoip_mod, "parse_geoip",
+                          side_effect=OSError("unreadable")):
+            self.assertIsNone(sweep_geo_routes(r"C:\anywhere\geoip.dat", "ir"))
+
+    def test_lan_sweep_failure_returns_none_not_zero(self):
+        import tuntop.network.routing as routing
+        with patch.object(routing, "_ps",
+                          side_effect=OSError("no powershell")):
+            self.assertIsNone(sweep_lan_routes())
 
 
 

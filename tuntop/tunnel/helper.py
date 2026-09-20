@@ -222,6 +222,20 @@ def poll_control_file():
                 changed.append("VPN endpoint bypass -> "
                                + ("removed (VPN traffic is tunneled)" if want
                                   else "installed (VPN endpoints stay direct)"))
+    if "servers" in data:
+        # Live [U] server change (the dashboard's _edit_servers). The
+        # dashboard installs the new host routes itself, but the tracked
+        # endpoint list (self-heal + gateway-change re-point) must be
+        # reconciled HERE - the dashboard's routes are invisible to the
+        # helper's ledger, and a later Wi-Fi change used to leave them
+        # pinned to the dead gateway.
+        _hosts = data["servers"]
+        if isinstance(_hosts, list):
+            _lines = _live_apply_servers(
+                _hosts, data.get("server_endpoints") or {})
+            for ln in _lines:
+                print(ln, flush=True)
+            changed.append("server list updated live ([U])")
     if data.get("vpn_endpoint_reapply"):
         # ONE-SHOT (the dashboard's _on_vpn_arrived writes this): a Windows
         # VPN connected AFTER this helper started. Startup only bypasses the
@@ -431,6 +445,17 @@ def get_egress_for(ip, exclude_vpn=True):
     gw = str(d.get("NextHop", "") or "")
     if not iface:
         return None
+    # Fail-closed at the Python twin too (1.0.33): the PS $tunAliases filter
+    # already excludes every tunnel-family adapter, but if the adapter
+    # enumeration hiccupped the resolver could hand back OUR tunnel (or,
+    # with exclude_vpn, a VPN) as the "physical" egress - pinning a bypass
+    # route onto the tunnel loops the transport (the "the server IP goes to
+    # the wintun" report). Refusing here makes every caller fall back to
+    # the last-known-good physical egress instead of installing a loop.
+    if _es.is_tun_iface(iface):
+        return None
+    if exclude_vpn and _es.is_vpn_iface(iface):
+        return None
     return iface, (gw or "0.0.0.0")
 
 
@@ -633,6 +658,32 @@ def get_foreign_tun_adapters():
     records = d if isinstance(d, list) else [d]
     return [(str(x.get("Alias", "")), str(x.get("Default", "")))
             for x in records if x.get("Alias")]
+
+
+def reject_competing_tun():
+    """Refuse to start when another Wintun TUN program owns a default route
+    (v2rayN/xray/sing-box TUN mode): whichever adapter owns the lowest-metric
+    0.0.0.0/0 silently steals all traffic. The old soft warning let the operator
+    burn hours debugging an empty "RUNNING" tunnel (the "the server IP goes to
+    the wintun" report: the moment a server /32 bypass drops, the transport
+    falls into the foreign TUN and loops back into this one - and because the
+    foreign adapter survives THIS program's cleanup it keeps breaking even
+    after closing and reopening). A foreign TUN without a default route cannot
+    capture anything and is left untouched (just noted)."""
+    _foreign = get_foreign_tun_adapters()
+    _blocked = [a for a, _d in _foreign if _d == "yes"]
+    if _blocked:
+        sys.exit(
+            "[!] TUN CONFLICT: another program's TUN adapter already owns the "
+            f"IPv4 default route: {', '.join(_blocked)} (e.g. v2rayN/xray TUN "
+            "mode). It would steal the VLESS server bypass and route the proxy "
+            "transport back into its own tunnel - TunTop refuses to start into "
+            "a broken routing state. Turn the other app's TUN mode OFF (keep "
+            "only its SOCKS proxy, e.g. 127.0.0.1:10808), then start again.")
+    for _fx_alias, _fx_def in _foreign:
+        if _fx_def != "yes":
+            print(f"[*] Foreign Wintun adapter '{_fx_alias}' present (no "
+                  "default route) - left untouched.")
 
 
 def preflight_cleanup(tun2socks_path=None):
@@ -1586,6 +1637,101 @@ def _live_switch_vpn_bypass(disable):
             lines.append("[*] VPN injected routes shadowed with Wintun "
                          "(sole egress) - as on startup.")
     return True, lines
+
+
+def _live_apply_servers(hosts, endpoints):
+    """Live [U] server change from the dashboard (control-file keys
+    'servers' + 'server_endpoints').
+
+    The dashboard installs the new endpoints' host routes itself, but the
+    HELPER's route tracking (added_routes) and the 15 s self-heal
+    (_heal_endpoint_routes) only knew the STARTUP server list - a
+    live-[U]-added server was invisible to both, so a later Wi-Fi change
+    left its /32 pinned to the dead gateway and the transport looped (the
+    "the U ip goes to the wintun" report). This reconciles the tracked
+    list: (re)install the current endpoints via the mode-appropriate egress
+    (which also adopts them under THIS helper's tracking), drop the
+    bypasses of servers that left the list, and re-arm _live_mode (+ the
+    launch args) so the self-heal and _check_gateway_change follow the NEW
+    servers. `endpoints` maps host -> {"v4": [...], "v6": [...]} and comes
+    pre-resolved from the dashboard (it already applied its DNS policy);
+    hosts without addresses are skipped without touching the tracked state.
+    Returns log lines."""
+    lines = []
+    hosts = [str(h).strip() for h in (hosts or []) if str(h).strip()]
+    if not hosts:
+        return ["[i] [U] empty server list ignored - nothing changed."]
+    endpoints = endpoints if isinstance(endpoints, dict) else {}
+    args = _live_mode.get("args")
+    over = _live_mode["vless_over_vpn"]
+    new_v4, new_v6 = [], []
+    for host in hosts:
+        eps = endpoints.get(host) or {}
+        v4 = [str(ip) for ip in (eps.get("v4") or []) if ip]
+        v6 = [str(ip) for ip in (eps.get("v6") or []) if ip]
+        if not v4 and not v6:
+            lines.append(f"[i] [U] server '{host}' has no resolved address "
+                         "yet - its bypass is (re)installed by the "
+                         "dashboard's resolver / the next self-heal.")
+            continue
+        for ip in v4:
+            if ip not in new_v4:
+                new_v4.append(ip)
+        for ip in v6:
+            if ip not in new_v6:
+                new_v6.append(ip)
+        lines.append(f"[+] [U] server {host} -> {', '.join(v4 + v6)}")
+    if not new_v4 and not new_v6:
+        # Nothing resolved: NEVER strip the tracked endpoints on a
+        # transient resolution failure - the self-heal must keep covering
+        # the currently-working servers.
+        lines.append("[!] [U] no server address resolved - tracked "
+                     "endpoints kept unchanged.")
+        return lines
+    # Drop the bypasses of servers that left the list (REPLACE mode). A
+    # stale extra /32 (a server whose IP changed) is harmless until the
+    # next restart sweeps it - losing coverage would not be.
+    for ip in list(_live_mode["v4"]):
+        if ip not in new_v4:
+            _remove_host_routes_v4(f"{ip}/32")
+            lines.append(f"[-] [U] old server {ip} host route removed")
+    for ip in list(_live_mode["v6"]):
+        if ip not in new_v6:
+            _remove_host_routes_v6(f"{ip}/128")
+            lines.append(f"[-] [U] old server {ip} host route removed")
+    # (Re)install every current endpoint so it lands under THIS helper's
+    # route tracking: the gateway-change re-point and the self-heal only
+    # see routes the helper installed itself. add_v4/add_v6 replace any
+    # same-prefix copy, so a dashboard-installed route is adopted, never
+    # duplicated.
+    for ip in new_v4:
+        _remove_host_routes_v4(f"{ip}/32")
+        eg = get_egress_for(ip, exclude_vpn=not over) or _live_mode["phys"]
+        if not eg or not eg[0]:
+            lines.append(f"[!] [U] no usable egress for {ip} - the "
+                         "self-heal retries.")
+            continue
+        if add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
+            lines.append(f"    [U] {ip}/32 via {eg[0]} ({eg[1]})")
+        else:
+            lines.append(f"[!] [U] could not install the {ip}/32 bypass - "
+                         "the self-heal retries.")
+    for ip in new_v6:
+        _remove_host_routes_v6(f"{ip}/128")
+        d6 = get_ipv6_default()
+        if d6 and add_v6(f"{ip}/128", d6["InterfaceAlias"],
+                         d6.get("NextHop") or "", 1):
+            lines.append(f"    [U] {ip}/128 via {d6['InterfaceAlias']}")
+        else:
+            lines.append(f"[i] [U] no IPv6 gateway - {ip} rides the TUN "
+                         "(same as a fresh start).")
+    # Re-arm the tracking so the self-heal and the gateway re-point cover
+    # the NEW server list from now on.
+    _live_mode["v4"] = new_v4
+    _live_mode["v6"] = new_v6
+    if args is not None:
+        args.server = list(hosts)
+    return lines
 
 
 def _heal_endpoint_routes():
@@ -3082,20 +3228,10 @@ def main():
     # arm point is a harmless duplicate).
     _live_mode["args"] = args
 
-    # A second Wintun program (v2rayN/xray TUN mode = 'Wintun Tunnel') cannot
-    # coexist with this tunnel: whichever adapter owns the lowest-metric
-    # 0.0.0.0/0 silently steals all traffic. Say it out loud instead of
-    # letting the operator debug a "RUNNING but empty" tunnel.
-    for _fx_alias, _fx_def in get_foreign_tun_adapters():
-        if _fx_def == "yes":
-            print(f"[!] WARNING: another TUN program is active: adapter "
-                  f"'{_fx_alias}' has its own 0.0.0.0/0 route (e.g. v2rayN/xray "
-                  "TUN mode). Turn its TUN mode OFF (keep only its SOCKS "
-                  "127.0.0.1:10808) or browser traffic will bypass this "
-                  "tunnel entirely.")
-        else:
-            print(f"[*] Foreign Wintun adapter '{_fx_alias}' present (no "
-                  "default route) - left untouched.")
+    # A second Wintun program cannot coexist with this tunnel (see
+    # reject_competing_tun): refuse to start when another TUN owns a default
+    # route instead of letting the operator debug a broken routing state.
+    reject_competing_tun()
 
     iface, gateway, ifindex = get_ipv4_default()
     print(f"[*] Physical interface: {iface}  IfIndex={ifindex}  Gateway={gateway}")

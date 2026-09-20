@@ -2,6 +2,97 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.33] - 2026-09-20
+
+### Fixed (the server bypass was pinned onto TunTop's OWN wintun - "the server IP goes to the wintun")
+- **ROOT CAUSE: the TUN filters were blind to our own adapter.** Every egress
+  lookup (`ipv4_default_ps`, `egress_lookup_ps` - both processes) excluded
+  tunnel adapters via `$tunAliases`, built ONLY from
+  `InterfaceDescription -match TUN_DRIVER_RE`. The vendored tun2socks creates
+  our adapter with a tunnelType whose description matches NEITHER 'wintun'
+  nor any other alternative (the health panel even showed
+  "Proxy loop detection ... bypassed through wintun" as PASSING - proof the
+  description test was wrong). While the tunnel was up, the lookups therefore
+  saw our own TUN's `0.0.0.0/0` + `0/1`+`128/1` routes as valid "physical"
+  candidates and returned **wintun** as the egress - so every [A]/[U]/[R]/
+  geo install and the 15 s self-heal pinned the server /32 ONTO our own
+  wintun and the transport looped (the `192.168.123.1 -> server:443`
+  connection rows). The preamble now:
+  - always includes OUR adapter aliases (`wintun`, `wintun2`) by NAME;
+  - matches the TUN driver on the adapter NAME as well as the description
+    (a physical NIC is never named `wintun*`/`tun2socks*`);
+  - `TUN_DRIVER_RE` also recognizes the vendored tun2socks' own
+    `tun2socks` tunnelType text.
+- **Fail-closed egress guards at the Python level** (`helper.get_egress_for`,
+  `routing._get_egress_for`): a resolver answer naming a tunnel-family
+  interface is refused (and in DIRECT mode, a VPN-pattern interface too), so
+  callers fall back to the last-known-good physical egress instead of
+  installing a looping route. In [V] vless-over-vpn mode the VPN interface
+  stays a valid egress.
+- **The "Proxy loop detection" health check no longer lies.** It matched only
+  the adapter DESCRIPTION against 'Wintun' - with our own adapter's
+  description not containing that word, it passed while the server route
+  resolved through our own TUN ("VLESS endpoint bypassed through wintun" as a
+  green check). It now fails loudly when the route resolves through ANY
+  tunnel-family adapter - ours by alias, foreign by driver description -
+  and names the looped interface.
+- **A live [U] server change is now known to the helper.** The dashboard
+  installed the new endpoints' host routes itself, but the helper's tracked
+  endpoint list - the 15 s self-heal AND the gateway-change re-point -
+  only covered routes the HELPER had installed. A server added/edited via
+  [U] while the tunnel ran was invisible to both: after a later Wi-Fi
+  change its /32 stayed pinned to the dead gateway and the transport
+  looped ("the U ip goes to the wintun"). The [U] worker now hands the new
+  server list plus the per-host resolutions to the helper through the
+  existing live-reconfig control file (`servers` + `server_endpoints`);
+  the helper reconciles its tracked list (drops servers that left,
+  re-installs every current endpoint under its own tracking so gateway
+  changes re-point them, never strips anything on a transient resolution
+  failure).
+- **Watchdog sweeps survive a vanished `_MEI` dir for real.** The frozen
+  dashboard spawned `--watchdog-child` (and the helper child) with an
+  inherited PyInstaller environment (`_MEIPASS2`/`_PYI_*`), so the child
+  bootloader REUSED the parent's extraction dir instead of extracting its
+  own. When the dashboard died, that dir was deleted and every later lazy
+  import in the watchdog failed with
+  `FileNotFoundError: ...\_MEIxxxxx\base_library.zip` - the geo/LAN sweeps
+  no-op'd while the log still said "crash marker cleared - system is clean".
+  Child processes now get a scrubbed environment (own extraction dir), the
+  watchdog warms the lazily-imported codecs at startup, and a PARTIALLY
+  FAILED sweep keeps the crash marker (plus the live-state sidecar) so the
+  next launch re-runs the recovery instead of trusting a lie.
+- The watchdog logged `geo sweep failed: no CIDR entries found for geoip
+  code ''` on every sweep when a geoip file was configured without a country
+  code - that is "geo bypass never active", now a quiet no-op.
+
+## [1.0.33] - 2026-09-17
+
+### Added
+- **GitHub release auto-update (verified, staged - never auto-run).** The
+  frozen exe checks the latest stable GitHub release ONCE per session in a
+  background thread. A newer TunTop.exe is downloaded, size-capped, PE/x64
+  -checked, SHA-256-verified against the release's own `checksums.txt`
+  (single-sourced with `build_release.write_checksums`' format), and staged
+  NEXT TO the running exe as `TunTop-<version>.exe`. The running exe is
+  never overwritten, launched, or otherwise touched - the log names the
+  staged file and applying the update stays a manual step. Opt out with
+  `BTOP_NO_UPDATE=1` or `--no-update-check`; offline/up-to-date checks are
+  quiet no-ops. Pure stdlib (`tuntop/config/updates.py`), 21 offline tests.
+
+### Fixed
+- **The second black console window on launch is gone.** The frozen exe
+  auto-relaunched itself into Windows Terminal in a NEW window while the
+  original conhost stayed open - two windows, one black. The dashboard now
+  always runs in the console it was launched in.
+- **The event log no longer auto-scrolls away from what you are reading.**
+  `Space` pauses/resumes the log, scrolling up auto-freezes it into an
+  immutable snapshot (new lines and the 200-line prune can't move the
+  viewport), `End` resumes live tailing; the log title shows
+  `[paused - Space resumes]`. A second keypress in the same input batch is
+  no longer dropped.
+- **Graph stats line was unreadable** ("0.39% 4 avg 0.0 peak 0.54"): rates
+  now carry explicit units - `▼ 0.42 MiB/s (  7%)  avg 0.1 peak 1.95 MiB/s`.
+
 ## [1.0.32] - 2026-09-16
 
 ### Fixed (the server bypass STILL didn't work with a Windows VPN connected)

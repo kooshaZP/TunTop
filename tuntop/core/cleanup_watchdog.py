@@ -258,7 +258,14 @@ def sweep_lan_routes(log=None) -> int:
     except Exception as e:
         _log(f"watchdog: LAN sweep failed: {e}\n"
              f"{traceback.format_exc()}".rstrip(), log)
-        return 0
+        # None (not 0): the caller must NOT treat this as "sweep ran and
+        # found nothing" - a failed sweep leaves the crash marker in place
+        # so the next launch re-runs the whole recovery. (Field evidence:
+        # the frozen watchdog's lazy imports died with Errno 2 on
+        # base_library.zip after the parent's _MEI dir was deleted, the
+        # sweeps no-op'd - and the marker was STILL cleared, so the log
+        # said "system is clean" while routes stayed.)
+        return None
 
 
 def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
@@ -272,6 +279,12 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
     log = log or (lambda m: None)
     try:
         if not geoip or not os.path.isfile(geoip):
+            return 0
+        # A geoip file without a country code means geo bypass was never
+        # active this session - nothing to sweep, and NOT an error (the
+        # empty code used to reach parse_geoip and be logged as a scary
+        # "no CIDR entries found for geoip code ''" failure).
+        if not geoip_code:
             return 0
         from tuntop.geoip import parse_geoip          # repo root on sys.path
         import tuntop.network.routing as routing
@@ -329,7 +342,10 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
     except Exception as e:
         _log(f"watchdog: geo sweep failed: {e}\n"
              f"{traceback.format_exc()}".rstrip(), log)
-        return 0
+        # None (not 0): the caller must NOT treat this as "sweep ran and
+        # found nothing" - a failed sweep leaves the crash marker in place
+        # so the next launch re-runs the whole recovery.
+        return None
 
 
 def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
@@ -380,22 +396,34 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
 
     # Geo bypass routes sit on the PHYSICAL adapter - invisible to the
     # Wintun teardown. Sweep them by CIDR match if a geoip file is known.
+    # Both sweeps return None on failure - a half-failed sweep must NOT
+    # retire the crash marker, or the log lies ("clean") while routes stay
+    # and the next launch skips its startup recovery.
+    sweeps_ok = True
     n_geo = sweep_geo_routes(geoip, geoip_code, log=log)
-    if n_geo:
+    if n_geo is None:
+        sweeps_ok = False
+    elif n_geo:
         _log(f"watchdog: removed {n_geo} leftover geoip route(s)", log)
 
     # LAN bypass routes (helper installs them every run, physical adapter).
     n_lan = sweep_lan_routes(log=log)
-    if n_lan:
+    if n_lan is None:
+        sweeps_ok = False
+    elif n_lan:
         _log(f"watchdog: removed {n_lan} leftover LAN bypass route(s)", log)
 
-    # Clear the marker ONLY if it is still ours - a session started while
+    # Clear the marker ONLY if it is still ours AND the sweeps ran clean - a session started while
     # we swept has written its own by now and owns the system.
     try:
         marker = read_marker(marker_path)
         if marker and int(marker.get("pid", -1) or -1) == int(pid):
-            clear_marker(marker_path)
-            _log("watchdog: crash marker cleared - system is clean", log)
+            if sweeps_ok:
+                clear_marker(marker_path)
+                _log("watchdog: crash marker cleared - system is clean", log)
+            else:
+                _log("watchdog: sweep PARTIALLY FAILED - crash marker LEFT "
+                     "in place so the next launch re-runs the recovery", log)
     except Exception as e:
         _log(f"watchdog: could not clear the crash marker: {e}", log)
     return True
@@ -439,6 +467,16 @@ def main(argv=None) -> int:
         from tuntop.geoip import parse_geoip as _pg  # noqa: F401
         from tuntop.startup_recovery import scan as _scan  # noqa: F401
         from tuntop.startup_recovery import recover as _recover  # noqa: F401
+        # Codec warm-up (belt & braces for the _MEI class): encoding to
+        # 'utf-16-le' inside routing._ps is a LAZY codec import - it reads
+        # base_library.zip from the extraction dir on FIRST use. Do it now,
+        # while the dir is guaranteed alive, not during the sweep later.
+        for _codec in ("utf-8", "utf-16-le", "utf-16-be", "utf-16",
+                       "cp1252", "latin-1"):
+            try:
+                "".encode(_codec)
+            except Exception:
+                pass
     except Exception as _e:
         _log(f"watchdog: eager import failed: {traceback.format_exc()}"
              .rstrip() + " - sweeps may fail; continuing so startup "
@@ -481,22 +519,24 @@ def main(argv=None) -> int:
     # Consume the sidecar: it described THIS session's live state and the
     # session is over. Only delete when it still names the swept pid - a
     # session started while we swept has rewritten it and owns the file.
+    # 1.0.33: a PARTIALLY FAILED sweep leaves the crash marker in place
+    # (the next launch must re-run the recovery) - keep the sidecar too in
+    # that case, since it describes the routes that still need sweeping.
     try:
         _sc_path = os.path.join(os.path.dirname(os.path.abspath(args.marker)),
                                 os.path.basename(STATE_FILE))
-        if os.path.isfile(_sc_path):
+        _marker_now = read_marker(args.marker)
+        _marker_ours = (_marker_now
+                        and int(_marker_now.get("pid", -1) or -1) == int(args.pid))
+        if _marker_ours:
+            _log("watchdog: sidecar kept with the marker - sweep incomplete")
+        elif os.path.isfile(_sc_path):
             with open(_sc_path, "r", encoding="utf-8") as _f:
                 _sc = json.load(_f)
             if int(_sc.get("pid", -1) or -1) == int(args.pid):
                 os.unlink(_sc_path)
     except Exception:
         pass
-
-    # Also retire a state file that outlived its session WITHOUT a sweep
-    # (clean exit / newer session): a stale sidecar would feed an old
-    # session's geo config to a future sweep. startup_recovery's marker
-    # protocol already decides whether a sweep runs - the sidecar must
-    # never be the stale half of that decision.
     return 0
 
 

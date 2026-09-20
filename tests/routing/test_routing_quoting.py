@@ -149,6 +149,28 @@ class TestHealthCheckScriptQuoting(unittest.TestCase):
         self.assertTrue(any("ping.exe -n 1 -f -l 1200 'Bob''s dns'" in s
                             for s in scripts))
 
+    def test_proxy_loop_check_flags_our_tunnel_by_alias(self):
+        """1.0.33: the loop-detection check used to pass while the server
+        route resolved through OUR OWN 'wintun' adapter (it only matched the
+        adapter DESCRIPTION against 'Wintun', which our vendored tun2socks
+        description does not contain). The generated script must treat our
+        own aliases as a loop regardless of the description."""
+        import tuntop.config.defaults as cfgdef
+        scripts = self._scripts(self._ns())
+        hits = [s for s in scripts if "Proxy loop detection" in s
+                or "VLESS endpoint NOT bypassed" in s]
+        self.assertTrue(hits)
+        for s in hits:
+            self.assertIn(f"@('{cfgdef.TUN}','{cfgdef.TUN2}')", s)
+            self.assertIn("-contains $r.InterfaceAlias", s)
+
+    def test_proxy_loop_check_uses_shared_tun_driver_regex(self):
+        from tuntop.network import egress_scripts as es
+        scripts = self._scripts(self._ns())
+        hits = [s for s in scripts if "VLESS endpoint NOT bypassed" in s]
+        self.assertTrue(hits)
+        self.assertTrue(all(es.TUN_DRIVER_RE in s for s in hits))
+
 
 if __name__ == "__main__":
     unittest.main()

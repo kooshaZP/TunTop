@@ -15,7 +15,7 @@ preambles in their own script and run them through their own runner.
 """
 import re
 
-from tuntop.config.defaults import VPN_IFACE_RE
+from tuntop.config.defaults import TUN, TUN2, VPN_IFACE_RE
 from tuntop.psshell import ps_quote
 
 #: Foreign full-tunnel TUN detection. 'Wintun' alone was NOT enough: Throne's
@@ -25,7 +25,14 @@ from tuntop.psshell import ps_quote
 #: churned. The server's traffic then fell into OUR TUN and looped. ANY
 #: adapter whose description matches this is a tunnel: never an egress.
 #: (PS -match is case-insensitive already; (?i) kept for the Python twin.)
-TUN_DRIVER_RE = ("(?i)(wintun|sing-tun|\\btun\\b|\\btap\\b|tunnel|wireguard"
+#:
+#: 1.0.33 adds 'tun2socks': the VENDORED tun2socks creates OUR OWN adapter
+#: with a tunnelType whose description matched NEITHER 'wintun' nor any other
+#: alternative - so the egress lookups saw our own TUN's 0/0 + 0/1 routes as
+#: valid "physical" candidates and pinned every server /32 ONTO our own
+#: wintun (the "the server IP goes to the wintun" report). 'tun2socks' never
+#: appears in a physical NIC description.
+TUN_DRIVER_RE = ("(?i)(wintun|tun2socks|sing-tun|\\btun\\b|\\btap\\b|tunnel|wireguard"
                  "|tailscale|openvpn|softether|zerotier|nekoray|mihomo|clash)")
 
 
@@ -57,11 +64,27 @@ def tun_alias_ps(var="$tunAliases"):
     adapters (ours, AND foreign full-tunnel tools - v2rayN/xray Wintuns,
     Throne's 'sing-tun Tunnel', WireGuard/Tailscale/OpenVPN clients; see
     TUN_DRIVER_RE). Consumers filter with
-    ``$tunAliases -notcontains $_.InterfaceAlias``."""
-    return (var + " = @(Get-NetAdapter -ErrorAction SilentlyContinue | "
-            "Where-Object { $_.InterfaceDescription -match '"
-            + TUN_DRIVER_RE + "' } | "
-            "Select-Object -ExpandProperty Name)\n")
+    ``$tunAliases -notcontains $_.InterfaceAlias``.
+
+    1.0.33: the collection matches the TUN driver on the DESCRIPTION *and*
+    on the NAME (alias), and OUR OWN adapter aliases (TUN/TUN2) are always
+    included. The vendored tun2socks creates our adapter with a tunnelType
+    whose description matched NEITHER the old regex nor 'wintun' - so
+    $tunAliases was blind to our own adapter, Find-NetRoute resolved every
+    server IP through OUR 0/0 + 0/1 routes, and every bypass install
+    ([A]/[U]/[R]/geo/self-heal) pinned the /32 ONTO our own wintun - the
+    "the server IP goes to the wintun" report. A physical NIC is never
+    named 'wintun*'/'tun2socks*', so name matching can only ever exclude
+    tunnel adapters.
+    """
+    ours = ", ".join("'" + a + "'" for a in (TUN, TUN2))
+    return (var + " = @(" + ours + ")\n"
+            "Get-NetAdapter -ErrorAction SilentlyContinue | "
+            "Where-Object { ($_.InterfaceDescription -match '"
+            + TUN_DRIVER_RE + "') -or ($_.Name -match '" + TUN_DRIVER_RE
+            + "') } | Select-Object -ExpandProperty Name | "
+            "ForEach-Object { " + var + " += $_ }\n"
+            + var + " = @(" + var + " | Select-Object -Unique)\n")
 
 
 def vpn_alias_ps(var="$vpnAliases"):
@@ -186,7 +209,15 @@ def ipv4_default_ps():
 _EGRESS_FOR_BODY = r"""
 $r = Find-NetRoute -RemoteIPAddress '__IP__' -ErrorAction SilentlyContinue
 if ($r) {
-    $r = @($r) | Where-Object { $tunAliases -notcontains $_.InterfaceAlias__VPN_CLAUSE__ } |
+    # Find-NetRoute emits TWO objects per hit: a NetIPAddress row (which
+    # carries NO NextHop) and the NetRoute row. Without the route check the
+    # address row can win the sort and the script returns
+    # {"InterfaceAlias":..,"NextHop":null} - add_v4 then installs the bypass
+    # with gateway 0.0.0.0 onto an interface whose actual route has a real
+    # next-hop, and Windows drops the packet (the "bypass doesn't work even
+    # when manually bypassed" report).
+    $r = @($r) | Where-Object { $_.DestinationPrefix -and
+            $tunAliases -notcontains $_.InterfaceAlias__VPN_CLAUSE__ } |
         Sort-Object -Property @{Expression={ ($_.DestinationPrefix -split '/')[1] -as [int] }; Descending=$true}, @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
         Select-Object -First 1
 }

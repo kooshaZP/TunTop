@@ -166,6 +166,17 @@ def _get_egress_for(ip, exclude_vpn=True):
     gw = str(d.get("NextHop", "") or "")
     if not iface:
         return None
+    # Fail-closed at the Python twin too (1.0.33): the PS filter already
+    # excludes every $tunAliases adapter, but if the adapter enumeration
+    # hiccupped the resolver could hand back OUR tunnel (or, with
+    # exclude_vpn, a VPN) as the "physical" egress - pinning a bypass route
+    # onto the tunnel loops the transport (the "the server IP goes to the
+    # wintun" report). Refusing here makes every caller fall back to the
+    # last-known-good physical egress instead of installing a looping route.
+    if egress_scripts.is_tun_iface(iface):
+        return None
+    if exclude_vpn and egress_scripts.is_vpn_iface(iface):
+        return None
     return iface, (gw or "0.0.0.0")
 
 

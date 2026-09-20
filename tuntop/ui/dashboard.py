@@ -75,7 +75,10 @@ from tuntop.routing import (          # noqa: E402
     _get_ipv4_default, _get_ipv6_default,
     _get_egress_for, _get_vpn_ipv4_default, _get_vpn_ipv6_default,
 )
-from tuntop.network.egress_scripts import is_tun_iface as _is_tun_iface  # noqa: E402
+from tuntop.network.egress_scripts import (  # noqa: E402  (single source)
+    is_tun_iface as _is_tun_iface,
+    TUN_DRIVER_RE as _TUN_DRIVER_RE,
+)
 from tuntop.psshell import ps_quote   # noqa: E402
 from tuntop.netdns import (           # noqa: E402
     _host_from_url, _resolve, _resolve_cached, _resolve_detail,
@@ -1292,8 +1295,22 @@ def build_checks(ns):
                         f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; if ($r) {{'via ' + $r.InterfaceAlias}} else {{Write-Output 'no route found'; exit 1}}"))
         checks.append(q(f"Proxy loop detection ({_s})",
                         f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; "
-                        f"$t = (Get-NetAdapter -Name $r.InterfaceAlias -ErrorAction SilentlyContinue).InterfaceDescription -match 'Wintun'; "
-                        f"if ($r -and -not $t) {{'VLESS endpoint bypassed through ' + $r.InterfaceAlias}} else {{Write-Output 'VLESS endpoint NOT bypassed (loops into tunnel!)'; exit 1}}"))
+                        f"if (-not $r) {{Write-Output 'no route found'; exit 1}}; "
+                        # The verdict must recognize OUR OWN tunnel adapters by
+                        # ALIAS (1.0.33): the old check only tested the adapter
+                        # DESCRIPTION for 'Wintun', but the vendored tun2socks
+                        # creates our adapter with a description that matches
+                        # neither - so the check kept passing ("bypassed
+                        # through wintun") while the server /32 was pinned
+                        # INTO our own TUN and the transport looped. A route
+                        # that resolves through ANY tunnel-family adapter
+                        # (ours by alias, foreign by driver description) is a
+                        # loop, always.
+                        f"$a = Get-NetAdapter -Name $r.InterfaceAlias -ErrorAction SilentlyContinue; "
+                        f"$tun = (@('{TUN}','{TUN2}') -contains $r.InterfaceAlias) "
+                        f"-or ($a.InterfaceDescription -match '{_TUN_DRIVER_RE}'); "
+                        f"if ($tun) {{Write-Output ('VLESS endpoint NOT bypassed - resolves via tunnel adapter ' + $r.InterfaceAlias + ' (loops into a tunnel)'); exit 1}}; "
+                        f"'VLESS endpoint bypassed through ' + $r.InterfaceAlias"))
 
     return checks
 
@@ -1760,6 +1777,7 @@ class BTopTui:
 
         self.checks = build_checks(args)
         self.log_lines = []
+        self._log_snapshot = None
         self._log_scroll = 0        # lines scrolled back from the newest log entry
         self._checks_scroll = 0     # checks scrolled back from the newest row
                                     # (same scroll-back model as the log)
@@ -2297,6 +2315,26 @@ class BTopTui:
             return "checks"
         return "log"
 
+    def _log_entries(self):
+        if self._log_snapshot is not None:
+            return self._log_snapshot
+        return self.log_lines
+
+    def _pause_log(self):
+        if self._log_snapshot is None:
+            self._log_snapshot = tuple(self.log_lines)
+
+    def _resume_log(self):
+        self._log_snapshot = None
+        self._log_scroll = 0
+
+    def _scroll_log(self, delta):
+        if delta > 0:
+            self._pause_log()
+        self._log_scroll = max(
+            0, min(self._log_scroll + delta,
+                   max(0, len(self._log_entries()) - 1)))
+
     def _poll_input(self):
         """Non-blocking unified keyboard+mouse poll via ReadConsoleInputW.
         Only used once _init_mouse() has succeeded; returns a single logical
@@ -2308,6 +2346,8 @@ class BTopTui:
         same console input batch as a keypress) is never silently dropped - the
         old code only ever returned the LAST event of the whole batch, which is
         exactly what made rapid input feel like "the mouse / keys don't work"."""
+        if self._mouse_queue:
+            return self._mouse_queue.pop(0)[1]
         try:
             n = ctypes.c_uint32()
             if not ctypes.windll.kernel32.GetNumberOfConsoleInputEvents(self._stdin_handle, ctypes.byref(n)):
@@ -3167,6 +3207,41 @@ class BTopTui:
         th.start()
         return th
 
+    def _start_update_check(self):
+        """One background GitHub-release update check per session (frozen
+        exe only; BTOP_NO_UPDATE=1 or --no-update-check opts out). Stages a
+        VERIFIED TunTop-<version>.exe next to the running one - never
+        launches or overwrites anything."""
+        if not getattr(_sys, "frozen", False):
+            return None
+        if os.environ.get("BTOP_NO_UPDATE"):
+            return None
+        if getattr(self.ns, "no_update_check", False):
+            return None
+        if getattr(self, "_update_thread", None) and self._update_thread.is_alive():
+            return self._update_thread
+        self._update_thread = threading.Thread(
+            target=self._update_check_worker, daemon=True)
+        self._update_thread.start()
+        return self._update_thread
+
+    def _update_check_worker(self):
+        from tuntop.config import updates as _updates
+        import tuntop as _pkg
+        try:
+            exe_dir = _os.path.dirname(_os.path.abspath(_sys.executable))
+            staged = _updates.prepare_update(_pkg.__version__, exe_dir)
+        except Exception as e:
+            self.logs.put(f"[i] Update check skipped: {e}")
+            return
+        if staged:
+            self.logs.put(
+                f"[+] Update {staged.version} downloaded and verified (SHA-256): "
+                f"{staged.path} - close TunTop and run that exe to apply it.")
+        else:
+            self.logs.put("[i] Update check done - no newer release "
+                          "(up to date, or offline).")
+
     def _bypass_resolver_worker(self):
         """Background loop: keep every bypass entry resolved and routed. Runs
         until the dashboard exits. All DNS/route work happens here so the UI
@@ -3979,6 +4054,7 @@ class BTopTui:
             # lands on the wrong interface and the new server is unreachable
             # even though requests to it keep appearing in the log.
             self._iface_cache = None
+            _ep_map = {}    # host -> {"v4": [...], "v6": [...]} for the helper sync
             gone = []
             for ip in old_ips:
                 ok, _foreign = (_del_route_v4(f"{ip}/32", "", "") if ":" not in ip
@@ -4022,6 +4098,35 @@ class BTopTui:
                         "will LOOP (every request to the server fails). Check "
                         "the egress, then press [R] to re-apply or restart the "
                         "tunnel.")
+                _ep_map[srv] = {"v4": list(v4), "v6": list(v6)}
+            # Complete the map with the UNTOUCHED servers so the helper's
+            # reconciliation keeps their tracked endpoints (in ADD mode the
+            # edited hosts are only a subset of ns.server - without this,
+            # the helper would read the missing entries as "dropped" and
+            # strip the old servers' bypasses).
+            _allow_fb_rest = _dns_fallback_allowed(
+                getattr(self.ns, "dns_policy", "availability"),
+                self.state not in ("STOPPED", "STOPPING"))
+            for srv in (self.ns.server or []):
+                if srv in _ep_map:
+                    continue
+                v4, v6, _err, _src = _resolve_detail(
+                    srv, use_cache=False, fallback=_allow_fb_rest)
+                _ep_map[srv] = {"v4": list(v4), "v6": list(v6)}
+            # Hand the NEW server list (with the per-host resolutions) to
+            # the running helper: its tracked endpoint list - the 15 s
+            # self-heal AND the gateway-change re-point - only covers
+            # routes the HELPER installed, so a live [U] change used to
+            # leave the new server's /32 invisible to both (pinned to the
+            # dead gateway after a Wi-Fi change: "the U ip goes to the
+            # wintun").
+            try:
+                self._write_control_file(extra={
+                    "servers": list(self.ns.server or []),
+                    "server_endpoints": _ep_map})
+            except Exception as e:
+                self._blog(f"[!] Could not sync the [U] server list to the "
+                           f"helper: {e}")
         threading.Thread(target=_worker, daemon=True).start()
 
     def _edit_geo(self):
@@ -5156,6 +5261,12 @@ class BTopTui:
             # the UI responsive and logs progress into the event log.
             self._start_geo_download(force=True)
             return True
+        elif key in (' ', 'space'):
+            if self._log_snapshot is None:
+                self._pause_log()
+            else:
+                self._resume_log()
+            return True
         elif key in ('j', 'k'):
             # j = toward newer, k = toward older - applied to whichever
             # panel is ACTIVE. Hovering a visible log/checks panel with the
@@ -5170,11 +5281,7 @@ class BTopTui:
                 else:
                     self._checks_scroll = max(0, self._checks_scroll - 5)
             else:
-                if key == 'k':
-                    self._log_scroll = min(
-                        len(self.log_lines), self._log_scroll + 5)
-                else:
-                    self._log_scroll = max(0, self._log_scroll - 5)
+                self._scroll_log(5 if key == 'k' else -5)
             return True
         elif key in ('up', 'pgup', 'down', 'pgdn'):
             # Vertical scroll for the ACTIVE panel (the one the mouse hovers;
@@ -5189,25 +5296,22 @@ class BTopTui:
                 else:
                     self._checks_scroll = max(0, self._checks_scroll - step)
             else:
-                if older:
-                    self._log_scroll = min(
-                        len(self.log_lines), self._log_scroll + step)
-                else:
-                    self._log_scroll = max(0, self._log_scroll - step)
+                self._scroll_log(step if older else -step)
             return True
         elif key == 'home':
             # Jump the ACTIVE panel to its oldest row.
             if self._scroll_panel() == "checks":
                 self._checks_scroll = max(0, len(self.results) - 1)
             else:
-                self._log_scroll = len(self.log_lines)
+                self._pause_log()
+                self._scroll_log(len(self._log_entries()))
             return True
         elif key == 'end':
             # Back to the newest row: re-arm auto-follow on the ACTIVE panel.
             if self._scroll_panel() == "checks":
                 self._checks_scroll = 0
             else:
-                self._log_scroll = 0
+                self._resume_log()
             return True
         elif key in ('left', 'right'):
             # Horizontal scroll for long log lines / health details - ONE
@@ -6308,6 +6412,9 @@ class BTopTui:
             # Stats line: current (+ share of scale) + window average + peak per
             # direction, plus session total. avg gives the eye a reference the
             # raw peak hides; %-of-scale explains how tall the bars SHOULD look.
+            # Every rate is an unambiguous "N.NN MiB/s"; the %-of-scale value is
+            # separated by a space (the old "1.23 %45" glued the % sign onto the
+            # rate and read like a mangled unit).
             _avg_r = (sum(rx_snap) / len(rx_snap) / 1024) if rx_snap else 0.0
             _avg_t = (sum(tx_snap) / len(tx_snap) / 1024) if tx_snap else 0.0
             down_k = cur_rx / 1024
@@ -6317,10 +6424,10 @@ class BTopTui:
             _pct_r = min(100.0, cur_rx / max(peak_ref, 1e-9) * 100)
             _pct_t = min(100.0, cur_tx / max(peak_ref, 1e-9) * 100)
             L.append(_row(
-                f"{GREEN}\u25bc {down_k:6.2f}{DIM}%{_pct_r:3.0f}{_R}"
-                f"{DIM} avg {_avg_r:5.1f} peak {pdown_k:6.2f}{_R}   "
-                f"{CYAN}\u25b2 {up_k:6.2f}{DIM}%{_pct_t:3.0f}{_R}"
-                f"{DIM} avg {_avg_t:5.1f} peak {pup_k:6.2f}{_R}   "
+                f"{GREEN}\u25bc {down_k:6.2f} MiB/s{DIM} ({_pct_r:3.0f}%){_R}"
+                f"{DIM} avg {_avg_r:5.1f} peak {pdown_k:6.2f} MiB/s{_R}   "
+                f"{CYAN}\u25b2 {up_k:6.2f} MiB/s{DIM} ({_pct_t:3.0f}%){_R}"
+                f"{DIM} avg {_avg_t:5.1f} peak {pup_k:6.2f} MiB/s{_R}   "
                 f"{DIM}total {total_mb:7.1f} MiB   "
                 f"scale {peak_mib:.2f} MiB/s  [G] {gmode}{_R}"))
             L.append(_bot(pal["throughput"]))
@@ -6451,14 +6558,17 @@ class BTopTui:
             self._fixed_rows = len(L)
 
         if "log" not in self._hidden:
-            total = len(self.log_lines)
+            entries = self._log_entries()
+            total = len(entries)
             # Clamp the scroll position so it stays within the history.
             self._log_scroll = max(0, min(self._log_scroll, max(0, total - 1)))
             v = self._log_visible
             end = total - self._log_scroll
             start = max(0, end - v)
-            visible = self.log_lines[start:end] if total else ["Waiting for events..."]
+            visible = entries[start:end] if total else ["Waiting for events..."]
             title = "EVENT LOG"
+            if self._log_snapshot is not None:
+                title += "  [paused - Space resumes]"
             if total > v:
                 # 1-based range of the slice currently shown.
                 title += f"  ({start + 1}-{end} of {total})"
@@ -6546,7 +6656,8 @@ class BTopTui:
                     ('y', "[Y] VPN Bypass"), ('f', "[F] Geo Manager"),
                     ('w', "[W] Get/Update GeoIP"),
                     ('o', "[O] Save Profile"), ('i', "[I] Load Profile"),
-                    ('k', "[J/K] Page: hovered panel"), ('up', "[\u2191\u2193] Scroll: hovered panel"),
+                    (' ', "[Space] Pause log"), ('k', "[J/K] Page: hovered panel"),
+                    ('up', "[↑↓] Scroll: hovered panel"),
                 ],
                 [
                     ('1', "[1] Metrics"), ('2', "[2] Endpoint"),
@@ -6698,6 +6809,11 @@ class BTopTui:
         # the /32 - /128 bypass routes as soon as they resolve. Off the UI thread
         # so a slow or dead resolver can never freeze a frame or a keypress.
         self._ensure_bypass_resolver()
+        # GitHub release auto-update check (1.0.33): background, once per
+        # session, frozen exe only. A newer verified TunTop-<version>.exe is
+        # STAGED next to the running one (never executed, never overwritten) -
+        # the log line tells the user where it is; starting it is manual.
+        self._start_update_check()
 
         try:
             while self.running:
@@ -6983,7 +7099,7 @@ class BTopTui:
         try:
             # Force the child (helper) into UTF-8 so its log lines are readable
             # and never turn into '?'.
-            child_env = os.environ.copy()
+            child_env = _pyinstaller_clean_env()
             child_env["PYTHONUTF8"] = "1"
             child_env["PYTHONIOENCODING"] = "utf-8"
             child_env["PYTHONUNBUFFERED"] = "1"  # critical: helper stdout is
@@ -8334,6 +8450,30 @@ def _bootstrap_geoip(exe_dir):
     return dest
 
 
+def _pyinstaller_clean_env():
+    """Environment for the re-dispatched child processes (--helper-child,
+    --watchdog-child) with PyInstaller's parent-process variables REMOVED.
+
+    The onefile bootloader marks its extraction dir with _MEIPASS2 (and the
+    _PYI_* variables on newer PyInstaller) so a child re-entering the exe
+    REUSES the parent's _MEI dir instead of extracting its own. That is
+    fatal for the cleanup watchdog: it deliberately outlives the dashboard,
+    and when the dashboard exits, the bootloader deletes the shared _MEI
+    dir - after which every lazy import in the watchdog (a codec lookup
+    inside routing._ps, a zipimport of base_library.zip) dies with
+    "FileNotFoundError: ...\\_MEIxxxxx\\base_library.zip", the geo/LAN
+    sweeps no-op, and leftover routes survive an unclean exit. Stripping
+    the variables makes the child extract its OWN dir that nobody else
+    deletes. No-op (plain copy) outside a frozen build.
+    """
+    env = os.environ.copy()
+    for key in list(env):
+        if (key.startswith("_MEIPASS") or key.startswith("_PYI")
+                or key.startswith("PYINSTALLER")):
+            env.pop(key, None)
+    return env
+
+
 def main():
     # ── Frozen child-process dispatch (PyInstaller onefile) ────────────
     # The tunnel helper and the cleanup watchdog run as SEPARATE processes,
@@ -8351,37 +8491,11 @@ def main():
             import importlib
             sys.exit(importlib.import_module(_child_mod).main() or 0)
 
-    # ── Prefer Windows Terminal over legacy conhost (frozen exe) ────────
-    # Double-clicking the exe opens a classic conhost window - the weakest
-    # renderer TunTop can end up in: its default font is often a Raster face
-    # and several glyph slots keep showing '?' even after the font/codepage
-    # fix-up below. When the exe starts inside a plain conhost and Windows
-    # Terminal is installed, move the whole dashboard there instead: WT
-    # renders every box/block/●/✔ glyph natively with its own profile font
-    # (the "PowerShell window" experience, minus the cmd.exe drawing bugs).
-    # Child helper/watchdog processes never get here (dispatch above already
-    # exited), the relaunch passes every original argument through, and
-    # BTOP_NO_WT=1 opts out entirely.
-    if (getattr(_sys, "frozen", False)
-            and _detect_terminal_host() == "conhost"
-            and sys.stdout.isatty()
-            and not os.environ.get("BTOP_NO_WT")
-            and not any(a in sys.argv for a in ("-h", "--help"))):
-        _wt = (shutil.which("wt.exe") or os.path.join(
-            os.environ.get("LOCALAPPDATA", ""),
-            "Microsoft", "WindowsApps", "wt.exe"))
-        if _wt and os.path.isfile(_wt):
-            try:
-                _exe = os.path.abspath(_sys.executable)
-                subprocess.Popen([_wt, "-d", os.path.dirname(_exe), _exe]
-                                 + sys.argv[1:],
-                                 creationflags=subprocess.DETACHED_PROCESS
-                                 | subprocess.CREATE_NEW_PROCESS_GROUP,
-                                 close_fds=True)
-                print("[i] Relaunching in Windows Terminal ...")
-                sys.exit(0)
-            except Exception:
-                pass   # alias missing/broken - keep the current conhost
+    # ── Terminal-host note ──────────────────────────────────────────────
+    # The dashboard now always runs in the console it was launched in. The
+    # old frozen-exe auto-relaunch into Windows Terminal spawned a second
+    # window next to the original conhost one; that extra window is gone
+    # and the BTOP_NO_WT=1 opt-out with it.
 
     ap = argparse.ArgumentParser(
     description="btop-style dashboard for v2ray TUN monitoring.",
@@ -8408,6 +8522,9 @@ def main():
                     help="Skip the SHA-256 verification of tun2socks.exe / "
                          "wintun.dll (only for binaries you rebuilt "
                          "yourself - NOT recommended)")
+    ap.add_argument("--no-update-check", action="store_true",
+                    help="Disable the one-shot GitHub release update check "
+                         "(frozen exe only)")
     ap.add_argument("--proxy-over-vpn", "--vless-over-vpn", action="store_true",
                     dest="vless_over_vpn")
     ap.add_argument("--proxy2-port", type=int, default=None, metavar="PORT",
@@ -8641,6 +8758,11 @@ def main():
                          stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL,
+                         # Without a scrubbed env the child inherits
+                         # _MEIPASS2 and reuses THIS process's _MEI dir -
+                         # deleted on our exit, killing every later import
+                         # in the watchdog (the base_library.zip Errno 2).
+                         env=_pyinstaller_clean_env(),
                          creationflags=subprocess.DETACHED_PROCESS |
                                  subprocess.CREATE_NEW_PROCESS_GROUP)
     except Exception as e:

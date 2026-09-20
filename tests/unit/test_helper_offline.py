@@ -78,5 +78,43 @@ class TestGeoSweepHits(unittest.TestCase):
         self.assertEqual(H._geo_sweep_hits("", "v6"), [])
 
 
+class TestRejectCompetingTun(unittest.TestCase):
+    """The foreign full-tunnel TUN startup guard (v2rayN/xray TUN mode).
+
+    Regression: a competing Wintun adapter owning 0.0.0.0/0 used to be a soft
+    warning, so the helper started anyway and the VLESS server /32 bypass fell
+    into the foreign TUN the moment it dropped ("the server IP goes to the
+    wintun"), surviving closing AND reopening because the foreign adapter
+    outlives this program's cleanup. Now it refuses to start."""
+    PATH = "tuntop.tunnel.helper.get_foreign_tun_adapters"
+
+    def test_blocks_when_foreign_tun_owns_default(self):
+        with mock.patch(self.PATH, return_value=[("xray_tun", "yes")]):
+            with self.assertRaises(SystemExit) as cm:
+                H.reject_competing_tun()
+        msg = str(cm.exception)
+        self.assertIn("TUN CONFLICT", msg)
+        self.assertIn("xray_tun", msg)
+        self.assertNotIn("left untouched", msg)
+
+    def test_blocks_when_any_of_many_owns_default(self):
+        with mock.patch(self.PATH, return_value=[("wireguard", "no"),
+                                                 ("v2rayN", "yes")]):
+            with self.assertRaises(SystemExit):
+                H.reject_competing_tun()
+
+    def test_lets_tun_without_default_pass_and_notes_it(self):
+        with mock.patch(self.PATH, return_value=[("sing-tun Tunnel", "no")]):
+            with mock.patch.object(H, "print") as pr:
+                H.reject_competing_tun()
+        joined = "\n".join(str(v) for args, _kw in pr.call_args_list
+                           for v in args)
+        self.assertIn("left untouched", joined)
+
+    def test_no_foreign_tun_is_a_noop(self):
+        with mock.patch(self.PATH, return_value=[]):
+            H.reject_competing_tun()  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

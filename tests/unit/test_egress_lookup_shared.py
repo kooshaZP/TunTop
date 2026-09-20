@@ -87,8 +87,13 @@ class TestSharedEgressScript(unittest.TestCase):
 
     def test_preamble_present(self):
         ps = es.egress_lookup_ps("1.2.3.4")
-        self.assertIn("$tunAliases = @(Get-NetAdapter", ps)
+        # 1.0.33: the preamble seeds $tunAliases with OUR OWN aliases
+        # (name-based, immune to a description blind spot) and then appends
+        # every adapter matching the TUN driver on description OR name.
+        self.assertIn(f"$tunAliases = @('{es.TUN}', '{es.TUN2}')", ps)
         self.assertIn("InterfaceDescription", ps)
+        self.assertIn("-or ($_.Name -match", ps)
+        self.assertIn("ForEach-Object { $tunAliases += $_ }", ps)
 
 
 class TestConsumersDelegate(unittest.TestCase):

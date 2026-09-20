@@ -78,6 +78,41 @@ class TestScriptShape(unittest.TestCase):
         # xray's 'xray_tun' defeated) must not come back:
         self.assertNotIn("^wintun", ps)
 
+    def test_tun_preamble_covers_our_own_adapters(self):
+        """1.0.33 ('the server IP goes to the wintun'): the vendored
+        tun2socks creates OUR adapter with a tunnelType whose DESCRIPTION
+        matched neither 'wintun' nor any TUN_DRIVER_RE alternative, so the
+        description-only preamble was blind to our own TUN - the egress
+        lookups then resolved every server IP through OUR 0/1 routes and
+        every bypass install pinned the /32 ONTO our own wintun. The
+        preamble must now include our aliases by NAME and match the driver
+        on the NAME as well as the description."""
+        ps = es.tun_alias_ps()
+        self.assertIn("'wintun'", ps)      # config.defaults.TUN by name
+        self.assertIn("'wintun2'", ps)     # config.defaults.TUN2 by name
+        self.assertIn("-or ($_.Name -match", ps)
+        self.assertIn("-match '" + es.TUN_DRIVER_RE + "') -or ($_.Name", ps)
+
+
+class TestTunDriverRegexCoversTun2socks(unittest.TestCase):
+    """TUN_DRIVER_RE is the single TUN detector (PS preamble AND the Python
+    twin). The vendored tun2socks' own tunnelType text must classify as a
+    tunnel - and a physical NIC description must never do so."""
+
+    def test_tun2socks_description_is_a_tunnel(self):
+        self.assertTrue(es.is_tun_iface("tun2socks"))
+        self.assertTrue(es.is_tun_iface("tun2socks Tunnel"))
+
+    def test_our_aliases_are_tunnels(self):
+        for alias in ("wintun", "wintun2", "Wintun Tunnel"):
+            self.assertTrue(es.is_tun_iface(alias), alias)
+
+    def test_physical_descriptions_never_match(self):
+        for alias in ("Intel(R) Wi-Fi 7 BE200 320MHz", "Ethernet",
+                      "Realtek PCIe GbE Family Controller", "reza_U",
+                      "Shirazu-VPN", "VMware Virtual Ethernet Adapter"):
+            self.assertFalse(es.is_tun_iface(alias), alias)
+
     def test_v4_filter_tun_predicate_is_variable(self):
         self.assertIn("$tunAliases -notcontains", es.v4_default_filter_ps())
         self.assertIn(VPN_IFACE_RE, es.v4_default_filter_ps(True))
