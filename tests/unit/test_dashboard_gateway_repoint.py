@@ -35,7 +35,7 @@ class TestRerouteLiveGeoRows(unittest.TestCase):
             ("v4", "31.13.0.0/16", "Wi-Fi", "192.168.1.1"),   # moves
             ("v4", "2.16.0.0/20", "Ethernet", "10.0.0.1"),    # other egress
             ("v4", "8.8.8.8/32", "wintun", "192.168.123.1"),  # tunneled geo
-            ("v6", "2606:4700::/32", "Wi-Fi", "fe80::1"),     # v6 stays
+            ("v6", "2606:4700::/32", "Wi-Fi", "fe80::1"),     # v6 stays (no v6 egress)
         ])
         deleted = []
         added = []
@@ -44,7 +44,9 @@ class TestRerouteLiveGeoRows(unittest.TestCase):
                                deleted.extend(rows) or len(rows)), \
              mock.patch.object(app, "_batch_add_routes",
                                side_effect=lambda rows:
-                               added.extend(rows) or len(rows)):
+                               added.extend(rows) or len(rows)), \
+             mock.patch("tuntop.ui.dashboard._get_ipv6_default",
+                        return_value=None):
             n = app._reroute_live_geo_rows("Wi-Fi", "Ethernet", "10.0.0.1")
         self.assertEqual(n, 2)
         self.assertEqual(sorted(deleted),

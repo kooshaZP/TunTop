@@ -129,13 +129,17 @@ _UA = "tuntop-leak/1.0"
 #: verification ON, TLS 1.2+ only. One explicit context (not bare
 #: ssl.wrap_socket) is both the secure construction and what static
 #: analysers (CodeQL "use of insecure SSL/TLS version") require to see the
-#: protocol floor is pinned.
+#: protocol floor is pinned. The floor is pinned TWICE so the guarantee is
+#: unconditional:
+#:   * minimum_version = TLSv1_2 (Python 3.7+), and
+#:   * the OP_NO_* protocol-kill flags (belt-and-braces, and what the CodeQL
+#:     py/insecure-protocol query recognizes directly on any Python).
 _SSL_CONTEXT = ssl.create_default_context()
 if hasattr(ssl, "TLSVersion"):
-    try:
-        _SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
-    except Exception:
-        pass
+    _SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+for _opt_name in ("OP_NO_SSLv3", "OP_NO_TLSv1", "OP_NO_TLSv1_1"):
+    _SSL_CONTEXT.options |= getattr(ssl, _opt_name, 0)
+del _opt_name
 
 
 def _tls_wrap(sock, host):

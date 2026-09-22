@@ -94,18 +94,42 @@ class TestHealEndpointRoutes(unittest.TestCase):
         add.assert_not_called()
         rm.assert_not_called()
 
-    def test_over_vpn_mode_uses_vpn_egress(self):
+    def test_over_vpn_mode_pins_to_vpn_egress_without_lookup(self):
+        # [V] mode is DETERMINISTIC: the validated VPN egress
+        # (_live_mode["over"]) is the pin target - never a Find-NetRoute
+        # lookup, which can return the physical NIC (a VPN adapter matching
+        # the tunnel-driver description filter is invisible to that lookup)
+        # and would silently leave the transport on Wi-Fi.
         helper._live_mode["vless_over_vpn"] = True
         helper._live_mode["over"] = ("reza_U", "10.0.0.1")
         with mock.patch.object(helper, "get_existing_v4_routes",
                                return_value=[]), \
-                mock.patch.object(helper, "get_egress_for",
-                                  return_value=("reza_U", "10.0.0.1")) as eg, \
+                mock.patch.object(helper, "get_egress_for") as eg, \
                 mock.patch.object(helper, "add_v4", return_value=True) as add:
             helper._heal_endpoint_routes()
-        eg.assert_called_once_with("188.114.97.6", exclude_vpn=False)
+        eg.assert_not_called()
         add.assert_called_once_with("188.114.97.6/32", "reza_U",
                                     "10.0.0.1", metric=1)
+
+    def test_over_vpn_mode_re_points_wi_fi_route_onto_vpn(self):
+        # The named bug: "VLESS server route via Wi-Fi" while [V] mode says
+        # the transport rides the VPN. A /32 that resolved onto the physical
+        # NIC is a mode violation and gets evicted + re-pointed onto the VPN,
+        # exactly like a TUN-pinned route always was.
+        helper._live_mode["vless_over_vpn"] = True
+        helper._live_mode["over"] = ("Shirazu-VPN", "10.8.0.1")
+        with mock.patch.object(helper, "get_existing_v4_routes",
+                               return_value=[_row("Wi-Fi", "192.168.1.1")]), \
+                mock.patch.object(helper, "get_egress_for") as eg, \
+                mock.patch.object(helper, "remove_route") as rm, \
+                mock.patch.object(helper, "add_v4", return_value=True) as add:
+            lines = helper._heal_endpoint_routes()
+        rm.assert_called_once_with(("v4", "188.114.97.6/32",
+                                    "Wi-Fi", "192.168.1.1"))
+        eg.assert_not_called()
+        add.assert_called_once_with("188.114.97.6/32", "Shirazu-VPN",
+                                    "10.8.0.1", metric=1)
+        self.assertTrue(any("[HEAL]" in ln for ln in lines))
 
     def test_no_egress_reports_and_keeps_retrying(self):
         # Live resolution fails AND no startup-captured fallback exists:

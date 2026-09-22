@@ -22,6 +22,18 @@ import tempfile
 _PS_CMDLINE_SAFE = 20000
 
 
+"""Subprocess execution helpers with timeout safety.
+
+All PowerShell, netsh, and taskkill calls in the helper are routed through
+`run()`, so the CREATE_NO_WINDOW flag here is the single chokepoint that
+prevents console windows from popping up when the PyInstaller onefile exe
+launches children.  The flag is guarded with getattr() so the module can be
+imported on non-Windows platforms without error.
+"""
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def run(cmd, check=False, timeout=15):
     """Run a command and return (returncode, stdout, stderr).
 
@@ -46,6 +58,7 @@ def run(cmd, check=False, timeout=15):
             text=True,
             encoding="utf-8",
             errors="replace",
+            creationflags=_NO_WINDOW,
         )
     except (FileNotFoundError, OSError) as e:
         msg = str(e)

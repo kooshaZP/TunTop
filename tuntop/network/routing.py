@@ -11,6 +11,8 @@ from tuntop.psshell import ps_quote
 from tuntop.config.defaults import TUNNEL_ALIASES, VPN_IFACE_RE  # noqa: F401
 from tuntop.network import egress_scripts
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # Windows caps a whole CreateProcess command line at 32767 characters.
 # -EncodedCommand puts the ENTIRE script on the command line (base64 of
 # UTF-16LE ≈ 2.7x the script size), so any batched bulk operation - e.g.
@@ -51,6 +53,7 @@ def _ps_file(script, timeout=8):
                  "-File", path],
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=timeout,
+                creationflags=_NO_WINDOW,
             )
         except Exception as e:
             return False, str(e)
@@ -80,6 +83,7 @@ def _ps(script, timeout=8):
              "-EncodedCommand", enc],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=timeout,
+            creationflags=_NO_WINDOW,
         )
         return _ps_process_out(p)
     except Exception as e:
@@ -338,7 +342,8 @@ $best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
 def _netsh(args_list, timeout=10):
     try:
         p = subprocess.run(["netsh"] + args_list, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace", timeout=timeout)
+                            encoding="utf-8", errors="replace", timeout=timeout,
+                            creationflags=_NO_WINDOW)
         return p.returncode == 0, (p.stdout or p.stderr or "").strip()
     except Exception as e:
         return False, str(e)

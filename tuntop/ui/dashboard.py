@@ -972,7 +972,8 @@ def _https(proxy=False, v6=False, port=10808,
     last = (False, "")
     for _ in range(2):
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=18)
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=18,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
             out = (p.stdout or "").strip() or (p.stderr or "").strip()
             last = (p.returncode == 0 and out.startswith("2"), out)
             if last[0]:
@@ -1104,6 +1105,8 @@ def build_checks(ns):
     servers = ns.server
     dns = getattr(ns, "dns4", None) or _cfgdef.DNS4   # probe/display fallback
     ep = getattr(ns, "endpoint_port", 443)
+    # [V] vless-over-vpn mode: the per-server route checks below are MODE-AWARE.
+    over = getattr(ns, "vless_over_vpn", False)
 
     def q(label, code):
         return (label, lambda: _ps(code))
@@ -1287,30 +1290,80 @@ def build_checks(ns):
                     f"Get-NetRoute -DestinationPrefix '{prefix}' -ErrorAction SilentlyContinue | % {{'routed'}}"))
 
     # Per-server endpoint checks: one set of TCP / route / proxy-loop checks
-    # for every configured --server value.
+    # for every configured --server value. In [V] vless-over-vpn mode the
+    # route checks are MODE-AWARE: the endpoint /32s must resolve through the
+    # CONNECTED Windows VPN - a route that lands on the physical NIC (Wi-Fi)
+    # silently defeats the mode ("VLESS server route via Wi-Fi" while the VPN
+    # shows Connected), so it is reported as a FAILURE, not a pass.
+    _vpnconn_ps = ("$vc = @(Get-VpnConnection -AllUserConnection -EA SilentlyContinue) + "
+                   "@(Get-VpnConnection -EA SilentlyContinue) | "
+                   "? ConnectionStatus -eq 'Connected' | "
+                   "select -ExpandProperty Name -Unique; ")
     for _s in (servers or []):
         checks.append((f"Configured endpoint TCP/{ep} ({_s})",
                        lambda _s=_s, ep=ep: _tcp(_s, ep, 8)))
-        checks.append(q(f"VLESS server route ({_s})",
-                        f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; if ($r) {{'via ' + $r.InterfaceAlias}} else {{Write-Output 'no route found'; exit 1}}"))
-        checks.append(q(f"Proxy loop detection ({_s})",
-                        f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' -ErrorAction SilentlyContinue | select -First 1; "
-                        f"if (-not $r) {{Write-Output 'no route found'; exit 1}}; "
-                        # The verdict must recognize OUR OWN tunnel adapters by
-                        # ALIAS (1.0.33): the old check only tested the adapter
-                        # DESCRIPTION for 'Wintun', but the vendored tun2socks
-                        # creates our adapter with a description that matches
-                        # neither - so the check kept passing ("bypassed
-                        # through wintun") while the server /32 was pinned
-                        # INTO our own TUN and the transport looped. A route
-                        # that resolves through ANY tunnel-family adapter
-                        # (ours by alias, foreign by driver description) is a
-                        # loop, always.
-                        f"$a = Get-NetAdapter -Name $r.InterfaceAlias -ErrorAction SilentlyContinue; "
-                        f"$tun = (@('{TUN}','{TUN2}') -contains $r.InterfaceAlias) "
-                        f"-or ($a.InterfaceDescription -match '{_TUN_DRIVER_RE}'); "
-                        f"if ($tun) {{Write-Output ('VLESS endpoint NOT bypassed - resolves via tunnel adapter ' + $r.InterfaceAlias + ' (loops into a tunnel)'); exit 1}}; "
-                        f"'VLESS endpoint bypassed through ' + $r.InterfaceAlias"))
+        # Find-NetRoute emits TWO objects per hit: a NetIPAddress row (which
+        # carries NO DestinationPrefix and NO NextHop) and the NetRoute row.
+        # Filter on DestinationPrefix so the address row can never win the
+        # `select -First 1` and name the WRONG interface - the same trap
+        # egress_scripts.egress_lookup_ps guards against (a route check that
+        # then reports "via Wi-Fi" while the actual /32 is elsewhere).
+        _find = (f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' "
+                 f"-ErrorAction SilentlyContinue | "
+                 f"? {{ $_.DestinationPrefix }} | select -First 1; ")
+        if over:
+            _on_vpn = (f"($vc -contains $r.InterfaceAlias) "
+                       f"-or ($r.InterfaceAlias -match '{VPN_IFACE_RE}')")
+            checks.append(q(f"VLESS server route ({_s})",
+                            _vpnconn_ps + _find +
+                            f"if (-not $r) {{Write-Output 'no route found'; exit 1}}; "
+                            f"if ({_on_vpn}) {{'via Windows VPN ' + $r.InterfaceAlias}} "
+                            f"else {{Write-Output ('via ' + $r.InterfaceAlias + ' - NOT on the Windows VPN (expected: ' + ($vc -join ', ') + ') - the helper self-heal re-points it; toggle [V] or restart if this persists'); exit 1}}"))
+            checks.append(q(f"Proxy loop detection ({_s})",
+                            _vpnconn_ps + _find +
+                            f"if (-not $r) {{Write-Output 'no route found'; exit 1}}; "
+                            # The verdict must recognize OUR OWN tunnel adapters by
+                            # ALIAS (1.0.33): the old check only tested the adapter
+                            # DESCRIPTION for 'Wintun', but the vendored tun2socks
+                            # creates our adapter with a description that matches
+                            # neither - so the check kept passing ("bypassed
+                            # through wintun") while the server /32 was pinned
+                            # INTO our own TUN and the transport looped. A route
+                            # that resolves through ANY tunnel-family adapter
+                            # (ours by alias, foreign by driver description) is a
+                            # loop, always.
+                            f"$a = Get-NetAdapter -Name $r.InterfaceAlias -ErrorAction SilentlyContinue; "
+                            f"$tun = (@('{TUN}','{TUN2}') -contains $r.InterfaceAlias) "
+                            f"-or ($a.InterfaceDescription -match '{_TUN_DRIVER_RE}'); "
+                            f"if ($tun) {{Write-Output ('VLESS endpoint NOT bypassed - resolves via tunnel adapter ' + $r.InterfaceAlias + ' (loops into a tunnel)'); exit 1}}; "
+                            # Over-VPN mode: riding the VPN is the POINT. A route
+                            # that resolves through the physical NIC means the
+                            # transport left the VPN (flap, stale pin) - fail
+                            # loudly instead of showing a green "bypassed".
+                            f"if ({_on_vpn}) {{'VLESS endpoint rides Windows VPN ' + $r.InterfaceAlias}} "
+                            f"else {{Write-Output ('VLESS endpoint on ' + $r.InterfaceAlias + ' - expected Windows VPN transport (VLESS via VPN mode)'); exit 1}}"))
+        else:
+            checks.append(q(f"VLESS server route ({_s})",
+                            _find +
+                            f"if ($r) {{'via ' + $r.InterfaceAlias}} else {{Write-Output 'no route found'; exit 1}}"))
+            checks.append(q(f"Proxy loop detection ({_s})",
+                            _find +
+                            f"if (-not $r) {{Write-Output 'no route found'; exit 1}}; "
+                            # The verdict must recognize OUR OWN tunnel adapters by
+                            # ALIAS (1.0.33): the old check only tested the adapter
+                            # DESCRIPTION for 'Wintun', but the vendored tun2socks
+                            # creates our adapter with a description that matches
+                            # neither - so the check kept passing ("bypassed
+                            # through wintun") while the server /32 was pinned
+                            # INTO our own TUN and the transport looped. A route
+                            # that resolves through ANY tunnel-family adapter
+                            # (ours by alias, foreign by driver description) is a
+                            # loop, always.
+                            f"$a = Get-NetAdapter -Name $r.InterfaceAlias -ErrorAction SilentlyContinue; "
+                            f"$tun = (@('{TUN}','{TUN2}') -contains $r.InterfaceAlias) "
+                            f"-or ($a.InterfaceDescription -match '{_TUN_DRIVER_RE}'); "
+                            f"if ($tun) {{Write-Output ('VLESS endpoint NOT bypassed - resolves via tunnel adapter ' + $r.InterfaceAlias + ' (loops into a tunnel)'); exit 1}}; "
+                            f"'VLESS endpoint bypassed through ' + $r.InterfaceAlias"))
 
     return checks
 
@@ -3761,7 +3814,7 @@ class BTopTui:
                                     else f"{ip}/128")
                 rows = [(fam, dest, iface, gw)
                         for fam, dest, iface, gw in list(self._live_bypass_added)
-                        if not str(iface).lower().startswith("wintun")
+                        if not _is_tun_iface(iface)
                         and dest not in vpn_ips]
                 if not rows:
                     return
@@ -3825,40 +3878,65 @@ class BTopTui:
 
         Batched (netsh -f deletes + adds), like the exit sweeps: the list can
         hold thousands of rows after a live re-apply, so the per-route
-        PowerShell path the [A] re-point uses would take minutes. Only v4
-        rows whose interface IS the old physical adapter move - wintun /
-        wintun2 / Windows-VPN egress rows are untouched (their next-hop is
-        internal to that adapter and unaffected by a Wi-Fi change). IPv6
-        rows stay (the helper's marker carries no v6 egress; its own v6 geo
-        rows are re-pointed helper-side). Tracking is updated in place so
-        [Q] still removes exactly what is in the table."""
+        PowerShell path the [A] re-point uses would take minutes. Only rows
+        whose interface IS the old physical adapter move - wintun / wintun2 /
+        Windows-VPN egress rows are untouched (their next-hop is internal to
+        that adapter and unaffected by a Wi-Fi change). IPv6 rows on the old
+        physical adapter re-point to the CURRENT physical v6 default egress -
+        the [GATEWAY] marker carries v4 info only, so v6 egress is re-queried
+        here. Tracking is updated in place so [Q] still removes exactly what is
+        in the table."""
         rows = [(fam, dest, iface, gw)
                 for fam, dest, iface, gw in list(self._live_geo_added)
-                if fam == "v4"
-                and str(iface).lower() == str(old_iface).lower()]
+                if str(iface).lower() == str(old_iface).lower()]
         if not rows:
             return 0
+        v6d = None
+        if any(fam == "v6" for fam, _, _, _ in rows):
+            v6d = _get_ipv6_default()
+        # Only move rows we can actually re-point: v4 always, v6 only when
+        # a v6 egress is available (otherwise the route would be deleted
+        # without being re-added and tracking would drift).
+        move_rows = [r for r in rows
+                     if r[0] == "v4" or (r[0] == "v6" and v6d)]
+        if not move_rows:
+            self._blog("[!] v6 geo routes on the old physical adapter cannot be"
+                       " re-pointed (no v6 egress); leaving them in place.")
+            return 0
         del_rows = []
-        for _fam, dest, iface, gw in rows:
+        for _fam, dest, iface, gw in move_rows:
             nh = gw if gw and gw not in ("0.0.0.0", "::") else ""
             del_rows.append((dest, iface, nh))
         try:
             self._batch_delete_routes(del_rows)
         except Exception:
             pass
-        add_rows = [(dest, new_iface, new_gw, 1, False)
-                    for _f, dest, _i, _g in rows]
+        add_rows = []
+        for fam, dest, _iface, _gw in move_rows:
+            if fam == "v4":
+                add_rows.append((dest, new_iface, new_gw, 1, False))
+            elif v6d:
+                add_rows.append((dest, v6d[0], v6d[1], 1, False))
         try:
-            self._batch_add_routes(add_rows)
+            added = self._batch_add_routes(add_rows)
         except Exception as e:
             self._blog(f"[!] Could not re-add live geo routes on the new "
                        f"gateway: {e.__class__.__name__}: {e}")
             return 0
+        if not add_rows or not added:
+            self._blog(f"[!] Re-pointed 0/{len(move_rows)} live geo route(s) to the new "
+                       f"gateway ({new_iface} {new_gw}) - "
+                       f"{'no usable egress' if not add_rows else 'netsh rejected all adds'}"
+                       f"; old entries remain tracked at the dead gateway.")
+            return 0
         moved = 0
-        for row in rows:
+        for fam, dest, iface, gw in move_rows:
             try:
-                idx = self._live_geo_added.index(row)
-                self._live_geo_added[idx] = ("v4", row[1], new_iface, new_gw)
+                idx = self._live_geo_added.index((fam, dest, iface, gw))
+                if fam == "v4":
+                    self._live_geo_added[idx] = (fam, dest, new_iface, new_gw)
+                elif v6d:
+                    self._live_geo_added[idx] = (fam, dest, v6d[0], v6d[1])
                 moved += 1
             except ValueError:
                 pass
@@ -5923,9 +6001,16 @@ class BTopTui:
                            f"{GREEN}[E]{_R} ep-port"))
 
         # Right column body: everything routed DIRECT (not through the TUN).
+        # In [V] mode the VLESS server /32s do NOT ride Wi-Fi - they ride the
+        # Windows VPN - so the header says so instead of implying every entry
+        # is routed "direct" via the physical adapter.
         bl = []
-        bl.append(f"{BRIGHT}{pal['endpoint']}ROUTED DIRECT{_R}"
-                  f"{GRAY} - these never enter the tunnel{_R}")
+        if getattr(self.ns, "vless_over_vpn", False):
+            bl.append(f"{BRIGHT}{pal['endpoint']}ROUTED DIRECT{_R}"
+                      f"{GRAY} - VLESS server(s) via Windows VPN{_R}")
+        else:
+            bl.append(f"{BRIGHT}{pal['endpoint']}ROUTED DIRECT{_R}"
+                      f"{GRAY} - these never enter the tunnel{_R}")
         # Live VPN name for the bypass row: the telemetry worker refreshes
         # self._vpn_status every ~4s while any VPN-dependent feature is on;
         # fall back to a one-shot lookup when nothing else sampled it yet.
@@ -7107,9 +7192,10 @@ class BTopTui:
             # Without this the "[+] TUNNEL ACTIVE" marker can sit in a 4KB
             # buffer forever, leaving the dashboard stuck at STARTING.
             self.proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, text=True,
                 encoding="utf-8", errors="replace", env=child_env,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW)
             # The helper is alive: the machine leaves STOPPED and walks the
             # start sequence from here (VERIFYING on "[+] TUNNEL ACTIVE",
             # RUNNING on the START SEQUENCE COMPLETE marker - see _read).
@@ -7228,6 +7314,32 @@ class BTopTui:
                             TunnelState.RUNNING, "self-heal applied")
                         self.logs.put(s)
                         continue
+                    if s.startswith("[!] Self-heal: Wintun adapter is gone"):
+                        # The tunnel adapter itself disappeared - self-heal
+                        # cannot proceed and the tunnel is dead. Escalate to
+                        # FAILED so the UI goes red, and tell the recovery
+                        # engine (PROCESS ladder: restart the helper which
+                        # re-creates the Wintun adapter).
+                        self.tunnel.try_transition(
+                            TunnelState.FAILED,
+                            "self-heal: Wintun adapter is gone")
+                        self.recovery.report_failure(
+                            FailureKind.PROCESS,
+                            "Wintun adapter is gone; cannot re-apply routes")
+                        self.logs.put(s)
+                        continue
+                    if s.startswith("[!] Self-heal failed:"):
+                        # Self-heal ran but hit an exception - the tunnel is
+                        # still up but not repaired. Drop back to DEGRADED so
+                        # the dashboard does not claim RUNNING; the recovery
+                        # engine already has the incident open from the original
+                        # [MONITOR] tunnel check failed and will escalate on
+                        # its 90s backoff window if this did not fix it.
+                        self.tunnel.try_transition(
+                            TunnelState.DEGRADED,
+                            s.split(":", 1)[-1].strip() or "self-heal failed")
+                        self.logs.put(s)
+                        continue
                     # The helper's monitor prints "[MONITOR] tunnel OK: ..."
                     # every 30s forever - pure noise in the log (it says nothing
                     # new). Drop the success heartbeats; a DEGRADED tunnel that
@@ -7267,6 +7379,13 @@ class BTopTui:
                         except Exception:
                             pass
                         # fall through: the line itself is logged below
+                    # Surface DNS resolution requests to the structured event
+                    # log so the user can see which IPs/hosts were resolved and
+                    # installed as bypass routes.
+                    if (s.startswith("[*] Resolving ") or "-> IPv4:" in s
+                            or "is an IP literal" in s):
+                        self.event_log.log(
+                            _LOG_INFO, "DNS", s.strip())
                     self.logs.put(s)
                 # Helper stdout closed: the process has exited (clean stop,
                 # crash or external kill). Drive the machine down so neither
@@ -7486,8 +7605,8 @@ class BTopTui:
             return False
         if dp.lower() in cls._SNAPSHOT_DEFAULTS:
             return False
-        if alias.lower().startswith("wintun"):
-            return False   # our adapters' routes die with the adapter
+        if _is_tun_iface(alias):
+            return False   # tunnel adapters' routes die with the adapter
         return True
 
     @classmethod
@@ -7555,8 +7674,9 @@ class BTopTui:
     def _batch_add_routes(self, rows):
         """Re-create route rows [(dest, iface, nh, metric, persistent), ...]
         via batched netsh -f scripts (the same fast path the geo installer
-        uses). Errors are ignored: a route Windows refuses (adapter gone) is
-        reported once and skipped. Returns how many rows were attempted."""
+        uses). Per-route errors are ignored: a route Windows refuses (adapter
+        gone) is skipped so the rest of the batch still installs. Returns the
+        number of routes that netsh accepted (``Ok.`` or ``already exists``)."""
         if not rows:
             return 0
         lines = []
@@ -7569,21 +7689,31 @@ class BTopTui:
                          f"{nh_tok} metric={int(metric or 0)} store={store}")
         chunks = [lines[i:i + self._SWEEP_CHUNK]
                   for i in range(0, len(lines), self._SWEEP_CHUNK)]
+        ok = 0
         for chunk in chunks:
             fd, path = tempfile.mkstemp(suffix=".txt", prefix="snap_add_")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write("\n".join(chunk))
-                subprocess.run(["netsh", "-f", path],
-                               capture_output=True, timeout=180)
-            except Exception:
-                pass
+                try:
+                    result = subprocess.run(["netsh", "-f", path],
+                                            capture_output=True, timeout=180,
+                                            creationflags=subprocess.CREATE_NO_WINDOW)
+                    out = (result.stdout or b"")
+                    if isinstance(out, bytes):
+                        out = out.decode("utf-8", "replace")
+                    for ln in out.splitlines():
+                        s = ln.strip()
+                        if s == "Ok." or "already exists" in s:
+                            ok += 1
+                except Exception:
+                    pass
             finally:
                 try:
                     os.unlink(path)
                 except Exception:
                     pass
-        return len(rows)
+        return ok
 
     def _restore_route_snapshot(self):
         """Make the live table match the pre-session snapshot: delete
@@ -7782,7 +7912,8 @@ class BTopTui:
                             with os.fdopen(fd, "w", encoding="utf-8") as f:
                                 f.write("\n".join(_lines))
                             subprocess.run(["netsh", "-f", path],
-                                           capture_output=True, timeout=180)
+                                           capture_output=True, timeout=180,
+                                           creationflags=subprocess.CREATE_NO_WINDOW)
                         finally:
                             try:
                                 os.unlink(path)
@@ -8475,7 +8606,7 @@ def _pyinstaller_clean_env():
 
 
 def main():
-    # ── Frozen child-process dispatch (PyInstaller onefile) ────────────
+    # ── Frozen child-process dispatch (PyInstaller onefile) ──────────────
     # The tunnel helper and the cleanup watchdog run as SEPARATE processes,
     # but a onefile exe cannot "run a script": sys.executable is TunTop.exe,
     # not python, so spawning "<exe> helper.py ..." made the exe's own
@@ -8488,6 +8619,20 @@ def main():
             ("--watchdog-child", "tuntop.core.cleanup_watchdog")):
         if _child_flag in sys.argv:
             sys.argv.remove(_child_flag)
+            # Even though the parent launches us with CREATE_NO_WINDOW, the
+            # PyInstaller onefile bootloader (compiled with console=True) may
+            # still allocate a console for this child via AllocConsole/ShowWindow
+            # internally. Hide ANY console that the bootloader created so no
+            # empty black window flashes on screen — the child's stdout/stderr
+            # are piped back to the parent anyway, so this console is never used.
+            try:
+                _k32 = ctypes.windll.kernel32
+                _hwnd = _k32.GetConsoleWindow()
+                if _hwnd:
+                    _k32.ShowWindow(_hwnd, 0)  # SW_HIDE
+                _k32.FreeConsole()  # detach from any console the bootloader created
+            except Exception:
+                pass
             import importlib
             sys.exit(importlib.import_module(_child_mod).main() or 0)
 
@@ -8763,7 +8908,16 @@ def main():
                          # deleted on our exit, killing every later import
                          # in the watchdog (the base_library.zip Errno 2).
                          env=_pyinstaller_clean_env(),
+                         # CREATE_NO_WINDOW is the critical flag here: the
+                         # frozen exe has console=True in its spec, so even
+                         # DETACHED_PROCESS (which just detaches from the
+                         # parent console) still lets PyInstaller's bootloader
+                         # allocate a NEW console for the watchdog - that
+                         # window shows up black/empty because stdout/stderr
+                         # are DEVNULL. CREATE_NO_WINDOW explicitly forbids
+                         # any console allocation, so no second window pops.
                          creationflags=subprocess.DETACHED_PROCESS |
+                                 subprocess.CREATE_NO_WINDOW |
                                  subprocess.CREATE_NEW_PROCESS_GROUP)
     except Exception as e:
         # Watchdog is best-effort; if it fails to start, the next launch's
@@ -9044,3 +9198,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

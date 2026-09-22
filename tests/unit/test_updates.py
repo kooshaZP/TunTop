@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 import urllib.error
+import urllib.parse
 
 from tuntop.config import updates
 
@@ -75,7 +76,10 @@ class TestCheckLatest(unittest.TestCase):
         body = json.dumps(rel).encode()
 
         def fake_urlopen(req, timeout=None):
-            if "api.github.com" in req.full_url:
+            # Parse the URL and compare the HOST - never a substring check:
+            # "api.github.com" can appear at an arbitrary position in a URL
+            # (CodeQL py/incomplete-url-substring-sanitization).
+            if urllib.parse.urlparse(req.full_url).hostname == "api.github.com":
                 return _FakeResp(body)
             raise AssertionError("unexpected fetch " + req.full_url)
 

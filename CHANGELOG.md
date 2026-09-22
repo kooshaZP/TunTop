@@ -2,6 +2,61 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.34] - 2026-09-23
+
+### Fixed (VLESS server /32s pinned to Wi-Fi while [V] "VLESS via VPN" mode was active)
+
+- **ROOT CAUSE: over-VPN mode trusted a Find-NetRoute egress lookup that
+  cannot see VPN-client adapters.** In `--vless-over-vpn` mode the helper
+  resolved every VLESS endpoint's egress with
+  `get_egress_for(ip, exclude_vpn=False)`. That lookup's candidate list drops
+  ANY adapter whose description matches `TUN_DRIVER_RE` - so VPN clients
+  whose adapter matches it (SoftEther, OpenVPN, WireGuard-based clients...)
+  are invisible even when riding them is the whole point - and low-metric
+  races can let the physical NIC win as well. Either way the server /32 was
+  pinned to Wi-Fi and the transport silently stopped riding the VPN
+  ("VLESS server route (188.114.97.6) via Wi-Fi" while the VPN showed
+  Connected). Over-VPN mode is now DETERMINISTIC: the /32s are pinned to the
+  exact VPN interface/next-hop that was resolved and validated at startup
+  (`vpn_default` -> `_live_mode["over"]`), in ALL FOUR install paths:
+  - the startup install (helper `main()`),
+  - the live [V] mode switch (`_live_switch_vless`),
+  - a live [U] server change (`_live_apply_servers`),
+  - the 15 s endpoint self-heal (`_heal_endpoint_routes`).
+- **The self-heal now treats a server /32 on the WRONG interface as broken.**
+  In over-VPN mode a route that resolved onto the physical NIC (Wi-Fi) is a
+  mode violation: it is evicted and re-pointed onto the validated VPN
+  egress, exactly like a TUN-pinned route always was (both IPv4 /32 and
+  IPv6 /128). DIRECT mode semantics are unchanged.
+- **The "VLESS server route" / "Proxy loop detection" health checks are
+  mode-aware.** In [V] mode they now PASS only when the endpoint route
+  resolves through the connected Windows VPN (Get-VpnConnection names, with
+  the VPN-alias regex as fallback for clients Get-VpnConnection does not
+  expose); "via Wi-Fi" is reported as a FAILURE with an actionable message
+  instead of a green "bypassed through Wi-Fi". Both checks also filter
+  Find-NetRoute's address row (no DestinationPrefix) so `select -First 1`
+  can never name the wrong interface.
+- **The TUN CONFIG panel no longer claims everything is routed "direct" in
+  [V] mode** - the header now reads "ROUTED DIRECT - VLESS server(s) via
+  Windows VPN".
+- **VPN-flap re-point could skip cycles.** The monitor loop gated the VPN
+  transport status poll on `int(now) % 10 == 0`; a drifting 1 s sleep can
+  jump from 19.x to 21.x and silently SKIP a whole cycle (the exact window
+  a flap can happen in). Replaced with a timestamp cadence
+  (`_VPN_STATUS_EVERY`), consistent with the gateway and self-heal clocks.
+
+### Security (CodeQL remediation)
+
+- `py/insecure-protocol` (`tuntop/network/leak_probe.py`): the shared
+  TLS context now pins the protocol floor TWICE and unconditionally -
+  `minimum_version = TLSVersion.TLSv1_2` (no swallow-exception guard) plus
+  `OP_NO_SSLv3 | OP_NO_TLSv1 | OP_NO_TLSv1_1` - so every IP-echo fetch
+  refuses TLS 1.0/1.1/SSLv3 no matter which pin a given Python honours.
+- `py/incomplete-url-substring-sanitization`
+  (`tests/unit/test_updates.py`): the update-check fake now compares
+  `urlparse(req.full_url).hostname == "api.github.com"` instead of a
+  substring search, which can match the host at an arbitrary position.
+
 ## [1.0.33] - 2026-09-20
 
 ### Fixed (the server bypass was pinned onto TunTop's OWN wintun - "the server IP goes to the wintun")

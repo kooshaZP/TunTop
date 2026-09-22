@@ -134,6 +134,7 @@ def kill_own(tun2socks_path=None, recorded=(), log=None) -> int:
     pattern as the watchdog's helper-tree kill). Best-effort; returns how
     many victims were identified and targeted."""
     log = log or (lambda msg: None)
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     victims = select_own(enumerate_tun2socks(), tun2socks_path, recorded)
     for v in victims:
         pid = v["pid"]
@@ -142,7 +143,7 @@ def kill_own(tun2socks_path=None, recorded=(), log=None) -> int:
             rc = subprocess.call(
                 ["taskkill", "/F", "/T", "/PID", str(pid)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL)
+                stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW)
             if rc == 0:
                 log(f"stopped owned tun2socks PID {pid} ({where})")
                 continue

@@ -81,7 +81,7 @@ from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
 from tuntop.network import egress_scripts as _es
 from tuntop.network.routeops import RouteLedger, RouteResult, sweeps as _rsweeps  # noqa: E402
 from tuntop.tunnel.exec import (  # noqa: E402  (moved Phase 4: state-free primitives)
-    run, ps_json, run_ps, _clean_err,
+    run, ps_json, run_ps, _clean_err, _NO_WINDOW,
 )
 
 
@@ -729,14 +729,18 @@ def preflight_cleanup(tun2socks_path=None):
 def resolve_all(server):
     try:
         ip = ipaddress.ip_address(server)
-        return ([str(ip)] if ip.version == 4 else [],
-                [str(ip)] if ip.version == 6 else [])
+        if ip.version == 4:
+            print(f"[*] {server} is an IP literal (no DNS query needed)")
+            return ([str(ip)], [])
+        return ([], [str(ip)])
     except ValueError:
         pass
 
+    print(f"[*] Resolving {server} ...", flush=True)
     try:
         infos = socket.getaddrinfo(server, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except socket.gaierror as e:
+        print(f"[!] DNS resolution failed for {server}: {e}", flush=True)
         sys.exit(f"[!] Could not resolve {server}: {e}")
 
     v4, v6 = [], []
@@ -747,7 +751,10 @@ def resolve_all(server):
             v6.append(sa[0])
 
     if not v4 and not v6:
+        print(f"[!] {server} resolved to no usable addresses.", flush=True)
         sys.exit(f"[!] {server} resolved to no usable addresses.")
+    print(f"[*] {server} -> IPv4: {', '.join(v4) if v4 else '(none)'}  "
+          f"IPv6: {', '.join(v6) if v6 else '(none)'}", flush=True)
     return v4, v6
 
 
@@ -1586,7 +1593,13 @@ def _live_switch_vless(over):
         # silent no-op (the exact bug that left VLESS on Wi-Fi after [V]).
         _remove_host_routes_v4(f"{ip}/32")
         if over:
-            eg = get_egress_for(ip, exclude_vpn=False) or _live_mode["over"]
+            # Deterministic VPN pin (same rule as the startup install):
+            # _live_mode["over"] was JUST validated against the live VPN
+            # default route above. The Find-NetRoute lookup can return the
+            # physical NIC (VPN adapters matching the tunnel-driver
+            # description filter are invisible to it) and would silently
+            # leave the transport on Wi-Fi while [V] says "via VPN".
+            eg = _live_mode["over"]
         else:
             eg = get_egress_for(ip, exclude_vpn=True) or _live_mode["phys"]
         if not eg or eg[0] is None:
@@ -1706,7 +1719,14 @@ def _live_apply_servers(hosts, endpoints):
     # duplicated.
     for ip in new_v4:
         _remove_host_routes_v4(f"{ip}/32")
-        eg = get_egress_for(ip, exclude_vpn=not over) or _live_mode["phys"]
+        if over:
+            # Same deterministic VPN pin as the startup/[V] paths: in
+            # over-VPN mode a fresh [U] server's /32 must land on the VPN,
+            # never on whatever Find-NetRoute ranks first (which can be the
+            # physical NIC - see _live_switch_vless / the startup install).
+            eg = _live_mode.get("over") or get_egress_for(ip, exclude_vpn=False)
+        else:
+            eg = get_egress_for(ip, exclude_vpn=True) or _live_mode["phys"]
         if not eg or not eg[0]:
             lines.append(f"[!] [U] no usable egress for {ip} - the "
                          "self-heal retries.")
@@ -1751,19 +1771,29 @@ def _heal_endpoint_routes():
     monitor thread, so it never races the [V]/[Y] switches."""
     lines = []
     over = _live_mode["vless_over_vpn"]
+    # In over-VPN mode the ONLY correct interface for a server /32 is the
+    # validated Windows-VPN egress - a route that resolved onto the physical
+    # NIC (Wi-Fi) is a silent mode violation and gets re-pointed below, the
+    # same way a TUN-pinned route always was.
+    over_eg = _live_mode.get("over") or None
     for ip in list(_live_mode["v4"]):
         dest = f"{ip}/32"
         rows = get_existing_v4_routes(dest)
         bad = [r for r in rows
                if _es.is_tun_iface(r.get("InterfaceAlias", ""))
-               or (not over and _es.is_vpn_iface(r.get("InterfaceAlias", "")))]
+               or (not over and _es.is_vpn_iface(r.get("InterfaceAlias", "")))
+               or (over and over_eg
+                   and str(r.get("InterfaceAlias", "")).lower()
+                   != str(over_eg[0]).lower())]
         if rows and not bad:
             continue                       # healthy - leave it alone
         for r in bad:
             remove_route(("v4", dest, str(r.get("InterfaceAlias", "")),
                           str(r.get("NextHop", "") or "")))
         if over:
-            eg = get_egress_for(ip, exclude_vpn=False) or _live_mode.get("over")
+            # Deterministic VPN pin (see _live_switch_vless): the validated
+            # VPN egress, not a Find-NetRoute lookup that can return Wi-Fi.
+            eg = over_eg or get_egress_for(ip, exclude_vpn=False)
         else:
             eg = get_egress_for(ip, exclude_vpn=True) or _live_mode.get("phys")
         if not eg or not eg[0]:
@@ -1778,22 +1808,28 @@ def _heal_endpoint_routes():
                          "retrying next cycle.")
     for ip in list(_live_mode["v6"]):
         dest = f"{ip}/128"
-        rows = get_existing_v6_routes(dest)
-        bad = [r for r in rows
-               if _es.is_tun_iface(r.get("InterfaceAlias", ""))
-               or (not over and _es.is_vpn_iface(r.get("InterfaceAlias", "")))]
-        if rows and not bad:
-            continue
-        for r in bad:
-            remove_route(("v6", dest, str(r.get("InterfaceAlias", "")),
-                          str(r.get("NextHop", "") or "")))
         if over:
+            # Over-VPN mode: resolve the VPN's IPv6 egress FIRST so the
+            # identity check below can treat a /128 pinned anywhere else as
+            # bad (same rule as the v4 path).
             v6d = get_vpn_ipv6_default(
                 getattr(_live_mode.get("args"), "vpn_interface", None))
             eg = (v6d[0], v6d[1]) if v6d else None
         else:
             d6 = get_ipv6_default()
             eg = (d6["InterfaceAlias"], d6["NextHop"]) if d6 else None
+        rows = get_existing_v6_routes(dest)
+        bad = [r for r in rows
+               if _es.is_tun_iface(r.get("InterfaceAlias", ""))
+               or (not over and _es.is_vpn_iface(r.get("InterfaceAlias", "")))
+               or (over and eg
+                   and str(r.get("InterfaceAlias", "")).lower()
+                   != str(eg[0]).lower())]
+        if rows and not bad:
+            continue
+        for r in bad:
+            remove_route(("v6", dest, str(r.get("InterfaceAlias", "")),
+                          str(r.get("NextHop", "") or "")))
         if not eg:
             continue                       # no native v6 - same as startup
         if add_v6(dest, eg[0], eg[1], 1):
@@ -1900,6 +1936,10 @@ _GW_CHECK_EVERY = 5
 # churn can silently strip the server /32s - cheap identity checks, re-resolve
 # + re-add only for the broken ones.
 _HEAL_EVERY = 15
+# Windows-VPN transport status poll cadence ([V] mode only): detects the VPN
+# flapping so the VLESS /32s fall back to the physical egress while it is
+# down and re-point onto the VPN when it returns.
+_VPN_STATUS_EVERY = 10
 
 #: Serialises the geo re-point so a slow bulk move can never overlap itself.
 _geo_repoint_lock = threading.Lock()
@@ -2391,7 +2431,12 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
                       f"[!] geoip:{code} bypass skipped (every CIDR overlaps a "
                       f"protected endpoint/bypass prefix).")
             return []
-    print(f"[*] Installing geoip:{code} bypass ({len(v4)} IPv4, {len(v6)} IPv6) via {iface}...")
+    print(f"[*] Installing geoip:{code} bypass "
+          f"({len(v4)} IPv4, {len(v6)} IPv6) via {iface} "
+          f"(gw={gateway})" if gateway else
+          f"[*] Installing geoip:{code} bypass "
+          f"({len(v4)} IPv4, {len(v6)} IPv6) via {iface} "
+          f"(no gateway - on-link)", flush=True)
     # Heartbeat BEFORE the slow pre-install passes below.  The dashboard's
     # startup watchdog extends its grace window while [GEO-LOAD] markers keep
     # arriving; without this early marker the metric fix + conflict sweep
@@ -2626,12 +2671,24 @@ def _remove_routes_bulk(routes):
 
     chunks = [routes[i:i + GEO_SUB_BATCH]
               for i in range(0, len(routes), GEO_SUB_BATCH)]
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(len(chunks), GEO_MAX_WORKERS)) as ex:
-        for _fut in concurrent.futures.as_completed(
-                [ex.submit(_drop_chunk, c) for c in chunks]):
+    # Guard against atexit/interpreter-shutdown: a ThreadPoolExecutor created
+    # in an atexit callback can hit RuntimeError("cannot schedule new futures
+    # after interpreter shutdown") if the interpreter is already tearing down
+    # its internal threading state. Catch and fall back to a sequential drain.
+    try:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(chunks), GEO_MAX_WORKERS)) as ex:
+            for _fut in concurrent.futures.as_completed(
+                    [ex.submit(_drop_chunk, c) for c in chunks]):
+                try:
+                    _fut.result()
+                except Exception:
+                    pass
+    except RuntimeError:
+        # Interpreter shutting down: run remaining chunks sequentially.
+        for c in chunks:
             try:
-                _fut.result()
+                _drop_chunk(c)
             except Exception:
                 pass
 
@@ -3024,7 +3081,7 @@ def start_tun2socks_pipe(device_name, ip4, ip6, port, tun2socks_path,
     print("    " + " ".join(cmd))
 
     try:
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(cmd, creationflags=_NO_WINDOW)
     except FileNotFoundError:
         sys.exit(f"[!] tun2socks not found: {tun2socks_path}")
 
@@ -3353,7 +3410,21 @@ def main():
         # otherwise out-match the VPN default in Find-NetRoute and pin the
         # route to the old egress again.
         _remove_host_routes_v4(f"{ip}/32")
-        eg = get_egress_for(ip, exclude_vpn=not args.vless_over_vpn) or (vless_iface, vless_gateway)
+        if args.vless_over_vpn:
+            # Over-VPN mode is DETERMINISTIC: the /32 is pinned to the exact
+            # VPN interface/next-hop resolved above (vpn_default), never to
+            # whatever Find-NetRoute happens to rank first. The lookup path
+            # (get_egress_for(exclude_vpn=False)) is NOT trusted here: its
+            # candidate list drops tunnel-family adapters by DESCRIPTION, so
+            # a VPN client whose adapter matches TUN_DRIVER_RE (SoftEther,
+            # OpenVPN, WireGuard-based clients...) is excluded even in
+            # over-VPN mode - and metric races can let the physical NIC win
+            # too. Either way the /32 lands on Wi-Fi and the transport
+            # silently stops riding the VPN ("VLESS server route via Wi-Fi"
+            # while the VPN is Connected).
+            eg = (vless_iface, vless_gateway)
+        else:
+            eg = get_egress_for(ip, exclude_vpn=True) or (vless_iface, vless_gateway)
         print(f"    VLESS {ip} -> via {eg[0]} ({eg[1]})")
         if not add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
             failed_vless.append(ip)
@@ -3447,7 +3518,7 @@ def main():
     # original build; the restart must be byte-identical to what it launched).
     cmd = [args.tun2socks, "--device", TUN,
            "--proxy", f"socks5://127.0.0.1:{args.port}"]
-    tun_proc = subprocess.Popen(cmd)
+    tun_proc = subprocess.Popen(cmd, creationflags=_NO_WINDOW)
     time.sleep(1)
     if tun_proc.poll() is not None:
         sys.exit(f"[!] tun2socks exited after restart: {tun_proc.returncode}")
@@ -3517,7 +3588,7 @@ def main():
         tun2_proc = subprocess.Popen([
             args.tun2socks, "--device", TUN2,
             "--proxy", f"socks5://127.0.0.1:{args.proxy2_port}",
-        ])
+        ], creationflags=_NO_WINDOW)
         time.sleep(1)
         if tun2_proc.poll() is not None:
             sys.exit(f"[!] tun2socks (proxy2) exited after restart: "
@@ -3822,6 +3893,7 @@ def main():
     last_leak = None      # last leak verdict - report only on CHANGE
     last_gw_check = 0.0   # gateway-change poll clock (see _check_gateway_change)
     last_heal_check = 0.0  # endpoint-bypass self-heal clock (see _HEAL_EVERY)
+    last_vpn_check = 0.0  # VPN transport status clock (see _VPN_STATUS_EVERY)
     fails = 0
     mon_interval = max(5, args.monitor_interval)
     mon_retries = max(1, args.monitor_retries)
@@ -3855,7 +3927,12 @@ def main():
                         print(_heal_ln, flush=True)
                 except Exception:
                     pass
-            if args.vless_over_vpn and int(now) % 10 == 0:
+            # Timestamp-based cadence (NOT int(now) % 10 == 0): a 1 s sleep
+            # drifts, so the modulo can jump from 19.x to 21.x and silently
+            # SKIP an entire VPN-status cycle - the exact window a flap can
+            # happen in. The clock comparison can never skip a cycle.
+            if args.vless_over_vpn and (now - last_vpn_check) >= _VPN_STATUS_EVERY:
+                last_vpn_check = now
                 # The transport may have been switched TO over-VPN live ([V]
                 # toggle): then vpn_conn_name_for_check (the startup value)
                 # is None and the live channel names the connection instead.

@@ -58,6 +58,8 @@ from tuntop.startup_recovery import (  # noqa: E402
     MARKER_FILE, clear_marker, read_marker, recover, scan,
 )
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # Windows access rights / wait codes (ctypes only; absent on other OSes).
 _SYNCHRONIZE = 0x00100000
 _PROCESS_TERMINATE = 0x0001
@@ -176,7 +178,8 @@ def kill_pid(pid: int, log=None) -> bool:
         rc = subprocess.call(["taskkill", "/F", "/T", "/PID", str(int(pid))],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL,
-                             stdin=subprocess.DEVNULL)
+                             stdin=subprocess.DEVNULL,
+                             creationflags=_NO_WINDOW)
         if rc == 0:
             _log(f"watchdog: helper tree (PID {pid}) terminated", log)
             return True
@@ -248,7 +251,8 @@ def sweep_lan_routes(log=None) -> int:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
             subprocess.run(["netsh", "-f", tmp],
-                           capture_output=True, timeout=120)
+                           capture_output=True, timeout=120,
+                           creationflags=_NO_WINDOW)
         finally:
             try:
                 os.unlink(tmp)
@@ -329,7 +333,8 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         f.write("\n".join(lines))
                     subprocess.run(["netsh", "-f", tmp],
-                                   capture_output=True, timeout=180)
+                                   capture_output=True, timeout=180,
+                                   creationflags=_NO_WINDOW)
                 finally:
                     try:
                         os.unlink(tmp)
