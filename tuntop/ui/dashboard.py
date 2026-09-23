@@ -82,7 +82,7 @@ from tuntop.network.egress_scripts import (  # noqa: E402  (single source)
 from tuntop.psshell import ps_quote   # noqa: E402
 from tuntop.netdns import (           # noqa: E402
     _host_from_url, _resolve, _resolve_cached, _resolve_detail,
-    _dns_fallback_allowed,
+    _dns_fallback_allowed, set_dns_log,
     _dns_cache_clear, _dns_build_query, _dns_parse_answers,
     _dns_query_udp, _dns_query_doh,
 )
@@ -1771,6 +1771,13 @@ class BTopTui:
         # state — used by the event panel, diagnostics export, and
         # (eventually) JSON bug reports.
         self.event_log = LogRing(capacity=500)
+        # Route DNS resolution request/answer events (host, path, resolved IPs)
+        # into the same structured event log that already captures the helper's
+        # "[*] Resolving ..." stdout lines. Installed once: every _resolve_detail
+        # call thereafter - UI-thread and background bypass resolver alike - is
+        # logged automatically. _dns_log() is exception-guarded so a dead
+        # callback can never stall a resolution hot path.
+        set_dns_log(lambda msg: self.event_log.log(_LOG_INFO, "DNS", msg))
 
         # [Q] shutdown-with-progress state. While `_shutting_down` is True the
         # dashboard runs a blocking, single-threaded route-clearing sequence and
@@ -2387,6 +2394,14 @@ class BTopTui:
         self._log_scroll = max(
             0, min(self._log_scroll + delta,
                    max(0, len(self._log_entries()) - 1)))
+        # Scrolled back DOWN to the newest entry -> resume LIVE following.
+        # _scroll_log only ever PAUSES (a scroll-up freezes the snapshot);
+        # without this, reaching the bottom again left _log_snapshot set and
+        # the panel kept rendering the frozen history forever - new lines
+        # never appeared until Space/[End] was pressed, even though the view
+        # was visually back at the bottom. Bottom == live, always.
+        if delta < 0 and self._log_scroll == 0:
+            self._log_snapshot = None
 
     def _poll_input(self):
         """Non-blocking unified keyboard+mouse poll via ReadConsoleInputW.
@@ -5065,8 +5080,17 @@ class BTopTui:
                 g_iface, g_gw = t2, t2_ip4
                 v6iface, v6gw = t2, t2_ip6
                 self._blog(f"[*] geoip:{code} routed via the second proxy (wintun2).")
-        if target == "direct" and (self._geo_target() == "winvpn"
-                                   or getattr(self.ns, "geoip_via_win_vpn", False)):
+        if target != "direct":
+            # winvpn / proxy2 already resolved (g_iface, g_gw, v6iface, v6gw)
+            # in the branches above. The fallback chain below is DIRECT-only:
+            # the old unconditional `else` caught "winvpn" AND "proxy2" here
+            # and OVERWROTE the just-resolved egress with the physical NIC -
+            # the log even said "routed via connected Windows VPN
+            # (Shirazu-VPN)" and then installed every country route via
+            # "Wi-Fi (gw=...)", so geo via VPN silently did nothing.
+            pass
+        elif (self._geo_target() == "winvpn"
+              or getattr(self.ns, "geoip_via_win_vpn", False)):
             # Route the country ranges out through a CONNECTED Windows VPN.
             vpn4 = _get_vpn_ipv4_default(getattr(self.ns, "vpn_interface", None))
             vpn6 = _get_vpn_ipv6_default(getattr(self.ns, "vpn_interface", None))
@@ -5091,7 +5115,7 @@ class BTopTui:
                     v6iface, v6gw = vpn6[0], vpn6[1]
                 self._blog(
                     f"[*] geoip:{code} routed via connected Windows VPN ({g_iface}).")
-        elif target == "direct" and getattr(self.ns, "geoip_via_vpn", False):
+        elif getattr(self.ns, "geoip_via_vpn", False):
             # Mode 3 ("vpn as geo"): tunnel the country ranges through wintun
             # instead of sending them direct via the physical adapter.
             helper.ensure_wintun_ipv4()
@@ -6985,7 +7009,7 @@ class BTopTui:
                             self._mode_stomp_logged = False
                         except Exception:
                             pass
-                        self.logs.put("[i] Input restored - press [T] to "
+                        self.logs.put("[i] Input restored - press [S] to "
                                       "start the tunnel again.")
                     self._last_seen_state = st
 
@@ -7195,7 +7219,13 @@ class BTopTui:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, text=True,
                 encoding="utf-8", errors="replace", env=child_env,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW)
+                # NO CREATE_NEW_CONSOLE here: per MSDN, CREATE_NO_WINDOW is
+                # IGNORED when combined with CREATE_NEW_CONSOLE - the helper
+                # got its own fresh console window that just sat there EMPTY
+                # (its stdout is piped, so nothing was ever printed in it).
+                # CREATE_NO_WINDOW alone keeps a piped child console-free
+                # (the exact pattern every other TunTop spawn uses).
+                creationflags=subprocess.CREATE_NO_WINDOW)
             # The helper is alive: the machine leaves STOPPED and walks the
             # start sequence from here (VERIFYING on "[+] TUNNEL ACTIVE",
             # RUNNING on the START SEQUENCE COMPLETE marker - see _read).
@@ -8619,12 +8649,13 @@ def main():
             ("--watchdog-child", "tuntop.core.cleanup_watchdog")):
         if _child_flag in sys.argv:
             sys.argv.remove(_child_flag)
-            # Even though the parent launches us with CREATE_NO_WINDOW, the
-            # PyInstaller onefile bootloader (compiled with console=True) may
-            # still allocate a console for this child via AllocConsole/ShowWindow
-            # internally. Hide ANY console that the bootloader created so no
-            # empty black window flashes on screen — the child's stdout/stderr
-            # are piped back to the parent anyway, so this console is never used.
+            # Defense-in-depth only: the REAL fix is the spawn-side
+            # CREATE_NO_WINDOW (1.0.36 - the 1.0.35 DETACHED_PROCESS combo
+            # let the onefile bootloader keep a visible console; see the
+            # watchdog spawn below). Hiding here also races: by the time
+            # this python child runs, the bootloader stub may already have
+            # shown its window. The child's stdout/stderr are piped/DEVNULL
+            # anyway, so any console it finds is never used - hide it.
             try:
                 _k32 = ctypes.windll.kernel32
                 _hwnd = _k32.GetConsoleWindow()
@@ -8908,16 +8939,27 @@ def main():
                          # deleted on our exit, killing every later import
                          # in the watchdog (the base_library.zip Errno 2).
                          env=_pyinstaller_clean_env(),
-                         # CREATE_NO_WINDOW is the critical flag here: the
-                         # frozen exe has console=True in its spec, so even
-                         # DETACHED_PROCESS (which just detaches from the
-                         # parent console) still lets PyInstaller's bootloader
-                         # allocate a NEW console for the watchdog - that
-                         # window shows up black/empty because stdout/stderr
-                         # are DEVNULL. CREATE_NO_WINDOW explicitly forbids
-                         # any console allocation, so no second window pops.
-                         creationflags=subprocess.DETACHED_PROCESS |
-                                 subprocess.CREATE_NO_WINDOW |
+                         # The watchdog MUST get NO console at all. Evidence
+                         # (monitor_windows2.py, exe 1.0.35 elevated run):
+                         # the --watchdog-child process owned the second
+                         # visible console window. With a console app as the
+                         # parent, DETACHED_PROCESS detaches the CHILD from
+                         # the parent console but does NOT stop the child
+                         # from allocating its own - and PyInstaller 6's
+                         # onefile bootloader is TWO processes (parent stub
+                         # -> python child): the stub keeps the console the
+                         # parent granted it, and the window stayed open
+                         # (0x3380e88 dashboard + 0x3d80860 watchdog-both
+                         # 'ConsoleWindowClass', title 'TunTop.exe'). The
+                         # in-child ShowWindow(SW_HIDE) in main() also comes
+                         # too late to matter: GetConsoleWindow() inside the
+                         # onefile python child returns the bootloader
+                         # parent's console, and hiding it raced the window
+                         # into view. CREATE_NO_WINDOW alone (same pattern
+                         # as the helper child) is the only flag pair that
+                         # empirically produced zero windows for a detached
+                         # frozen child; DEVNULL stdio never needs a console.
+                         creationflags=subprocess.CREATE_NO_WINDOW |
                                  subprocess.CREATE_NEW_PROCESS_GROUP)
     except Exception as e:
         # Watchdog is best-effort; if it fails to start, the next launch's

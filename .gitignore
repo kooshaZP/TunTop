@@ -6,6 +6,7 @@ build/
 *.exe
 *.dll
 *.zip
+geoip.dat
 
 # --- generated at runtime -------------------------------------------------
 profiles.json

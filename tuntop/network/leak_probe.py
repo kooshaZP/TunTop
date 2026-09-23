@@ -55,6 +55,7 @@ import concurrent.futures
 import ipaddress
 import socket
 import ssl
+import threading
 import time
 
 __all__ = ["run_leak_probe", "run_dns_leak_probe", "LEAK_TIMEOUT"]
@@ -96,6 +97,28 @@ def _same_network(a, b):
 _DNS_PREFIX = {4: 24, 6: 64}
 
 
+def _run_bounded(func, timeout):
+    """Run *func* in a daemon thread, return its result within *timeout*
+    seconds, or None if it does not finish. Never raises.
+
+    Used for the sequential fallback path (when the ThreadPoolExecutor is
+    unavailable) so that socket.getaddrinfo - which has no timeout knob on
+    Windows and can hang for the OS resolver timeout (minutes) - cannot
+    stall the probe indefinitely."""
+    box = [None]
+
+    def _runner():
+        try:
+            box[0] = func()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join(timeout)
+    return box[0]
+
+
 def _dns_same_network(a, b):
     """True when two addresses share the DNS-probe network prefix (/24 for
     IPv4, /64 for IPv6); different families are never the same network."""
@@ -134,7 +157,17 @@ _UA = "tuntop-leak/1.0"
 #:   * minimum_version = TLSv1_2 (Python 3.7+), and
 #:   * the OP_NO_* protocol-kill flags (belt-and-braces, and what the CodeQL
 #:     py/insecure-protocol query recognizes directly on any Python).
-_SSL_CONTEXT = ssl.create_default_context()
+#: Using ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT) instead of
+#: ssl.create_default_context() is required: create_default_context() builds
+#: a context that allows TLSv1/1.1 by default (CodeQL flags the constructor
+#: itself), then narrows it afterwards - the static analyser cannot prove the
+#: initial insecure state is ever remediated. PROTOCOL_TLS_CLIENT is a
+#: purpose-built client context (=CERT_REQUIRED + check_hostname=True by
+#: default) so CodeQL sees the floor is pinned from construction, not after.
+_SSL_CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+_SSL_CONTEXT.load_default_certs()
+_SSL_CONTEXT.check_hostname = True
+_SSL_CONTEXT.verify_mode = ssl.CERT_REQUIRED
 if hasattr(ssl, "TLSVersion"):
     _SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
 for _opt_name in ("OP_NO_SSLv3", "OP_NO_TLSv1", "OP_NO_TLSv1_1"):
@@ -314,11 +347,16 @@ def _race_leg(fetcher, timeout):
     executor down WITHOUT joining.  Abandoned stragglers are harmless:
     _run only ever fills out["ip"] from None and shares no other state."""
     t0 = time.time()
-    out = {"ip": None, "err": None, "ms": 0}
+    out = {"ip": None, "ips": [], "err": None, "ms": 0}
 
     def _run(scheme, host, path):
-        if out["ip"]:
-            return
+        # NOTE: deliberately NO early-exit once another endpoint answered -
+        # every echo endpoint's answer is COLLECTED in out["ips"] (see
+        # _verdict's multi-answer guard). With a geo bypass active, an echo
+        # host whose own IP lands inside the bypassed country's CIDR exits
+        # via THAT bypass route - a different egress than the tunnel - and
+        # keeping only the first answer made whichever host answered first
+        # decide the whole verdict (endless false LEAK on a healthy tunnel).
         try:
             body = fetcher(scheme, host, path, timeout)
         except Exception as e:
@@ -326,8 +364,12 @@ def _race_leg(fetcher, timeout):
                 out["err"] = f"{host}: {e}"
             return
         ip = _valid_ip(body)
-        if ip and out["ip"] is None:
+        if not ip:
+            return
+        if out["ip"] is None:
             out["ip"] = ip
+        if ip not in out["ips"]:
+            out["ips"].append(ip)
 
     ex = concurrent.futures.ThreadPoolExecutor(
         max_workers=len(_ECHO_ENDPOINTS))
@@ -351,7 +393,7 @@ def _sequential_leg(fetcher, timeout):
     decompresses a PYZ entry with zlib; a damaged/tampered archive raises
     zlib.error ("Error -3 ... incorrect header check") exactly there, which
     used to escape every per-endpoint handler and crash the [L] test."""
-    out = {"ip": None, "err": None, "ms": 0}
+    out = {"ip": None, "ips": [], "err": None, "ms": 0}
     t0 = time.time()
     for scheme, host, path in _ECHO_ENDPOINTS:
         try:
@@ -361,9 +403,15 @@ def _sequential_leg(fetcher, timeout):
                 out["err"] = f"{host}: {e}"
             continue
         ip = _valid_ip(body)
-        if ip:
+        if not ip:
+            continue
+        # Collect every answer (no break): _verdict needs the FULL set of
+        # direct-leg exits to tell a geo/bypass-routed echo host apart from
+        # a genuine leak - see _verdict's multi-answer guard.
+        if out["ip"] is None:
             out["ip"] = ip
-            break
+        if ip not in out["ips"]:
+            out["ips"].append(ip)
     out["ms"] = int((time.time() - t0) * 1000)
     return out
 
@@ -403,6 +451,26 @@ def _verdict(direct, tunnel, socks_port):
             f"belong to the SAME network (/{_PREFIX_LEN}): both legs exited "
             "through the tunnel; the exit server rotated its outbound address "
             "between the two connections. Your real IP was NOT exposed.")
+    # MULTI-ANSWER GUARD (geo bypass): with a country bypass active, an echo
+    # HOST whose own IP falls inside the bypassed country's CIDRs exits via
+    # the GEO route - a DIFFERENT egress than the tunnel exit, which used to
+    # read as a hard LEAK whenever that host won the race (the "LEAK: direct
+    # egress ... != tunnel exit ... - it happens a lot" report). Collect every
+    # direct answer and only call it a leak when NO answer rode the tunnel
+    # (or the tunnel's own network) - otherwise the tunnel is proven healthy
+    # and the divergent answer(s) are simply host(s) routed by a deliberate
+    # bypass. Data still escaped through the tunnel; this is not a leak.
+    # (Placed AFTER the single-answer rotation branch above so a lone answer
+    # keeps its specific message; this guard needs a SECOND, divergent one.)
+    _dips = [dip] + [i for i in (direct.get("ips") or []) if i and i != dip]
+    if len(_dips) > 1 and any(i == tip or _same_network(i, tip)
+                              for i in _dips):
+        return "same-exit", (
+            f"no leak - the tunnel exit {tip} answered directly too "
+            f"(direct answers: {', '.join(_dips)}). Direct traffic rides the "
+            "TUN; the divergent answer is an echo HOST whose own address "
+            "falls inside a country/bypass route and exits via that "
+            "deliberate bypass - it does not mean your other traffic leaks.")
     # Mixed families (direct answered v6, tunnel exited v4 - or reverse):
     # a cross-family /32 compare is ALWAYS False, which used to produce a
     # bogus "LEAK" whenever the machine had native/VPN-provided IPv6. The
@@ -640,15 +708,22 @@ def _forced_path_echo_ip(timeout):
     attempts += [(srv, _DNS_IDENTITY_HOSTS[0], _DNS_TYPE_A)
                  for srv in _DNS_PATH_SERVERS]
     t0 = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(attempts)) as ex:
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(attempts))
+    try:
         futs = {ex.submit(_dns_udp_query, srv, qn, qt,
-                          max(1.0, timeout - (time.time() - t0))): (srv, qn)
+                           max(1.0, timeout - (time.time() - t0))): (srv, qn)
                 for srv, qn, qt in attempts}
         done, _not = concurrent.futures.wait(futs, timeout=timeout + 2)
         for f in done:
             ip = _valid_ip(f.result() or "")
             if ip:
                 return ip
+    finally:
+        # Never join stragglers: each _dns_udp_query is individually socket-
+        # timed, but the with-block's __exit__ would wait for ALL workers
+        # including ones past the budget. Same timeout-bounding rule as
+        # _race_leg above.
+        ex.shutdown(wait=False, cancel_futures=True)
     return None
 
 
@@ -676,9 +751,12 @@ def run_dns_leak_probe(direct_ip=None, tunnel_ip=None, expected_dns=(),
             echo = f_echo.result(timeout + 5)
     except Exception:
         # Frozen-exe lazy-import/thread-pool failure: retry sequentially
-        # (same resilience rule as _race_leg_or_sequential above).
-        resolver = _system_resolver_ip()
-        echo = _forced_path_echo_ip(timeout)
+        # (same resilience rule as _race_leg_or_sequential above). _run_bounded
+        # wraps each in a daemon thread with a ceiling because getaddrinfo has
+        # no timeout knob on Windows and can otherwise stall for minutes.
+        resolver = _run_bounded(_system_resolver_ip, timeout + 5)
+        echo = _run_bounded(
+            lambda: _forced_path_echo_ip(timeout), timeout + 5)
 
     detail = {"resolver": resolver, "echo": echo}
     parts = []

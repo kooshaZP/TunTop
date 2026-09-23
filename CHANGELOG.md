@@ -2,6 +2,130 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.36] - 2026-09-23
+
+### Fixed (the second black console window is REALLY gone - the cleanup watchdog owned it)
+- **ROOT CAUSE (proven with an elevated window monitor, `monitor_windows2.py`):
+  the second 'TunTop' console window belonged to the `--watchdog-child`
+  process.** Timeline from the instrumented run: 0.3s dashboard console
+  (pid 7568, the only one that should exist) -> 6.1s a SECOND
+  `ConsoleWindowClass` window titled `...\dist\TunTop.exe` owned by
+  pid 31100, whose command line is
+  `TunTop.exe --watchdog-child --pid 55932 ...` - the detached cleanup
+  watchdog, spawned at startup with
+  `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`.
+  The assumption was that those flags forbid any console. They don't:
+  DETACHED_PROCESS detaches the child from the PARENT's console but does not
+  prevent the child from ALLOCATING one - and PyInstaller 6's onefile
+  bootloader is TWO processes (a parent stub + the python child), so the
+  flag reached python while the stub kept/created a visible console. The
+  dashboard's integrity lines were the last output BEFORE the window
+  appeared, and the watchdog spawn sits right after them - which is why the
+  window always materialized "after the integrity check" and showed nothing
+  (its stdout/stderr are DEVNULL). The in-child
+  `GetConsoleWindow()/ShowWindow(SW_HIDE)` mitigation raced and lost.
+- **Fix:** the watchdog is now spawned with `CREATE_NO_WINDOW |
+  CREATE_NEW_PROCESS_GROUP` - the same flag pair as the (already clean)
+  helper child, and the empirically windowless combination for a frozen
+  child. Detachment is not needed: the watchdog is a console-app child of a
+  console app, so it inherits no visible window with CREATE_NO_WINDOW, and
+  nothing in it reads or writes a console (DEVNULL stdio, log-file
+  diagnostics). The child-dispatch SW_HIDE stays as defense-in-depth.
+  Verified by re-running the window monitor against the rebuilt exe: the
+  only new `ConsoleWindowClass` window for the whole 40s session (including
+  [S]/[T] presses) is the dashboard's own.
+
+### Fixed (procguard normalization was platform-fake; CI was blind to non-Windows)
+
+- **`procguard._norm()` was platform-fake.** It used
+  `os.path.normcase(os.path.abspath(path))` - on non-Windows `normcase` is a
+  no-op, so case and `\` separators were left intact. A Windows path like
+  `C:\Tools\...\TUN2SOCKS-WINDOWS-AMD64-V3.EXE` therefore never matched the
+  lower-cased configured path, and the vendored-name compare missed our own
+  binary - so `test_exact_configured_path_is_owned` and
+  `test_vendored_name_is_owned_regardless_of_dir` FAILED on Linux/macOS while
+  passing on Windows. `_norm` now lowercases and treats BOTH `/` and `\` as
+  separators on every OS and anchors relative paths to `os.getcwd()`, so the
+  same input yields the same normalized string (and verdict) on Linux, macOS
+  and Windows. The vendored-name compare routes `TUN2SOCKS_BINARY` through the
+  same `_norm`. Windows runtime verdicts are unchanged (both sides of every
+  comparison in `select_own` now flow through `_norm`).
+- **CI blind-spot closed.** CI ran only on `windows-latest`, which is exactly
+  why the platform-dependent `_norm` bug above was invisible. A new
+  `tests-unix` job on `ubuntu-latest` runs `tests.unit.test_procguard` plus the
+  egress-script drift suite (`tests.routing.test_egress_scripts_drift`,
+  `tests.unit.test_egress_lookup_shared`) - the parts that are pure-Python /
+  platform-independent - and compiles the touched modules. The behavioural PS
+  branch (IfType/Tunnel media) only runs on real Windows and is covered there.
+- **Behavioural secondary TUN classifier (supplements `TUN_DRIVER_RE`).** An
+  adapter is now TUN if its description/alias matches `TUN_DRIVER_RE` OR its
+  Windows interface characteristics report a software tunnel
+  (`InterfaceType -eq 131` / `PhysicalMediaType -eq 'Tunnel'`). `TUN_DRIVER_RE`
+  is RETAINED (it is the only reliable Wintun catch, whose IfType is not
+  reliably 131) and the behavioural branch is OR'd on top - so an unknown
+  foreign TUN (e.g. a new sing-box/clash kernel) whose description matches no
+  keyword is still excluded from egress. Physical NICs (802.3/802.11, IfType
+  6/71) and Windows VPN miniports (Shirazu-VPN, reza_U) report neither 131 nor
+  'Tunnel' media and are never reclassified; the over-VPN deterministic pin
+  (`get_egress_for(...) or (vless_iface, vless_gateway)`) makes the gate
+  fail-safe there too. New coverage in
+  `tests/routing/test_egress_scripts_drift.py`
+  (`TestBehavioralTunClassifier` + `test_tun_preamble_includes_behavioral_filter`).
+
+## [1.0.35] - 2026-09-22
+
+### Fixed (field reports from the 1.0.34 test build)
+
+- **"press [T] to start" typo** - the input-restored hint named [T], which is
+  STOP; [S] starts the tunnel. The hint now reads "press [S] to start the
+  tunnel again."
+- **Empty phantom console window on start.** The helper was spawned with
+  `CREATE_NEW_CONSOLE | CREATE_NO_WINDOW` - per MSDN, CREATE_NO_WINDOW is
+  IGNORED when combined with CREATE_NEW_CONSOLE, so the helper got its own
+  fresh console that just sat there empty (its stdout is piped, nothing is
+  ever printed in it). The spawn now passes `CREATE_NO_WINDOW` alone - the
+  same pattern every other TunTop child spawn already uses.
+- **Endless false "LEAK DETECTED" with a geo bypass active** (the
+  "LEAK: direct egress 107.150.19.3 != tunnel exit 107.175.209.186 ...
+  it happens a lot" report). Root cause: the leak probe's echo race kept
+  only the FIRST echo answer. With geoip:ir routed through the Windows VPN,
+  an echo HOST whose own address falls inside an Iranian CIDR exits via the
+  GEO route - a different egress than the tunnel exit - so whichever host
+  answered first decided the whole verdict. The probe now collects EVERY
+  direct answer; the verdict is a leak only when NO answer rode the tunnel
+  (or its network). A tunnel exit that answered directly too is reported as
+  same-exit/OK with the divergent answer(s) named as bypass-routed hosts.
+  A genuine single-answer leak verdict is unchanged.
+- **The EVENT LOG never resumed following after a scroll-up.** Scrolling up
+  froze the log into a snapshot, but scrolling back down to the bottom did
+  NOT resume it - the panel kept rendering the frozen history forever and
+  new lines never appeared until [Space]/[End] was pressed. Bottom is now
+  live again: reaching the newest entry releases the snapshot automatically.
+- **geo bypass via the Windows VPN installed onto Wi-Fi instead** (the
+  "[*] geoip:ir routed via connected Windows VPN (Shirazu-VPN)" followed by
+  "Installing geoip:ir bypass ... via Wi-Fi" report). Root cause: in the
+  live [R] re-apply worker, the winvpn/proxy2 branches resolved the egress,
+  but a SECOND if/elif/else chain meant only for `target == "direct"` had an
+  unconditional `else` that caught "winvpn" too and OVERWROTE the egress
+  with the physical NIC. The fallback chain is now direct-only; winvpn and
+  proxy2 keep the egress their branches resolved.
+
+### Added
+
+- Regression tests for all five fixes (`tests/unit/test_ux_fixes.py`) and
+  the leak probe's multi-answer semantics.
+- **DNS request/answer logging.** `tuntop/network/dns.py` now reports every
+  resolution through the dashboard's structured event log: which hostname was
+  queried, which path answered (system, `udp:<server>`, `doh:<endpoint>`,
+  cache, or literal), and the IPs returned - so a silent fallback to UDP/53 or
+  DoH is visible instead of only the final result. A `set_dns_log()` callback
+  (exception-guarded, never raises) keeps `dns.py` a pure-stdlib leaf; the
+  dashboard wires it to `event_log.log(_LOG_INFO, "DNS", msg)` once at startup,
+  so all `_resolve_detail` callers are covered with no per-caller changes. The
+  standalone helper's `resolve_all()` stdout logging is unchanged. Tests in
+  `tests/unit/test_dns_logging.py`.
+
+
 ## [1.0.34] - 2026-09-23
 
 ### Fixed (VLESS server /32s pinned to Wi-Fi while [V] "VLESS via VPN" mode was active)

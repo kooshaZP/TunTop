@@ -5,9 +5,45 @@ import base64
 import socket
 import threading
 import time
+from typing import Callable
 
 
-# ─── Name resolution ────────────────────────────────────────────────────────
+# ─── DNS request/answer logging ─────────────────────────────────────────────
+# dns.py is a pure-stdlib leaf (no tuntop imports), so it cannot push into the
+# dashboard's structured LogRing directly. Instead, the dashboard installs a
+# callback once at startup via set_dns_log(); _dns_log() is the zero-surprise
+# wrapper that routes every resolution event through it. The wrapper MUST never
+# raise or block _resolve_detail - that path is performance-sensitive (UI frame
+# rebuilds and the background bypass resolver).
+_DNS_LOG: Callable[[str], None] | None = None
+
+__all__ = ["set_dns_log"]
+
+
+def set_dns_log(callback=None):
+    """Install `callback(msg: str)` to receive DNS resolution events.
+
+    Pass None (or call with no args) to clear it - DNS logging then becomes a
+    no-op, which is the state the standalone helper runs in (it has its own
+    stdout logging via resolve_all()). The dashboard sets this once at
+    startup to a lambda wrapping self.event_log.log(...)."""
+    global _DNS_LOG
+    _DNS_LOG = callback
+
+
+def _dns_log(msg):
+    """Best-effort: forward a resolution event to the installed callback.
+    Never raises - _resolve_detail is on hot paths and must not be perturbed."""
+    cb = _DNS_LOG
+    if cb is None:
+        return
+    try:
+        cb(msg)
+    except Exception:
+        pass
+
+
+# ─── Name resolution ────────────────────────────────────────────────────────────
 # Everything that turns a user-supplied "endpoint" (VLESS server, bypass entry)
 # into routable IPs goes through here. Two things this has to survive:
 #
@@ -192,6 +228,11 @@ def _dns_cache_clear():
         _DNS_CACHE.clear()
 
 
+def _ips_str(v4, v6):
+    """Render v4/v6 lists for a DNS log line: '9.9.9.9 (none)'."""
+    return f"{', '.join(v4) if v4 else '(none)'} {', '.join(v6) if v6 else '(none)'}"
+
+
 def _resolve_detail(server, use_cache=True, fallback=False):
     """Resolve `server` (host, IP, or URL) to (v4_list, v6_list, err, source).
 
@@ -209,6 +250,7 @@ def _resolve_detail(server, use_cache=True, fallback=False):
         return [], [], "empty entry", "none"
     try:
         ip = ipaddress.ip_address(host)
+        _dns_log(f"DNS: {host} is literal -> {ip}")
         return ([str(ip)] if ip.version == 4 else [],
                 [str(ip)] if ip.version == 6 else [], None, "literal")
     except ValueError:
@@ -219,6 +261,7 @@ def _resolve_detail(server, use_cache=True, fallback=False):
         with _DNS_CACHE_LOCK:
             hit = _DNS_CACHE.get(host)
         if hit and hit[2] > now:
+            _dns_log(f"DNS: {host} via cache -> {_ips_str(hit[0], hit[1])}")
             return list(hit[0]), list(hit[1]), hit[3], "cache"
 
     v4, v6, err, src = [], [], None, "system"
@@ -234,12 +277,18 @@ def _resolve_detail(server, use_cache=True, fallback=False):
     except Exception as e:
         err = getattr(e, "strerror", None) or str(e) or e.__class__.__name__
 
+    if v4 or v6:
+        _dns_log(f"DNS: {host} via system -> {_ips_str(v4, v6)}")
+    else:
+        _dns_log(f"DNS: {host} via system FAILED: {err}")
+
     if not v4 and not v6 and fallback:
         for srv in _DNS_FALLBACK_SERVERS:
             a = _dns_query_udp(host, srv, 1)
             aaaa = _dns_query_udp(host, srv, 28)
             if a or aaaa:
                 v4, v6, err, src = a, aaaa, None, f"udp:{srv}"
+                _dns_log(f"DNS: {host} via udp:{srv} -> {_ips_str(v4, v6)}")
                 break
     if not v4 and not v6 and fallback:
         for ep in _DNS_DOH_ENDPOINTS:
@@ -247,6 +296,8 @@ def _resolve_detail(server, use_cache=True, fallback=False):
             aaaa = _dns_query_doh(host, 28, ep)
             if a or aaaa:
                 v4, v6, err, src = a, aaaa, None, f"doh:{ep.split('//')[-1]}"
+                _dns_log(f"DNS: {host} via doh:{ep.split('//')[-1]}"
+                         f" -> {_ips_str(v4, v6)}")
                 break
 
     ttl = _DNS_TTL_OK if (v4 or v6) else _DNS_TTL_FAIL
@@ -256,6 +307,9 @@ def _resolve_detail(server, use_cache=True, fallback=False):
             for k in [k for k, v in list(_DNS_CACHE.items()) if v[2] <= now]:
                 _DNS_CACHE.pop(k, None)
     if not v4 and not v6:
+        if fallback:
+            _dns_log(f"DNS: {host} could not resolve "
+                     "(system + UDP/53 + DoH)")
         return [], [], err or "could not resolve", "none"
     return v4, v6, None, src
 

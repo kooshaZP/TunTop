@@ -1,0 +1,163 @@
+Speed up the remediation of this alert with Copilot Autofix for CodeQL
+
+Code snippet
+tests/unit/test_updates.py:78  Test
+        body = json.dumps(rel).encode()
+
+        def fake_urlopen(req, timeout=None):
+            if "api.github.com" in req.full_url:
+ Warning
+Incomplete URL substring sanitization
+The string api.github.com
+ may be at an arbitrary position in the sanitized URL.
+CodeQL
+                return _FakeResp(body)
+            raise AssertionError("unexpected fetch " + req.full_url)
+
+Rule
+Tool
+CodeQL
+Rule ID
+py/incomplete-url-substring-sanitization
+Query
+View source
+Description
+Sanitizing untrusted URLs is a common technique for preventing attacks such as request forgeries and malicious redirections. Usually, this is done by checking that the host of a URL is in a set of allowed hosts.
+
+However, treating the URL as a string and checking if one of the allowed hosts is a substring of the URL is very prone to errors. Malicious URLs can bypass such security checks by embedding one of the allowed hosts in an unexpected location.
+
+Even if the substring check is not used in a security-critical context, the incomplete check may still cause undesirable behaviors when the check succeeds accidentally.
+
+Recommendation
+Parse a URL before performing a check on its host value, and ensure that the check handles arbitrary subdomain sequences correctly.
+
+Example
+The following example code checks that a URL redirection will reach the example.com domain.
+
+from flask import Flask, request, redirect
+from urllib.parse import urlparse
+
+app = Flask(__name__)
+
+# Not safe, as "evil-example.net/example.com" would be accepted
+
+@app.route('/some/path/bad1')
+def unsafe1(request):
+    target = request.args.get('target', '')
+    if "example.com" in target:
+        return redirect(target)
+
+# Not safe, as "benign-looking-prefix-example.com" would be accepted
+
+@app.route('/some/path/bad2')
+def unsafe2(request):
+    target = request.args.get('target', '')
+    if target.endswith("example.com"):
+        return redirect(target)
+
+
+
+#Simplest and safest approach is to use an allowlist
+
+@app.route('/some/path/good1')
+def safe1(request):
+    allowlist = [
+        "example.com/home",
+        "example.com/login",
+    ]
+    target = request.args.get('target', '')
+    if target in allowlist:
+        return redirect(target)
+
+#More complex example allowing sub-domains.
+
+@app.route('/some/path/good2')
+def safe2(request):
+    target = request.args.get('target', '')
+    host = urlparse(target).hostname
+    #Note the '.' preceding example.com
+    if host and host.endswith(".example.com"):
+        return redirect(target)
+The first two examples show unsafe checks that are easily bypassed. In unsafe1 the attacker can simply add example.com anywhere in the url. For example, http://evil-example.net/example.com.
+
+In unsafe2 the attacker must use a hostname ending in example.com, but that is easy to do. For example, http://benign-looking-prefix-example.com.
+
+The second two examples show safe checks. In safe1, an allowlist is used. Although fairly inflexible, this is easy to get right and is most likely to be safe.
+
+In safe2, urlparse is used to parse the URL, then the hostname is checked to make sure it ends with .example.com.
+
+References
+OWASP: SSRF
+OWASP: XSS Unvalidated Redirects and Forwards Cheat Sheet.
+Common Weakness Enumeration: CWE-20.
+
+tuntop/network/leak_probe.py:143 
+
+def _tls_wrap(sock, host):
+    """Server-authenticated TLS over an already-connected socket."""
+    return _SSL_CONTEXT.wrap_socket(sock, server_hostname=host)
+ Warning
+Use of insecure SSL/TLS version
+Insecure SSL/TLS protocol version TLSv1 allowed by call to ssl.create_default_context
+.
+Insecure SSL/TLS protocol version TLSv1_1 allowed by call to ssl.create_default_context
+.
+CodeQL
+
+
+def _valid_ip(text):
+Rule
+Tool
+CodeQL
+Rule ID
+py/insecure-protocol
+Query
+View source
+Description
+Using a broken or weak cryptographic protocol may make a connection vulnerable to interference from an attacker.
+
+Recommendation
+Ensure that a modern, strong protocol is used. All versions of SSL, and TLS versions 1.0 and 1.1 are known to be vulnerable to attacks. Using TLS 1.2 or above is strongly recommended.
+
+Example
+The following code shows a variety of ways of setting up a connection using SSL or TLS. They are all insecure because of the version specified.
+
+import ssl
+import socket
+
+# Using the deprecated ssl.wrap_socket method
+ssl.wrap_socket(socket.socket(), ssl_version=ssl.PROTOCOL_SSLv2)
+
+# Using SSLContext
+context = ssl.SSLContext(ssl_version=ssl.PROTOCOL_SSLv3)
+
+# Using pyOpenSSL
+
+from pyOpenSSL import SSL
+
+context = SSL.Context(SSL.TLSv1_METHOD)
+
+All cases should be updated to use a secure protocol, such as PROTOCOL_TLSv1_2.
+
+Note that ssl.wrap_socket has been deprecated in Python 3.7. The recommended alternatives are:
+
+ssl.SSLContext - supported in Python 2.7.9, 3.2, and later versions
+ssl.create_default_context - a convenience function, supported in Python 3.4 and later versions.
+Even when you use these alternatives, you should ensure that a safe protocol is used. The following code illustrates how to use flags (available since Python 3.2) or the `minimum_version` field (favored since Python 3.7) to restrict the protocols accepted when creating a connection.
+import ssl
+
+# Using flags to restrict the protocol
+context = ssl.SSLContext()
+context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+
+# Declaring a minimum version to restrict the protocol
+context = ssl.create_default_context()
+context.minimum_version = ssl.TLSVersion.TLSv1_2
+References
+Wikipedia: Transport Layer Security.
+Python 3 documentation: class ssl.SSLContext.
+Python 3 documentation: ssl.wrap_socket.
+Python 3 documentation: notes on context creation.
+Python 3 documentation: notes on security considerations.
+pyOpenSSL documentation: An interface to the SSL-specific parts of OpenSSL.
+Common Weakness Enumeration: CWE-327.

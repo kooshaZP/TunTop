@@ -3422,6 +3422,13 @@ def main():
             # too. Either way the /32 lands on Wi-Fi and the transport
             # silently stops riding the VPN ("VLESS server route via Wi-Fi"
             # while the VPN is Connected).
+            #
+            # This fallback to the validated (vless_iface, vless_gateway) is
+            # what makes the behavioural TUN classifier (egress_scripts'
+            # $tunAliases now also matches IfType 131 / Tunnel media) fail-safe
+            # here: if that gate ever over-excludes a real egress, the None
+            # from get_egress_for is absorbed and the /32 still pins to the
+            # resolved VPN egress - never to a name-only guess.
             eg = (vless_iface, vless_gateway)
         else:
             eg = get_egress_for(ip, exclude_vpn=True) or (vless_iface, vless_gateway)

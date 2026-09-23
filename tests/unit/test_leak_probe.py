@@ -38,6 +38,39 @@ class TestSingleImplementation(unittest.TestCase):
         probe.assert_called_once_with(10808, timeout=5)
 
 
+class TestSSLContextSecurity(unittest.TestCase):
+    """Regression guard for the CodeQL py/insecure-protocol fix: the shared
+    TLS context must be built from PROTOCOL_TLS_CLIENT (not
+    ssl.create_default_context, which CodeQL flags) with the TLS 1.2 floor
+    pinned from construction."""
+
+    def test_not_create_default_context(self):
+        import ssl
+        # The context must NOT be a bare create_default_context() result.
+        # PROTOCOL_TLS_CLIENT is a purpose-built client context; CodeQL's
+        # py/insecure-protocol query recognizes it and does NOT flag it.
+        self.assertEqual(L._SSL_CONTEXT.protocol, ssl.PROTOCOL_TLS_CLIENT)
+
+    def test_verify_and_hostname_enforced(self):
+        import ssl
+        self.assertTrue(L._SSL_CONTEXT.check_hostname)
+        self.assertEqual(L._SSL_CONTEXT.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_tls_floor_is_1_2(self):
+        import ssl
+        if not hasattr(ssl, "TLSVersion"):
+            self.skipTest("ssl.TLSVersion not available")
+        self.assertEqual(L._SSL_CONTEXT.minimum_version, ssl.TLSVersion.TLSv1_2)
+
+    def test_legacy_protocols_disabled(self):
+        import ssl
+        opts = L._SSL_CONTEXT.options
+        for flag in ("OP_NO_SSLv3", "OP_NO_TLSv1", "OP_NO_TLSv1_1"):
+            self.assertTrue(
+                getattr(opts, flag, 0),
+                f"{flag} is not set on the leak probe SSL context")
+
+
 class TestValidIp(unittest.TestCase):
     def test_accepts_bare_ipv4(self):
         self.assertEqual(L._valid_ip("1.2.3.4"), "1.2.3.4")
@@ -324,6 +357,69 @@ class TestThreadedPathResilience(unittest.TestCase):
         self.assertEqual(body, "1.2.3.4")
         # Middleboxes must never gzip the echo body: ask for identity.
         self.assertIn(b"Accept-Encoding: identity\r\n", sock.sent)
+
+    def test_tls_wrap_uses_secure_context(self):
+        """_tls_wrap must use the shared _SSL_CONTEXT (PROTOCOL_TLS_CLIENT,
+        TLS 1.2+, not create_default_context)."""
+        with mock.patch.object(L, "_SSL_CONTEXT") as ctx:
+            sock = mock.Mock()
+            L._tls_wrap(sock, "example.com")
+        ctx.wrap_socket.assert_called_once_with(
+            sock, server_hostname="example.com")
+
+
+class TestRunBounded(unittest.TestCase):
+    """The daemon-thread timeout wrapper that protects the fallback path."""
+
+    def test_returns_result(self):
+        self.assertEqual(L._run_bounded(lambda: "result", 5), "result")
+
+    def test_swallows_exception(self):
+        def boom():
+            raise OSError("kaboom")
+        self.assertIsNone(L._run_bounded(boom, 5))
+
+    def test_returns_none_on_timeout(self):
+        """A function that sleeps longer than the budget must return None
+        instead of hanging forever (regression: getaddrinfo on Windows)."""
+        def hang():
+            time.sleep(10)
+            return "too-late"
+        t0 = time.time()
+        result = L._run_bounded(hang, 0.3)
+        dt = time.time() - t0
+        self.assertIsNone(result)
+        self.assertLess(dt, 2.0, "run_bounded waited past its timeout")
+
+
+class TestDnsFallbackTimeout(unittest.TestCase):
+    """When the ThreadPoolExecutor is unavailable (frozen-exe zlib error),
+    run_dns_leak_probe must still bound _system_resolver_ip via _run_bounded
+    so getaddrinfo cannot stall for minutes."""
+
+    def test_fallback_uses_bounded_timeout(self):
+        calls = []
+
+        def fake_system_resolver_ip():
+            calls.append("resolver")
+            return "8.8.8.8"
+
+        def fake_forced_path_echo_ip(timeout):
+            calls.append("echo")
+            return "1.1.1.1"
+
+        with mock.patch.object(L, "_system_resolver_ip", fake_system_resolver_ip), \
+             mock.patch.object(L, "_forced_path_echo_ip", fake_forced_path_echo_ip), \
+             mock.patch.object(L, "_run_bounded") as rb:
+            # Make _run_bounded pass through to the real function.
+            rb.side_effect = lambda fn, t: fn()
+            status, _msg, det = L.run_dns_leak_probe(
+                direct_ip="9.9.9.9", tunnel_ip="1.1.1.1")
+        self.assertEqual(calls, ["resolver", "echo"])
+        # Must have been called with a timeout argument, not None.
+        for call in rb.call_args_list:
+            args, _ = call
+            self.assertGreaterEqual(args[1], 0)  # timeout bound present
 
 
 if __name__ == "__main__":

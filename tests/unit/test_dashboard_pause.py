@@ -27,9 +27,13 @@ class TestDashboardPause(unittest.TestCase):
         app._scroll_log(100)
         self.assertEqual(app._log_scroll, len(frozen) - 1)
         self.assertEqual(app._log_entries(), frozen)
+        # Scrolling all the way back DOWN to the newest entry RESUMES live
+        # following (bottom == live) - the 1.0.35 fix; the frozen snapshot
+        # from the pause is released together with the scroll offset.
         app._scroll_log(-100)
         self.assertEqual(app._log_scroll, 0)
-        self.assertEqual(app._log_entries(), frozen)
+        self.assertIsNone(app._log_snapshot)
+        self.assertEqual(app._log_entries(), app.log_lines)
 
     def test_up_freezes_history_before_new_logs_and_pruning(self):
         app = _app()

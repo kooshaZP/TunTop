@@ -87,10 +87,32 @@ def enumerate_tun2socks() -> list:
         })
     return rows
 def _norm(path: str) -> str:
-    """Case/separator-insensitive absolute form (Windows-safe; identity on
-    other platforms, which only makes matching stricter there)."""
+    """Platform-independent case/separator-insensitive absolute form.
+
+    Unlike ``os.path.normcase(os.path.abspath(path))`` - which lowercases ONLY
+    on Windows and treats ``\\`` as a literal character on POSIX (so a Windows
+    ``C:\\Tools\\TUN2SOCKS.EXE`` is left upper-case and split on the wrong
+    char there, making the ownership test broken rather than "stricter") -
+    this lowercases and treats BOTH ``/`` and ``\\`` as separators on EVERY
+    platform, then anchors relative paths to ``os.getcwd()``.
+
+    The output is therefore identical on Linux, macOS and Windows: the same
+    input always yields the same normalized string and the same ownership
+    verdict regardless of host. Runtime behavior on Windows is unchanged in
+    verdict because every comparison in ``select_own`` flows through this same
+    normalizer on both sides.
+
+    A bare filename (no separator) has no directory component to resolve, so
+    its canonical form is the lowercased name itself - this keeps the
+    vendored-name compare against a basename a true no-op.
+    """
     try:
-        return os.path.normcase(os.path.abspath(path)) if path else ""
+        if not path:
+            return ""
+        p = str(path).replace("\\", "/").lower()
+        if "/" not in p:
+            return p
+        return os.path.abspath(p).replace("\\", "/").lower()
     except Exception:
         return ""
 
@@ -118,7 +140,7 @@ def select_own(rows: list, tun2socks_path=None, recorded=()) -> list:
                 else str(r.get("name") or "").lower())
         if (r.get("pid") in recorded_ids
                 or (want_path and exe_norm == want_path)
-                or base == os.path.normcase(TUN2SOCKS_BINARY)):
+                or base == _norm(TUN2SOCKS_BINARY)):
             own.append(r)
     return own
 

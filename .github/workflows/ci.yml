@@ -25,7 +25,37 @@ jobs:
 
       - name: Syntax-check all Python entry points
         run: |
-          python -m py_compile tuntop/ui/dashboard.py tuntop/tunnel/helper.py tuntop/network/routing.py tuntop/network/dns.py tuntop/geo/geoip.py tuntop/core/state.py tuntop/core/recovery.py tuntop/core/routes_txn.py tuntop/core/startup_recovery.py tuntop/core/integrity.py tuntop/ui/themes.py tuntop/config/profiles.py tuntop/core/events.py tuntop/monitor/health.py
+          python -m py_compile tuntop/ui/dashboard.py tuntop/tunnel/helper.py tuntop/network/routing.py tuntop/network/egress_scripts.py tuntop/network/procguard.py tuntop/network/dns.py tuntop/geo/geoip.py tuntop/core/state.py tuntop/core/recovery.py tuntop/core/routes_txn.py tuntop/core/startup_recovery.py tuntop/core/integrity.py tuntop/ui/themes.py tuntop/config/profiles.py tuntop/core/events.py tuntop/monitor/health.py
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -t . -v
+
+  # Non-Windows leg: the CI used to run ONLY on windows-latest, which is exactly
+  # why the platform-dependent procguard._norm bug (and the egress_scripts
+  # Python twin) were invisible on Linux/macOS. This leg runs the unit tests
+  # that are pure-Python and platform-independent - procguard ownership tests
+  # (which fail on non-Windows under the old os.path.normcase normalizer) and
+  # the egress-script drift suite (pure string/regex checks, no PowerShell
+  # execution). The behavioural PS branch (IfType==131 / Tunnel media) only
+  # runs on real Windows and is covered there above.
+  tests-unix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Syntax-check touched modules
+        run: |
+          python -m py_compile tuntop/network/procguard.py tuntop/network/egress_scripts.py tuntop/network/routing.py tuntop/tunnel/helper.py
+
+      - name: Run platform-independent unit tests
+        run: |
+          python -m unittest tests.unit.test_procguard tests.routing.test_egress_scripts_drift tests.unit.test_egress_lookup_shared -v

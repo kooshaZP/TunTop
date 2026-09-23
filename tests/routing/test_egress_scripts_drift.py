@@ -93,6 +93,20 @@ class TestScriptShape(unittest.TestCase):
         self.assertIn("-or ($_.Name -match", ps)
         self.assertIn("-match '" + es.TUN_DRIVER_RE + "') -or ($_.Name", ps)
 
+    def test_tun_preamble_includes_behavioral_filter(self):
+        """1.0.35 behavioural secondary classifier: the preamble does NOT only
+        match by driver name - it OR's in adapters that report a software
+        tunnel via Windows interface characteristics (InterfaceType 131 /
+        'Tunnel' media), so an unknown foreign TUN whose description matches
+        no keyword is still excluded. The single-source rule means both
+        process mirrors MUST emit this exact same filter."""
+        for ps in (es.tun_alias_ps(), h._tun_alias_powershell(),
+                   routing._tun_alias_powershell()):
+            self.assertIn("InterfaceType -eq 131", ps)
+            self.assertIn("PhysicalMediaType -eq 'Tunnel'", ps)
+            # still anchored on the name regex too (the Wintun safety net)
+            self.assertIn(es.TUN_DRIVER_RE, ps)
+
 
 class TestTunDriverRegexCoversTun2socks(unittest.TestCase):
     """TUN_DRIVER_RE is the single TUN detector (PS preamble AND the Python
@@ -117,6 +131,39 @@ class TestTunDriverRegexCoversTun2socks(unittest.TestCase):
         self.assertIn("$tunAliases -notcontains", es.v4_default_filter_ps())
         self.assertIn(VPN_IFACE_RE, es.v4_default_filter_ps(True))
         self.assertNotIn(VPN_IFACE_RE, es.v4_default_filter_ps(False))
+
+
+class TestBehavioralTunClassifier(unittest.TestCase):
+    """1.0.35 behavioural secondary classifier (D2): an adapter is TUN if its
+    name matches TUN_DRIVER_RE OR its Windows interface characteristics
+    report a software tunnel (IfType 131 / 'Tunnel' media). Unknown foreign
+    TUNs whose description slips past the regex are caught here; the
+    physical/VPN/VMware set must NOT be reclassified."""
+
+    def test_tunnel_iftype_or_media_is_tun_without_keyword(self):
+        # No keyword in the description - caught by the behavioural signal
+        # alone.
+        self.assertTrue(es.is_tun_iface("MysteryTun Adapter", if_type=131))
+        self.assertTrue(es.is_tun_iface("MysteryTun Adapter", media="Tunnel"))
+        self.assertTrue(es.is_tun_iface("MysteryTun Adapter", media="tunnel"))
+
+    def test_non_tunnel_iftype_and_media_are_not_tun(self):
+        # The test-guard set, now fed real Windows characteristics: a physical
+        # or VPN adapter reports 802.3/802.11 media and a non-131 IfType, so it
+        # must stay non-TUN even when the behavioural signal is present.
+        for alias in ("Intel(R) Wi-Fi 7 BE200 320MHz", "Ethernet",
+                      "Realtek PCIe GbE Family Controller", "reza_U",
+                      "Shirazu-VPN", "VMware Virtual Ethernet Adapter"):
+            self.assertFalse(
+                es.is_tun_iface(alias, if_type=6, media="802.3"), alias)
+            # ...and with no media hint the regex alone must also say False.
+            self.assertFalse(es.is_tun_iface(alias), alias)
+
+    def test_name_regex_still_catches_known_tunnels(self):
+        # No regression for the Wintun safety net / our own adapters.
+        for alias in ("wintun", "wintun2", "tun2socks", "Wintun Tunnel",
+                      "sing-tun Tunnel", "WireGuard Tunnel"):
+            self.assertTrue(es.is_tun_iface(alias), alias)
 
 
 class TestIpv4DefaultBodySingleSourced(unittest.TestCase):

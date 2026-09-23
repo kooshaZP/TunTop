@@ -32,16 +32,43 @@ from tuntop.psshell import ps_quote
 #: valid "physical" candidates and pinned every server /32 ONTO our own
 #: wintun (the "the server IP goes to the wintun" report). 'tun2socks' never
 #: appears in a physical NIC description.
+#:
+#: 1.0.35 adds a BEHAVIOURAL secondary classifier as an OR on top of this name
+#: regex (never a replacement): an adapter whose Windows InterfaceType == 131
+#: (IF_TYPE_TUNNEL) or PhysicalMediaType == 'Tunnel' is also a tunnel, even if
+#: its description matches no keyword. This catches a new foreign TUN tool
+#: (e.g. a brand-new sing-box/clash kernel) whose description slips past the
+#: regex. Wintun is the reason the name regex stays: Wintun does not reliably
+#: report a tunnel IfType, so 'wintun'/'wintun2' are kept on the name list as
+#: the safety net. Physical NICs (802.3/802.11, IfType 6/71) and Windows VPN
+#: miniports (Shirazu-VPN, reza_U) report neither 131 nor 'Tunnel' media, so
+#: they are never reclassified - see tests/routing/test_egress_scripts_drift.py.
 TUN_DRIVER_RE = ("(?i)(wintun|tun2socks|sing-tun|\\btun\\b|\\btap\\b|tunnel|wireguard"
                  "|tailscale|openvpn|softether|zerotier|nekoray|mihomo|clash)")
 
 
-def is_tun_iface(alias):
-    """Python-side twin of the $tunAliases PS filter: True when an adapter
-    alias/description looks like ANY tunnel adapter (ours, foreign TUN
-    drivers, VPN tunnel clients). Used by the endpoint-route self-heal to
-    recognise a bypass route that got pinned to the WRONG (tunnel) interface.
-    Physical NIC descriptions (Intel Wi-Fi, Realtek GbE, ...) never match."""
+def is_tun_iface(alias, if_type=None, media=None):
+    """Python-side twin of the ``$tunAliases`` PS filter.
+
+    True when an adapter is a tunnel adapter - matched by the driver-name
+    regex ``TUN_DRIVER_RE`` OR by Windows interface characteristics that
+    indicate a software tunnel: ``IfType == 131`` (``IF_TYPE_TUNNEL``) or
+    ``PhysicalMediaType`` of ``'Tunnel'``. The behavioural signal catches
+    foreign TUN tools (e.g. a new sing-box/clash kernel) whose description
+    slips past the regex; the regex is retained as the Wintun safety net since
+    Wintun does not always report a tunnel IfType.
+
+    Callers that only have the interface alias string (routing._get_egress_for
+    fail-closed check at routing.py:180, helper.get_egress_for) keep the
+    regex-only behaviour - the PS preamble now carries the media check, so a
+    behavioural tunnel adapter is excluded at the source. Physical NIC
+    descriptions (Intel Wi-Fi, Realtek GbE, ...) and Windows VPN miniports
+    (Shirazu-VPN, reza_U) never match: they report 802.3/802.11 media and a
+    non-131 IfType, so they stay classified as VPN (see is_vpn_iface)."""
+    if if_type == 131:
+        return True
+    if isinstance(media, str) and media.lower() == "tunnel":
+        return True
     return bool(alias) and bool(re.search(TUN_DRIVER_RE, str(alias)))
 
 
@@ -76,13 +103,22 @@ def tun_alias_ps(var="$tunAliases"):
     "the server IP goes to the wintun" report. A physical NIC is never
     named 'wintun*'/'tun2socks*', so name matching can only ever exclude
     tunnel adapters.
+
+    1.0.35: the Where-Object also admits adapters whose Windows interface
+    characteristics identify them as software tunnels - InterfaceType 131
+    (IF_TYPE_TUNNEL) OR PhysicalMediaType 'Tunnel' - OR'd with the driver
+    name match (not a replacement) so an unknown foreign TUN whose
+    description matches no keyword is still excluded. See the behavioural
+    twin ``is_tun_iface(alias, if_type=..., media=...)``.
     """
     ours = ", ".join("'" + a + "'" for a in (TUN, TUN2))
     return (var + " = @(" + ours + ")\n"
             "Get-NetAdapter -ErrorAction SilentlyContinue | "
             "Where-Object { ($_.InterfaceDescription -match '"
             + TUN_DRIVER_RE + "') -or ($_.Name -match '" + TUN_DRIVER_RE
-            + "') } | Select-Object -ExpandProperty Name | "
+            + "') -or ($_.InterfaceType -eq 131) -or "
+            "($_.PhysicalMediaType -eq 'Tunnel') } | "
+            "Select-Object -ExpandProperty Name | "
             "ForEach-Object { " + var + " += $_ }\n"
             + var + " = @(" + var + " | Select-Object -Unique)\n")
 
