@@ -1388,9 +1388,9 @@ def override_vpn_routes(vpn_iface, skip_ips):
     geo_dests = {r[1] for r in geoip_added}
     # Make Wintun decisively the lowest-metric interface so our overrides win.
     _set_wintun_interface_metric(2)
-    for fam, get_fam, gw, add in (
-        ("v4", "IPv4", TUN4, add_v4),
-        ("v6", "IPv6", TUN6, add_v6),
+    for fam, get_fam, gw in (
+        ("v4", "IPv4", TUN4),
+        ("v6", "IPv6", TUN6),
     ):
         ps = (f"Get-NetRoute -AddressFamily {get_fam} -InterfaceAlias '{ps_quote(vpn_iface)}' "
                f"-ErrorAction SilentlyContinue | Where-Object {{ $_.State -eq 'Alive' }} | "
@@ -1416,13 +1416,14 @@ def override_vpn_routes(vpn_iface, skip_ips):
                 ipaddress.ip_address(host)
             except ValueError:
                 continue
-            # Save the VPN's original route so cleanup can fully restore it. add_v4/
-            # add_v6 then replace the stale (VPN) route with our Wintun override
-            # (recording it in added_routes for normal cleanup too).
+            # Save the VPN's original route so cleanup can restore it if needed.
+            # _raw_add_route adds our Wintun override WITHOUT deleting the VPN
+            # route; the lower effective metric then wins and the VPN route is
+            # left intact (persistent store preserved).
             vpn_saved_routes.append((fam, prefix, vpn_iface,
                                      str(r.get("NextHop", "") or ""),
                                      int(r.get("RouteMetric", 1) or 1)))
-            if add(prefix, TUN, gw, metric=1):
+            if _raw_add_route(fam, prefix, TUN, gw, metric=1):
                 vpn_override_routes.append((fam, prefix, TUN, gw))
 
 
@@ -3051,10 +3052,12 @@ def self_heal_tunnel(dns4, dns6):
 
 
 def start_tun2socks_pipe(device_name, ip4, ip6, port, tun2socks_path,
-                         dns4=None, dns6=None):
+                         dns4=None, dns6=None, fatal=True):
     """Bring up one TUN adapter + tun2socks process against one local SOCKS5
-    port. Returns the Popen handle. Raises SystemExit on failure, same as the
-    original inline code in main().
+    port. Returns the Popen handle. Raises SystemExit on failure when
+    ``fatal`` is True (the default); otherwise prints the same diagnostic and
+    returns None so the caller can skip this optional pipe without taking the
+    whole helper down.
 
     Extracted verbatim from main() so the second proxy pipe (TUN2, behind
     --proxy2-port) can reuse the exact same bring-up sequence. The PRIMARY
@@ -3062,12 +3065,18 @@ def start_tun2socks_pipe(device_name, ip4, ip6, port, tun2socks_path,
     configuration (plain/DoH/NetBIOS via configure_tun); a secondary pipe
     only gets its interface addresses - DNS must stay on the primary
     adapter, or the two would fight over resolver settings."""
+    def _fail(msg):
+        if fatal:
+            sys.exit(msg)
+        print(f"[!] {msg}")
+        return None
+
     print(f"[*] Checking local SOCKS5 proxy at 127.0.0.1:{port}...")
     if not test_local_socks(port):
-        sys.exit(
-            f"[!] 127.0.0.1:{port} is not accepting TCP connections. "
-            "Start your proxy client and verify its SOCKS5 inbound is "
-            "listening on this port."
+        return _fail(
+            f"127.0.0.1:{port} is not accepting TCP connections. Start your "
+            "proxy client and verify its SOCKS5 inbound is listening on "
+            "this port."
         )
 
     # Critical: no --interface.
@@ -3083,14 +3092,14 @@ def start_tun2socks_pipe(device_name, ip4, ip6, port, tun2socks_path,
     try:
         proc = subprocess.Popen(cmd, creationflags=_NO_WINDOW)
     except FileNotFoundError:
-        sys.exit(f"[!] tun2socks not found: {tun2socks_path}")
+        return _fail(f"tun2socks not found: {tun2socks_path}")
 
     time.sleep(1)
     if proc.poll() is not None:
-        sys.exit(f"[!] tun2socks exited immediately: {proc.returncode}")
+        return _fail(f"tun2socks exited immediately: {proc.returncode}")
 
     if not wait_for_tun(name=device_name):
-        sys.exit(f"[!] Wintun adapter '{device_name}' did not appear.")
+        return _fail(f"Wintun adapter '{device_name}' did not appear.")
 
     if device_name == TUN:
         print(f"[*] Configuring Wintun: DNS4={dns4 or '(none)'}  "
@@ -3552,78 +3561,91 @@ def main():
         print(f"[*] Starting second proxy pipe ({TUN2}) for "
               f"127.0.0.1:{args.proxy2_port}...")
         tun2_proc = start_tun2socks_pipe(TUN2, TUN2_IP4, TUN2_IP6,
-                                         args.proxy2_port, args.tun2socks)
+                                         args.proxy2_port, args.tun2socks,
+                                         fatal=False)
+        if tun2_proc is None:
+            # SOCKS5 not listening: skip the wintun2 pipe rather than killing
+            # the whole helper (which would take the primary tunnel down too).
+            print(f"[!] Second proxy at 127.0.0.1:{args.proxy2_port} is not "
+                  "reachable — starting WITHOUT the wintun2 pipe. The primary "
+                  "tunnel is unaffected; restart the tunnel once the second "
+                  "proxy is listening to enable it.")
+            print(f"[*] proxy2 pipe skipped — SOCKS5 not listening at "
+                  f"127.0.0.1:{args.proxy2_port}")
+        else:
+            print(f"[*] proxy2 pipe active — wintun2 ready for "
+                  f"127.0.0.1:{args.proxy2_port}")
 
-        # The second proxy's own upstream server(s) get physical-NIC bypass
-        # routes - same reasoning as the primary --server bypass above: without
-        # them the proxy2 transport is captured by the TUN default route and
-        # loops back into 127.0.0.1.
-        p2_v4, p2_v6 = [], []
-        for entry in (args.proxy2_server or []):
-            ep4, ep6 = resolve_all_safe(entry, label=f"proxy2-server {entry}")
-            if ep4 is None and ep6 is None:
-                continue
-            p2_v4.extend(x for x in (ep4 or []) if x not in p2_v4)
-            p2_v6.extend(x for x in (ep6 or []) if x not in p2_v6)
-            if ep4 or ep6:
-                print(f"    [proxy2-server] {entry} -> "
-                      f"{', '.join((ep4 or []) + (ep6 or []))}")
-        for ip in p2_v4:
-            eg = (get_egress_for(ip, exclude_vpn=not args.vless_over_vpn)
-                  or (vless_iface, vless_gateway))
-            print(f"    proxy2 server {ip} -> via {eg[0]} ({eg[1]})")
-            if not add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
-                print(f"[!] Could not install proxy2-server bypass route for "
-                      f"{ip}; continuing.")
-        d6 = get_ipv6_default()
-        for ip in p2_v6:
-            if d6:
-                add_v6(f"{ip}/128", d6["InterfaceAlias"], d6["NextHop"], 1)
-            else:
-                print(f"[!] No native IPv6 gateway; proxy2-server bypass for "
-                      f"{ip} not installed.")
+            # The second proxy's own upstream server(s) get physical-NIC bypass
+            # routes - same reasoning as the primary --server bypass above: without
+            # them the proxy2 transport is captured by the TUN default route and
+            # loops back into 127.0.0.1.
+            p2_v4, p2_v6 = [], []
+            for entry in (args.proxy2_server or []):
+                ep4, ep6 = resolve_all_safe(entry, label=f"proxy2-server {entry}")
+                if ep4 is None and ep6 is None:
+                    continue
+                p2_v4.extend(x for x in (ep4 or []) if x not in p2_v4)
+                p2_v6.extend(x for x in (ep6 or []) if x not in p2_v6)
+                if ep4 or ep6:
+                    print(f"    [proxy2-server] {entry} -> "
+                          f"{', '.join((ep4 or []) + (ep6 or []))}")
+            for ip in p2_v4:
+                eg = (get_egress_for(ip, exclude_vpn=not args.vless_over_vpn)
+                      or (vless_iface, vless_gateway))
+                print(f"    proxy2 server {ip} -> via {eg[0]} ({eg[1]})")
+                if not add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
+                    print(f"[!] Could not install proxy2-server bypass route for "
+                          f"{ip}; continuing.")
+            d6 = get_ipv6_default()
+            for ip in p2_v6:
+                if d6:
+                    add_v6(f"{ip}/128", d6["InterfaceAlias"], d6["NextHop"], 1)
+                else:
+                    print(f"[!] No native IPv6 gateway; proxy2-server bypass for "
+                          f"{ip} not installed.")
 
-        # Restart the second pipe so its tun2socks picks up the (now present)
-        # wintun2 IPv6 address - same reason as the primary restart above.
-        if tun2_proc is not None and tun2_proc.poll() is None:
-            tun2_proc.terminate()
-            try:
-                tun2_proc.wait(timeout=5)
-            except Exception:
-                tun2_proc.kill()
-        time.sleep(1)
-        tun2_proc = subprocess.Popen([
-            args.tun2socks, "--device", TUN2,
-            "--proxy", f"socks5://127.0.0.1:{args.proxy2_port}",
-        ], creationflags=_NO_WINDOW)
-        time.sleep(1)
-        if tun2_proc.poll() is not None:
-            sys.exit(f"[!] tun2socks (proxy2) exited after restart: "
-                     f"{tun2_proc.returncode}")
-        if not wait_for_tun(name=TUN2):
-            sys.exit(f"[!] Wintun adapter '{TUN2}' did not reappear after "
-                     "restart.")
-        _set_wintun_addresses_plain(None, None, device=TUN2, ip4=TUN2_IP4,
-                                    ip6=TUN2_IP6, set_dns=False)
+            # Restart the second pipe so its tun2socks picks up the (now present)
+            # wintun2 IPv6 address - same reason as the primary restart above.
+            if tun2_proc is not None and tun2_proc.poll() is None:
+                tun2_proc.terminate()
+                try:
+                    tun2_proc.wait(timeout=5)
+                except Exception:
+                    tun2_proc.kill()
+            time.sleep(1)
+            tun2_proc = subprocess.Popen([
+                args.tun2socks, "--device", TUN2,
+                "--proxy", f"socks5://127.0.0.1:{args.proxy2_port}",
+            ], creationflags=_NO_WINDOW)
+            time.sleep(1)
+            if tun2_proc.poll() is not None:
+                sys.exit(f"[!] tun2socks (proxy2) exited after restart: "
+                         f"{tun2_proc.returncode}")
+            if not wait_for_tun(name=TUN2):
+                sys.exit(f"[!] Wintun adapter '{TUN2}' did not reappear after "
+                         "restart.")
+            _set_wintun_addresses_plain(None, None, device=TUN2, ip4=TUN2_IP4,
+                                        ip6=TUN2_IP6, set_dns=False)
 
-        # CLI-provided second-hop hosts get their TUN2 routes right away, so
-        # the feature works headless; the dashboard can add more live.
-        # Their prefixes are also collected so the geoip pass below never
-        # removes/overrides them (a geo CIDR equal to one of these /32s would
-        # otherwise be swept away and re-pointed at the geo egress).
-        _p2b_v4, _p2b_v6 = [], []
-        for entry in (args.proxy2_bypass_ip or []):
-            ep4, ep6 = resolve_all_safe(entry, label=f"proxy2-bypass {entry}")
-            if ep4 is None and ep6 is None:
-                continue
-            print(f"    [proxy2-bypass] {entry} -> "
-                  f"{', '.join((ep4 or []) + (ep6 or []))} via {TUN2}")
-            for ip in (ep4 or []):
-                _p2b_v4.append(ip)
-                add_v4(f"{ip}/32", TUN2, TUN2_IP4, metric=1)
-            for ip in (ep6 or []):
-                _p2b_v6.append(ip)
-                add_v6(f"{ip}/128", TUN2, TUN2_IP6, metric=1)
+            # CLI-provided second-hop hosts get their TUN2 routes right away, so
+            # the feature works headless; the dashboard can add more live.
+            # Their prefixes are also collected so the geoip pass below never
+            # removes/overrides them (a geo CIDR equal to one of these /32s would
+            # otherwise be swept away and re-pointed at the geo egress).
+            _p2b_v4, _p2b_v6 = [], []
+            for entry in (args.proxy2_bypass_ip or []):
+                ep4, ep6 = resolve_all_safe(entry, label=f"proxy2-bypass {entry}")
+                if ep4 is None and ep6 is None:
+                    continue
+                print(f"    [proxy2-bypass] {entry} -> "
+                      f"{', '.join((ep4 or []) + (ep6 or []))} via {TUN2}")
+                for ip in (ep4 or []):
+                    _p2b_v4.append(ip)
+                    add_v4(f"{ip}/32", TUN2, TUN2_IP4, metric=1)
+                for ip in (ep6 or []):
+                    _p2b_v6.append(ip)
+                    add_v6(f"{ip}/128", TUN2, TUN2_IP6, metric=1)
 
     # (Bypass routes are now installed right after the first Wintun config,
     #  before the tun2socks IPv6 restart, so they take effect instantly.)

@@ -116,5 +116,67 @@ class TestRejectCompetingTun(unittest.TestCase):
             H.reject_competing_tun()  # must not raise
 
 
+class TestStartProxy2Pipe(unittest.TestCase):
+    """Tests for start_tun2socks_pipe()'s fatal/non-fatal paths.
+
+    The proxy2 pipe (TUN2) must never sys.exit the helper when the second
+    SOCKS5 proxy is not running - that would take the primary tunnel down too
+    and trigger the recovery engine's restart loop. Only the primary pipe
+    (fatal=True, the default) should sys.exit on a dead proxy port."""
+
+    def test_non_fatal_returns_none_when_socks_dead(self):
+        """fatal=False: dead SOCKS5 must return None, NOT raise SystemExit."""
+        with mock.patch.object(H, "test_local_socks", return_value=False), \
+             mock.patch.object(H, "print"):
+            result = H.start_tun2socks_pipe(
+                H.TUN2, H.TUN2_IP4, H.TUN2_IP6, 2080, "tun2socks.exe",
+                fatal=False)
+        self.assertIsNone(result)
+
+    def test_fatal_still_exits_on_dead_socks(self):
+        """fatal=True (default for the primary pipe): dead SOCKS5 must sys.exit."""
+        with mock.patch.object(H, "test_local_socks", return_value=False), \
+             mock.patch.object(H, "print"):
+            with self.assertRaises(SystemExit) as cm:
+                H.start_tun2socks_pipe(
+                    H.TUN, "10.0.0.1", "fd00::1", 2080, "tun2socks.exe")
+        msg = str(cm.exception)
+        self.assertIn("127.0.0.1:2080", msg)
+
+    def test_fatal_default_param_preserves_exit(self):
+        """Regression guard: calling without fatal= (defaults to True) must
+        still sys.exit, preserving the original primary-pipe behavior."""
+        with mock.patch.object(H, "test_local_socks", return_value=False), \
+             mock.patch.object(H, "print"):
+            with self.assertRaises(SystemExit):
+                H.start_tun2socks_pipe(
+                    H.TUN2, H.TUN2_IP4, H.TUN2_IP6, 2080, "tun2socks.exe")
+
+    def test_non_fatal_proceeds_when_socks_alive(self):
+        """fatal=False: alive SOCKS5 proceeds to spawn tun2socks and returns
+        a real Popen handle whose command targets wintun2."""
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None  # process alive
+        fake_proc.wait.return_value = 0
+
+        with mock.patch.object(H, "test_local_socks", return_value=True), \
+             mock.patch.object(H, "subprocess") as m_sub, \
+             mock.patch("time.sleep"), \
+             mock.patch.object(H, "wait_for_tun", return_value=True), \
+             mock.patch.object(H, "_set_wintun_addresses_plain") as m_addr:
+            m_sub.Popen.return_value = fake_proc
+            proc = H.start_tun2socks_pipe(
+                H.TUN2, H.TUN2_IP4, H.TUN2_IP6, 2080, "tun2socks.exe",
+                fatal=False)
+
+        self.assertIs(proc, fake_proc)
+        cmd = m_sub.Popen.call_args[0][0]
+        self.assertIn("--device", cmd)
+        self.assertIn(H.TUN2, cmd)  # "wintun2"
+        self.assertIn("--proxy", cmd)
+        self.assertIn("socks5://127.0.0.1:2080", cmd)
+        m_addr.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

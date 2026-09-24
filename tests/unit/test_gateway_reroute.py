@@ -285,5 +285,109 @@ class TestCleanupOrder(_HelperStateCase):
         self.assertEqual(list(H.added_routes), [])
 
 
+class TestOverrideVpnRoutes(_HelperStateCase):
+    """Verify override_vpn_routes shadows VPN routes non-destructively via
+    _raw_add_route (no netsh delete), preserving the VPN route and its
+    persistent-store entry."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_iface = H.vpn_override_iface
+
+    def tearDown(self):
+        H.vpn_override_iface = self._saved_iface
+        super().tearDown()
+
+    def _vpn_rows(self):
+        """Two simulated VPN-injected routes."""
+        return [
+            {"DestinationPrefix": "217.26.222.255/32",
+             "NextHop": "10.8.0.1", "RouteMetric": 35},
+            {"DestinationPrefix": "217.26.222.0/24",
+             "NextHop": "10.8.0.1", "RouteMetric": 100},
+        ]
+
+    def _fake_ps_json(self, rows):
+        """ps_json returns `rows` for the IPv4 query, [] for IPv6."""
+        def _fn(script):
+            if "IPv4" in script:
+                return rows
+            return []
+        return _fn
+
+    def test_override_vpn_routes_uses_raw_add_route(self):
+        H.vpn_saved_routes[:] = []
+        H.vpn_override_routes[:] = []
+        with mock.patch.object(H, "_set_wintun_interface_metric"), \
+             mock.patch.object(H, "ps_json",
+                               side_effect=self._fake_ps_json(self._vpn_rows())), \
+             mock.patch.object(H, "_raw_add_route", return_value=True) as raw, \
+             mock.patch.object(H, "add_v4") as a4, \
+             mock.patch.object(H, "add_v6") as a6:
+            H.override_vpn_routes("VPN01", set())
+        # _raw_add_route called once per shadowed route (both IPv4 rows)
+        self.assertTrue(raw.called)
+        self.assertEqual(len(raw.call_args_list), 2)
+        for c in raw.call_args_list:
+            self.assertEqual(c.args[:1], ("v4",))
+            self.assertEqual(c.kwargs.get("metric"), 1)
+        # add_v4 / add_v6 must NOT be used for VPN shadow installation
+        a4.assert_not_called()
+        a6.assert_not_called()
+        # ledgers populated
+        self.assertEqual(len(H.vpn_saved_routes), 2)
+        self.assertEqual(len(H.vpn_override_routes), 2)
+
+    def test_override_vpn_routes_preserves_vpn_route(self):
+        """Shadow installation only issues 'add route' - never 'delete route'
+        for any VPN prefix (the old add_v4/add_v6 path did)."""
+        deletes = []
+
+        def _fake_run(cmd):
+            if "delete" in cmd and "route" in cmd:
+                deletes.append(list(cmd))
+            return (0, "OK", "")
+
+        with mock.patch.object(H, "_set_wintun_interface_metric"), \
+             mock.patch.object(H, "ps_json",
+                               side_effect=self._fake_ps_json(self._vpn_rows())), \
+             mock.patch.object(H, "run", side_effect=_fake_run):
+            H.override_vpn_routes("VPN01", set())
+        # No delete-route call for any VPN prefix
+        vpn_dests = {r["DestinationPrefix"] for r in self._vpn_rows()}
+        for d in deletes:
+            self.assertNotIn(d[4], vpn_dests, f"VPN route deleted: {d}")
+        self.assertEqual(deletes, [])
+
+    def test_vpn_shadow_restore_is_noop_when_route_intact(self):
+        """After shadow install via _raw_add_route, the undo path restores
+        saved VPN routes via _raw_add_route (add, not delete) and only
+        remove_route's the Wintun shadows."""
+        H.vpn_saved_routes[:] = []
+        H.vpn_override_routes[:] = []
+        with mock.patch.object(H, "_set_wintun_interface_metric"), \
+             mock.patch.object(H, "ps_json",
+                               side_effect=self._fake_ps_json(self._vpn_rows())), \
+             mock.patch.object(H, "_raw_add_route", return_value=True) as raw, \
+             mock.patch.object(H, "remove_route") as rm:
+            H.override_vpn_routes("VPN01", set())
+            ok = H._live_set_vpn_shadow(False)
+        self.assertFalse(ok)
+        # Undo removes only Wintun shadows (iface = TUN, never the VPN iface)
+        rm.assert_called()
+        for c in rm.call_args_list:
+            item = c.args[0]
+            self.assertEqual(item[2], H.TUN)
+        # Restore re-adds each saved VPN route via _raw_add_route (add, not delete)
+        restore_calls = [c for c in raw.call_args_list if c.args[2] == "VPN01"]
+        self.assertEqual(len(restore_calls), 2)
+        restored_dests = {c.args[1] for c in restore_calls}
+        self.assertEqual(restored_dests,
+                         {"217.26.222.255/32", "217.26.222.0/24"})
+        # Ledgers cleared after restore
+        self.assertEqual(len(H.vpn_override_routes), 0)
+        self.assertEqual(len(H.vpn_saved_routes), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -74,6 +74,7 @@ from tuntop.routing import (          # noqa: E402
     _route_exists_v4, _route_exists_v6,
     _get_ipv4_default, _get_ipv6_default,
     _get_egress_for, _get_vpn_ipv4_default, _get_vpn_ipv6_default,
+    _dump_route_table_ps, _dump_route_table_full_ps, _parse_route_rows,
 )
 from tuntop.network.egress_scripts import (  # noqa: E402  (single source)
     is_tun_iface as _is_tun_iface,
@@ -1705,6 +1706,11 @@ class BTopTui:
         self.ns = args
         self.proc = None
         self.logs = queue.Queue()
+        # proxy2 pipe state: True only when --proxy2-port is set AND the
+        # helper confirmed the wintun2 pipe came up. Set False by the reader
+        # thread when it sees the "proxy2 pipe skipped" marker, so the status
+        # bar stops claiming proxy2 is green.
+        self._proxy2_active = bool(getattr(self.ns, "proxy2_port", None))
 
         # Tunnel state machine (tuntop/state.py): the single source of
         # truth for what the tunnel is doing - far beyond the old
@@ -5879,12 +5885,19 @@ class BTopTui:
             # the bar looks unchanged for anyone not using the feature. The
             # wintun2 pipe lives and dies with the helper subprocess, so its
             # up/down mirrors the tunnel's operational state (never guessed
-            # from a route that might be stale).
-            p2_up = state in (TunnelState.RUNNING.value,
-                              TunnelState.DEGRADED.value)
-            pairs.append(("PROXY2", (GREEN if p2_up else YELLOW)
-                          + f"127.0.0.1:{self.ns.proxy2_port} "
-                          + ("up" if p2_up else "down") + _R))
+            # from a route that might be stale). When the helper saw no SOCKS5
+            # on the proxy2 port it skipped the pipe entirely: show an honest
+            # "down (proxy not running)" instead of a misleading green badge.
+            if not self._proxy2_active:
+                pairs.append(("PROXY2", YELLOW
+                               + f"127.0.0.1:{self.ns.proxy2_port} "
+                               + "down (proxy not running)" + _R))
+            else:
+                p2_up = state in (TunnelState.RUNNING.value,
+                                  TunnelState.DEGRADED.value)
+                pairs.append(("PROXY2", (GREEN if p2_up else YELLOW)
+                               + f"127.0.0.1:{self.ns.proxy2_port} "
+                               + ("up" if p2_up else "down") + _R))
         # VPN chip: rendered whenever a VPN-dependent feature is active - in
         # VLESS-over-VPN mode it's REQUIRED (red when no VPN is connected),
         # otherwise it's informational (shows the live connection/adapter
@@ -7293,6 +7306,17 @@ class BTopTui:
                     # restart; deduplicate them to ONE event-log line per session.
                     if self._geo_diag_suppress(s):
                         continue
+                    # proxy2 pipe status markers from the helper: track whether
+                    # the second hop actually came up so the status bar can show
+                    # an honest "down" instead of a misleading green badge.
+                    if s.startswith("[*] proxy2 pipe skipped"):
+                        self._proxy2_active = False
+                        self.logs.put(s)
+                        continue
+                    if s.startswith("[*] proxy2 pipe active"):
+                        self._proxy2_active = True
+                        self.logs.put(s)
+                        continue
                     # Start-sequence milestones: surface each phase to the
                     # user AND advance the tunnel state machine to match.
                     if s.strip() == "[+] TUNNEL ACTIVE":
@@ -7547,48 +7571,19 @@ class BTopTui:
     def _dump_route_table(self):
         """One-shot dump of the live routing table as dicts
         (DestinationPrefix / InterfaceAlias / NextHop). Empty list on failure."""
-        ps = ("$ProgressPreference='SilentlyContinue'; "
-              "$out = Get-NetRoute -ErrorAction SilentlyContinue | "
-              "Select-Object DestinationPrefix, InterfaceAlias, NextHop | "
-              "ConvertTo-Json -Compress; Write-Output $out")
-        try:
-            ok, out = _ps(ps, timeout=90)
-        except Exception:
-            return []
+        ok, out = _dump_route_table_ps()
         if not ok or not out:
             return []
-        try:
-            doc = json.loads(out.strip())
-        except Exception:
-            return []
-        if not isinstance(doc, list):
-            return []
-        return [r for r in doc if isinstance(r, dict) and r.get("DestinationPrefix")]
+        return _parse_route_rows(out)
 
     def _dump_route_table_full(self):
         """Like _dump_route_table but ALSO captures RouteMetric and Store,
         which the snapshot/restore needs to re-create an entry exactly.
         Empty list on failure."""
-        ps = ("$ProgressPreference='SilentlyContinue'; "
-              "$out = Get-NetRoute -ErrorAction SilentlyContinue | "
-              "Select-Object DestinationPrefix, InterfaceAlias, NextHop, "
-              "RouteMetric, Store | "
-              "ConvertTo-Json -Compress -Depth 2; Write-Output $out")
-        try:
-            ok, out = _ps(ps, timeout=90)
-        except Exception:
-            return []
+        ok, out = _dump_route_table_full_ps()
         if not ok or not out:
             return []
-        try:
-            doc = json.loads(out.strip())
-        except Exception:
-            return []
-        if isinstance(doc, dict):
-            doc = [doc]
-        if not isinstance(doc, list):
-            return []
-        return [r for r in doc if isinstance(r, dict) and r.get("DestinationPrefix")]
+        return _parse_route_rows(out, full=True)
 
     # ── Route-table snapshot / restore ────────────────────────────────────────
     # The user-visible contract: after ANY exit, the routing table must look
@@ -8253,23 +8248,30 @@ class BTopTui:
         geo_left = 0
         for attempt in range(6):
             leftover = self._count_wintun_routes()
-            if attempt > 0:
-                # After the first pass, ALSO count leftover geoip country
-                # routes on any interface (the wintun counter alone said
-                # "clear" while thousands of Wi-Fi bypass routes remained).
-                geo_left = self._sweep_geo_leftovers()
-            else:
+            if attempt == 0:
+                # First pass: count-only geo leftovers (no sweep/delete).
+                # Dumps the table once.
                 geo_left = len(self._leftover_geo_routes())
+            elif geo_left > 0 or leftover > 0:
+                # Only re-dump/re-sweep when the prior pass removed > 0 geo
+                # routes or wintun routes still remain - otherwise the table is
+                # unchanged and another full dump is pure overhead (seconds on a
+                # few-thousand-route geo table, just to confirm zero rows).
+                geo_left = self._sweep_geo_leftovers()
             if leftover == 0 and geo_left == 0 and not self._tun2socks_running():
                 break
             self._shutdown_stage = (
                 f"Verifying routes are clear... ({leftover} wintun"
                 + (f", {geo_left} geoip" if geo_left else "")
                 + f" left, retry {attempt + 1})")
-            try:
-                _teardown_wintun()
-            except Exception:
-                pass
+            # Only re-run _teardown_wintun when something is still present;
+            # skip the redundant kill when the prior pass reported 0 wintun + 0
+            # geo and only looped because tun2socks was still being torn down.
+            if leftover > 0 or geo_left > 0 or self._tun2socks_running():
+                try:
+                    _teardown_wintun()
+                except Exception:
+                    pass
             time.sleep(0.4)
         if leftover == 0 and geo_left == 0 and not self._tun2socks_running():
             self._shutdown_items[verify_idx][1] = "ok"

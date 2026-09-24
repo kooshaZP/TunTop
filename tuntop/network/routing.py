@@ -110,6 +110,61 @@ def _teardown_wintun():
         pass
 
 
+# ─── Fast route-table dumps (text, not ConvertTo-Json) ────────────────────────
+
+def _dump_route_table_ps(timeout=90):
+    """Fast full-table dump: |-delimited lines ``dest|iface|nh`` for every
+    route. Avoids ``ConvertTo-Json``, which is the bottleneck on tables with
+    thousands of geo-bypass routes (PowerShell 5.1 serialises large object
+    arrays slowly). Returns (ok, text) like _ps."""
+    ps = ("$ProgressPreference='SilentlyContinue'; Get-NetRoute -ErrorAction "
+          "SilentlyContinue | ForEach-Object { "
+          "\"$($_.DestinationPrefix)|$($_.InterfaceAlias)|$($_.NextHop)\" }")
+    return _ps(ps, timeout=timeout)
+
+
+def _dump_route_table_full_ps(timeout=90):
+    """Fast full-table dump (snapshot/restore): |-delimited
+    ``dest|iface|nh|metric|store``. Returns (ok, text) like _ps."""
+    ps = ("$ProgressPreference='SilentlyContinue'; Get-NetRoute -ErrorAction "
+          "SilentlyContinue | ForEach-Object { "
+          "\"$($_.DestinationPrefix)|$($_.InterfaceAlias)|$($_.NextHop)|"
+          "$($_.RouteMetric)|$($_.Store)\" }")
+    return _ps(ps, timeout=timeout)
+
+
+def _parse_route_rows(text, full=False):
+    """Parse |-delimited Get-NetRoute output into dicts matching the
+    ConvertTo-Json shape:
+      base  : DestinationPrefix, InterfaceAlias, NextHop
+      full  : + RouteMetric (int), Store
+    Strips stray single-quotes (PowerShell wraps some values) and normalises
+    on-link next-hops (0.0.0.0/::/On-link) to ''. Skips blank/garbage lines
+    and rows whose DestinationPrefix is empty. Pure string handling - unit
+    testable without Windows."""
+    rows = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln or "|" not in ln:
+            continue
+        parts = [p.strip().replace("'", "") for p in ln.split("|")]
+        dest = parts[0]
+        if not dest:
+            continue
+        nh = parts[2]
+        if nh.lower() in ("0.0.0.0", "::", "on-link"):
+            nh = ""
+        row = {"DestinationPrefix": dest,
+               "InterfaceAlias": parts[1],
+               "NextHop": nh}
+        if full:
+            if len(parts) < 5:
+                continue
+            row["RouteMetric"] = _as_int(parts[3])
+            row["Store"] = parts[4]
+        rows.append(row)
+    return rows
+
 
 # ─── Live route helpers (for in-dashboard bypass-IP editing) ─────────────────
 # The PowerShell SCRIPT TEXT these emit lives in exactly one place -

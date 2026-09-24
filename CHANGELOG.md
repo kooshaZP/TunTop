@@ -2,6 +2,19 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.37] - 2026-09-24
+
+### Fixed (VPN route persistence, optional PROXY2, and faster route-table handling)
+- **VPN routes survive Wintun shadow installation.** Geo-splitting through a connected Windows VPN now installs lower-metric Wintun shadow routes without deleting the VPN client's persistent route. The original route remains available after the tunnel is stopped, and the dashboard route-snapshot diff correctly treats an intact persistent route as a no-op during restore.
+- **An unavailable second SOCKS5 inbound no longer takes down the primary tunnel.** `--proxy2-port` is now optional: when that port is not listening, the helper skips only the second Wintun pipe and continues with the primary tunnel. The dashboard reports `PROXY2 down (proxy not running)` instead of showing a misleading green status.
+- **Route-table dumps no longer use slow `ConvertTo-Json` serialization.** Full route listings and snapshot dumps now stream compact pipe-delimited PowerShell output, then parse it in Python. IPv4/IPv6 next hops and persistent-store fields remain preserved.
+- **Shutdown avoids redundant full-table scans and teardown attempts.** After the first verification finds a clean route table, TunTop does not immediately dump and sweep thousands of routes again. It repeats those operations only while route or process cleanup remains.
+- **Second-pipe startup state is consistent with cleanup.** When `--proxy2-port` was skipped at startup, the helper does not attempt a redundant second restart; normal endpoint bypass installation still follows the primary path.
+
+### Tests
+- 685 passed, 6 skipped. Added coverage for non-destructive VPN route shadowing, proxy2 optional startup/restart state, fast route parsing, clean shutdown verification, and persistent VPN route survival.
+
+
 ## [1.0.36] - 2026-09-23
 
 ### Fixed (the second black console window is REALLY gone - the cleanup watchdog owned it)
