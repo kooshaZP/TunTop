@@ -357,11 +357,14 @@ $best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
 
 
 def _get_vpn_ipv6_default(vpn_interface=None):
-    """IPv6 counterpart of _get_vpn_ipv4_default for --proxy-over-vpn."""
+    """IPv6 default route of the VPN interface. Most Windows VPN profiles
+    (PPTP in particular) are IPv4-only and have no IPv6 default, so None is
+    normal and expected.
+
+    On-link IPv6 routes (NextHop = '::') are accepted and normalized to ''."""
     if vpn_interface:
         ps = rf"""
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{ps_quote(vpn_interface)}' -ErrorAction SilentlyContinue |
-    Where-Object {{$_.NextHop -ne '::'}} |
     Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {{ exit 1 }}
 $r | ConvertTo-Json -Compress
@@ -377,7 +380,6 @@ $names = @(
 $best = $null
 foreach ($n in $names) {
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-        Where-Object {$_.NextHop -ne '::'} |
         Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
     if ($r) { $best = $r; break }
 }
@@ -389,7 +391,10 @@ $best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
         return None
     try:
         d = json.loads(out)
-        return d["InterfaceAlias"], d["NextHop"]
+        nh = str(d.get("NextHop", "")).strip()
+        if nh == "::":
+            nh = ""
+        return d["InterfaceAlias"], nh
     except Exception:
         return None
 
@@ -643,14 +648,17 @@ def _add_route_v6(dest, iface, gateway, metric=1):
 
 
 def _get_ipv6_default(vpn_interface=None):
-    """IPv6 default route (next hop) used to send a bypass entry's IPv6
-    address directly. Mirrors the VPN-exclusion fix in
+    """IPv6 default route (interface + gateway) used to send a bypass entry's
+    IPv6 address directly. Mirrors the VPN-exclusion fix in
     tuntop/helper.py:get_ipv6_default() so a connected Windows VPN is never
-    picked as the "safe" native gateway."""
+    picked as the "safe" native gateway.
+
+    On-link IPv6 routes (NextHop = '::') are accepted and normalized to ''
+    so the caller installs them as on-link routes - the same treatment the
+    helper applies."""
     if vpn_interface:
         ps = rf"""
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{ps_quote(vpn_interface)}' -ErrorAction SilentlyContinue |
-    Where-Object {{$_.NextHop -ne '::'}} |
     Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {{ exit 1 }}
 $r | ConvertTo-Json -Compress
@@ -659,7 +667,7 @@ $r | ConvertTo-Json -Compress
         ps = _tun_alias_powershell() + _vpn_alias_powershell() + r"""
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
     Where-Object {
-        $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and
+        $_.State -eq 'Alive' -and
         $tunAliases -notcontains $_.InterfaceAlias -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
@@ -667,7 +675,7 @@ $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction Sil
     Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
+        Where-Object { $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
         Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
         Select-Object -First 1 NextHop, InterfaceAlias
 }
@@ -679,6 +687,9 @@ $r | ConvertTo-Json -Compress
         return None
     try:
         d = json.loads(out)
-        return d["InterfaceAlias"], d["NextHop"]
+        nh = str(d.get("NextHop", "")).strip()
+        if nh == "::":
+            nh = ""
+        return d["InterfaceAlias"], nh
     except Exception:
         return None

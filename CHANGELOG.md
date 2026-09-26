@@ -2,6 +2,69 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.39] - 2026-09-26
+
+### Fixed (Wintun as the preferred DNS source)
+- **Wintun is now the OS-selected DNS source, not just a DNS-configured adapter.**
+  Previously TunTop set DNS resolvers only on the `wintun` adapter and relied on
+  the split-defaults (`0.0.0.0/1`, `::/1`) to pull the public resolvers through
+  the tunnel - but nothing lowered Wintun's `InterfaceMetric`, so Windows's
+  DNS-client server selection could still prefer a DHCP-assigned physical NIC
+  (e.g. its on-link `192.168.1.1`) over the tunnel. `_set_wintun_interface_metric`
+  is now generalized to lower **both** IPv4 and IPv6 `InterfaceMetric` on Wintun
+  (to 2, below the VPN's ~25 and the physical adapter's typical ~4270) and is
+  applied from `configure_tun()` - so it is set on every bring-up, re-applied by
+  the DoH escalation in `wait_for_tunnel_stable`, and re-applied by
+  `self_heal_tunnel()`. The originals are saved per-family and restored on
+  cleanup. `tuntop/network/dns.py` is untouched: it remains a pure resolution
+  library and never touches interfaces.
+- **The "DNS configuration" health row now proves Wintun is selected, not just
+  present.** It used to check `ServerAddresses.Count > 0` (green for any adapter
+  with any DNS) - now it asserts `Find-NetRoute -RemoteIPAddress <resolver>`
+  selects the `wintun` alias for every configured resolver, and reports the chosen
+  interface so an accidental physical-NIC pick is visible. `[L]` remains the
+  backstop proof that no DNS escapes the tunnel.
+
+### Added (--log-adapter-activity)
+- **Adapter-traffic activity logging.** The dashboard can now optionally log
+  UDP/QUIC connections, ICMP counter deltas and Wintun throughput deltas to the
+  structured event log (component ``ADAPTER``) while the tunnel is up. Enabled
+  with ``--log-adapter-activity`` (``--no-log-adapter-activity`` to disable /
+  the default). The flag is saved in and restored from profiles, just like
+  ``--vless-over-vpn`` and ``--no-vpn-bypass``.
+- UDP connections are polled via ``Get-NetUDPConnection`` and logged as color
+  coded JSON records ``{"proto","src","sport","dst","dport","proc","pid"}``.
+  UDP flows to remote port 443 are heuristically tagged ``proto=QUIC`` (true QUIC
+  detection requires ETW and is out of scope; the heuristic is documented).
+- Per-protocol dedup (``_seen_udp_conns``, ``_seen_icmp_conns``) keeps adapter
+  lines from suppressing TCP entries and vice-versa. Per-destination rate
+  limiting reuses the existing ``_net_rate`` map (one line per remote
+  ``ip:port`` per 60 s; suppressed repeats are carried as a ``suppressed``
+  count on the next UDP record).
+- ICMP activity is sampled via ``netsh interface ipv4/ipv6 show icmpstats``
+  and logged as ``[icmp] ipv4: in=… out=… | ipv6: in=… out=…`` counter deltas.
+- Wintun throughput is sampled via ``Get-NetAdapterStatistics`` and logged as
+  ``[adapter] wintun: rx=…B tx=…B`` deltas.
+- All adapter polling shares the existing 5 s ``_poll_connections`` throttle so
+  the extra PowerShell calls do not multiply on the 50 ms telemetry tick.
+- Tests: 19 new coverage cases for UDP/QUIC parsing, ICMP delta tracking,
+  throughput deltas, dedup, rate limiting, and the off-state.
+
+### Tests
+- 726 passed, 6 skipped.
+
+## [1.0.38] - 2026-09-24
+
+### Fixed (IPv6 on-link default routes filtered out - country and host bypass skipped on IPv6-only-default networks)
+- **Gateway changes no longer create a Wintun traffic gap or a false throughput spike.** v1.0.37 re-pointed thousands of geo routes by deleting the old gateway routes before installing replacements. During that window, matching traffic could fall through the TUN and inflate the Wintun download graph. Replacements are now installed first, old routes are removed only after the full replacement batch is accepted, and a gateway transition resets the telemetry baseline. Implausible positive Wintun counter jumps are discarded as counter discontinuities.
+- **ROOT CAUSE (proven on physical Wi-Fi): the IPv6 default-route lookup in helper.py and routing.py carried a `$_ -ne '::'` Where-Object filter copied from the IPv4 `0.0.0.0` pattern. On IPv6, an on-link route (NextHop = `::`) is the NORMAL form of a default route on a physical adapter — the next-hop is resolved via neighbor discovery, so there is no gateway address. Filtering these out made `get_ipv6_default()` return None whenever a system only had on-link IPv6 defaults, which silently skipped all IPv6 geo/host bypass installs.** The filter was removed from all four IPv6 default lookups (`get_ipv6_default`, `get_vpn_ipv6_default`, `_get_ipv6_default`, `_get_vpn_ipv6_default`) and the NextHop is normalized from `::` to `""` on all return paths. `add_v6()`'s same-gateway comparison was also fixed to normalize `::` vs `""` so an existing on-link route is recognized as already-correct instead of being treated as stale (redundant delete+re-add). The geo-bypass netsh format was adjusted to omit the gateway token entirely for on-link routes (was emitting a double-space that netsh rejected).
+- **Geo startup output no longer implies that parsed IPv6 ranges were installed.** On an IPv4-only connection (Wi-Fi has IPv4 but no global IPv6 address or physical IPv6 default), the line now says `IPv6 skipped (no usable IPv6 egress ...)` and the install total contains only schedulable IPv4 routes. Previously it announced all parsed ranges under “Installing,” which made users believe missing routes were silently lost.
+- **VLESS route health checks now test resolved endpoint IPs, not configured URLs/hostnames.** `Find-NetRoute -RemoteIPAddress` received values such as `dey.lnmarketplace.net`, which Windows cannot route, causing false “no route found” failures for both the server-route and proxy-loop rows. Checks now reuse startup/edit-server DNS results, validate every resolved A/AAAA address, keep the hostname in the row label, and report “not resolved yet” without performing an invalid hostname route lookup.
+
+### Tests
+- 705 passed, 6 skipped. Added coverage for safe gateway re-point ordering, partial-batch failure handling, telemetry baseline resets, counter-discontinuity filtering, on-link IPv6 defaults, and the related route/install behavior.
+
+
 ## [1.0.37] - 2026-09-24
 
 ### Fixed (VPN route persistence, optional PROXY2, and faster route-table handling)

@@ -39,13 +39,21 @@ the VPN flaps.
 ### Is my DNS leaking?
 TunTop actively DETECTS leaks: the monitor loop continuously compares the
 direct and tunnel exit IPs and logs `[MONITOR] leak check ...`, and `[L]`
-runs the test on demand. For resolution itself, TunTop's fallback stack
-(UDP/53 and DoH) prioritizes availability over privacy: if the system
-resolver fails while the tunnel is up, those fallback queries can leave
-over the physical NIC. That is deliberate (a dead lookup helps nobody) -
-run with `--dns-policy strict` if you want the opposite trade: while a
-tunnel is live, resolution that cannot stay inside the tunnel is simply
-reported as failed instead of escaping.
+runs the test on demand. TunTop also makes Wintun the OS-selected DNS source:
+at bring-up it lowers Wintun's `InterfaceMetric` (below the VPN's and the
+physical adapter's), so Windows picks Wintun — not a DHCP-assigned physical
+NIC — when building its DNS server-selection order for the configured
+resolvers. The `[C]` health row "DNS configuration (Wintun is selected
+source)" proves that selection (it fails if Windows would reach a resolver
+through any other interface).
+
+For resolution itself, TunTop's fallback stack (UDP/53 and DoH) prioritizes
+availability over privacy: if the system resolver fails while the tunnel is
+up, those fallback queries can leave over the physical NIC. That is deliberate
+(a dead lookup helps nobody) - run with `--dns-policy strict` if you want the
+opposite trade: while a tunnel is live, resolution that cannot stay inside the
+tunnel is simply reported as failed instead of escaping. `[L]` is the backstop
+proof that no DNS escaped the tunnel even in the fallback modes.
 
 ### Health scan shows failing probes
 Press `[D]` to export diagnostics — it captures your config, routes, logs, and the last scan. Attach it to a GitHub issue for fastest help.

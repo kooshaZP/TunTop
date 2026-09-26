@@ -97,3 +97,10 @@ DEFAULT_ENDPOINT_PORT = 443
 # Default geoip country code: NONE. Nothing is bypassed by country until
 # the user picks a code ([F] Geo Manager / --geoip-code / a profile).
 DEFAULT_GEOIP_CODE = ""
+
+# ── Adapter activity logging ──────────────────────────────────────────────────
+# When True, the dashboard logs UDP/TCP/QUIC connection activity, ICMP
+# counter deltas, and Wintun throughput deltas to the structured event log
+# (component "ADAPTER") while the tunnel is up. Off by default to avoid
+# log noise.
+DEFAULT_LOG_ADAPTER_ACTIVITY = False

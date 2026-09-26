@@ -11,6 +11,7 @@ from typing import Optional
 
 from tuntop.config.defaults import (
     DEFAULT_ENDPOINT_PORT, DEFAULT_SOCKS_PORT, DNS4, DEFAULT_DNS_POLICY,
+    DEFAULT_LOG_ADAPTER_ACTIVITY,
 )
 
 
@@ -36,6 +37,7 @@ class Profile:
     vless_over_vpn: bool = False
     no_vpn_bypass: bool = False
     vpn_interface: Optional[str] = None
+    log_adapter_activity: bool = DEFAULT_LOG_ADAPTER_ACTIVITY
     secret_ref: Optional[str] = None   # key into the protected secret store
 
     @classmethod
@@ -65,4 +67,5 @@ class Profile:
             "vless_over_vpn": self.vless_over_vpn,
             "no_vpn_bypass": self.no_vpn_bypass,
             "vpn_interface": self.vpn_interface,
+            "log_adapter_activity": self.log_adapter_activity,
         }

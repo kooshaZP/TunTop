@@ -19,7 +19,7 @@ import os
 
 from tuntop.config.defaults import (
     DEFAULT_ENDPOINT_PORT, DEFAULT_SOCKS_PORT, DNS4,
-    DEFAULT_DNS_POLICY, DNS_POLICIES,
+    DEFAULT_DNS_POLICY, DNS_POLICIES, DEFAULT_LOG_ADAPTER_ACTIVITY,
 )
 
 
@@ -54,6 +54,8 @@ def snapshot_from_args(ns) -> dict:
         "vless_over_vpn": bool(getattr(ns, "vless_over_vpn", False)),
         "no_vpn_bypass": bool(getattr(ns, "no_vpn_bypass", False)),
         "vpn_interface": getattr(ns, "vpn_interface", None),
+        "log_adapter_activity": bool(getattr(ns, "log_adapter_activity",
+                                             DEFAULT_LOG_ADAPTER_ACTIVITY)),
     }
 
 
@@ -247,6 +249,8 @@ def apply_to_args(ns, snap: dict, normalise_host=None) -> list:
     ns.proxy2_server = list(snap.get("proxy2_server") or [])
     ns.vless_over_vpn = bool(snap.get("vless_over_vpn"))
     ns.no_vpn_bypass = bool(snap.get("no_vpn_bypass"))
+    ns.log_adapter_activity = bool(snap.get("log_adapter_activity",
+                                            DEFAULT_LOG_ADAPTER_ACTIVITY))
     return applied
 
 

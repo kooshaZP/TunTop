@@ -16,6 +16,7 @@ Run via Run_Helper.ps1 for admin elevation.
 import argparse
 import atexit
 import base64
+import collections
 import concurrent.futures
 import ctypes
 import ipaddress
@@ -1050,6 +1051,48 @@ def _dns_enforcement_check(dns_ip, is_v6=False):
                    "bypassed this resolver; otherwise a leak)")
 
 
+def _dns_configuration_check(dns4, dns6=None):
+    """Health check: is Wintun the OS-selected DNS SOURCE for the resolver(s)
+    we configured?
+
+    This is the assertion the old "DNS configuration" row SHOULD have made but
+    only did `ServerAddresses.Count > 0` - which passes the moment ANY adapter
+    (including a DHCP-assigned physical NIC with its on-link 192.168.1.1) has
+    any DNS server. That never proved Wintun was the one Windows would actually
+    use; a physical-NIC resolver there is selected by InterfaceMetric and is
+    reachable on-link, so the split-defaults (0.0.0.0/1) don't capture it.
+
+    Mirrors that gap by reusing _dns_enforcement_check() per configured
+    resolver: PASS only when Find-NetRoute -RemoteIPAddress <resolver> selects
+    the 'wintun' alias for every resolver we set. The detail names the chosen
+    interface per resolver, so an accidental physical-NIC selection is visible
+    instead of a silent green.
+    """
+    resolvers = []
+    if dns4:
+        resolvers.append((dns4, False))
+    if dns6:
+        resolvers.append((dns6, True))
+    if not resolvers:
+        return False, ("no DNS resolver is configured on Wintun - nothing to "
+                       "enforce as the DNS source")
+    parts = []
+    all_wintun = True
+    for ip, is_v6 in resolvers:
+        ok, msg = _dns_enforcement_check(ip, is_v6)
+        # _dns_enforcement_check returns None for "no route / probe failed" and
+        # True|False for the actual selection. Anything non-True breaks the
+        # combined assertion.
+        if not ok:
+            all_wintun = False
+        parts.append(msg)
+    if all_wintun:
+        return True, ("Wintun is the selected DNS source for the configured "
+                      "resolver(s): " + "; ".join(parts))
+    return False, ("DNS is NOT pinned to Wintun as the selected source - " +
+                   "; ".join(parts))
+
+
 def _leak_check(port, timeout=None):
     """Health-check wrapper around the Monitor-layer leak probe.
 
@@ -1098,6 +1141,96 @@ Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
     return data if isinstance(data, list) else [data]
 
 
+# ─── Adapter activity polling (UDP / QUIC / ICMP / throughput) ───────────────
+
+
+def _get_udp_connections():
+    """Active UDP connections (excluding loopback/local listeners) joined with
+    owning process name - the UDP/QUIC counterpart of _get_active_connections().
+
+    UDP is connectionless, so "Established" simply means "has a remote peer".
+    Connections whose remote port is 443 are heuristically classified as QUIC
+    (no native PowerShell 5.1 cmdlet exposes QUIC; ETW is too heavy for the 5s
+    poll). Returns a list of dicts with keys Proto, Local, Lport, Remote,
+    Rport, Proc, Pid. Best-effort: returns [] on any failure."""
+    ps = rf"""
+Get-NetUDPConnection -ErrorAction SilentlyContinue |
+  Where-Object {{
+    $_.RemoteAddress -notlike '127.*' -and
+    $_.RemoteAddress -ne '::1' -and $_.RemoteAddress -ne '0.0.0.0' -and
+    $_.RemoteAddress -ne '' -and $_.RemotePort -gt 0
+  }} |
+  Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, OwningProcess -Unique |
+  ForEach-Object {{
+    $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+    [PSCustomObject]@{{
+      Proto  = if ($_.RemotePort -eq 443) {{ 'QUIC' }} else {{ 'UDP' }}
+      Local  = $_.LocalAddress
+      Lport  = $_.LocalPort
+      Remote = $_.RemoteAddress
+      Rport  = $_.RemotePort
+      Proc   = if ($p) {{ $p.ProcessName }} else {{ 'pid-' + $_.OwningProcess }}
+      Pid    = $_.OwningProcess
+    }}
+  }} | ConvertTo-Json -Compress
+"""
+    ok, out = _ps(ps, timeout=6)
+    if not ok:
+        return []
+    try:
+        data = json.loads(out)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else [data]
+
+
+def _get_icmp_stats():
+    """Absolute ICMP counter snapshots for both IPv4 and IPv6 via netsh.
+    Returns {'ipv4': {'in': N, 'out': M}, 'ipv6': {'in': N, 'out': M}} where a
+    family is None when netsh has no data / the command failed. Callers compute
+    deltas by diffing against the previous snapshot."""
+    result = {}
+    for family, label in ((4, "ipv4"), (6, "ipv6")):
+        ok, out = _ps(
+            "netsh interface ipv%d show icmpstats 2>$null; exit 0" % family,
+            timeout=5)
+        if not ok:
+            result[label] = None
+            continue
+        # netsh prints a "Received / Sent" table per ICMP message type; each
+        # data line has exactly two trailing integers. Sum them for a coarse
+        # per-family total - good enough to detect *any* ICMP activity change.
+        in_total = 0
+        out_total = 0
+        for line in out.splitlines():
+            nums = re.findall(r"\d+", line)
+            if len(nums) >= 2:
+                try:
+                    in_total += int(nums[-2])
+                    out_total += int(nums[-1])
+                except (ValueError, IndexError):
+                    pass
+        result[label] = {"in": in_total, "out": out_total}
+    return result
+
+
+def _get_adapter_throughput():
+    """Absolute Wintun RX/TX byte counters via Get-NetAdapterStatistics.
+    Returns {'rx': N, 'tx': M} or None on failure. _poll_connections() diffs
+    against the previous sample to log throughput deltas."""
+    ok, out = _ps(
+        "Get-NetAdapterStatistics -Name wintun -ErrorAction SilentlyContinue | "
+        "Select-Object ReceivedBytes,SentBytes | ConvertTo-Json -Compress",
+        timeout=6)
+    if not ok:
+        return None
+    try:
+        d = json.loads(out)
+        return {"rx": int(d["ReceivedBytes"]), "tx": int(d["SentBytes"])}
+    except Exception:
+        return None
+
+
 # ─── Health checks ──────────────────────────────────────────────────────────
 
 def build_checks(ns):
@@ -1105,6 +1238,7 @@ def build_checks(ns):
     p = ns.port
     servers = ns.server
     dns = getattr(ns, "dns4", None) or _cfgdef.DNS4   # probe/display fallback
+    dns6 = getattr(ns, "dns6", None) or _cfgdef.DNS6  # probe/display fallback
     ep = getattr(ns, "endpoint_port", 443)
     # [V] vless-over-vpn mode: the per-server route checks below are MODE-AWARE.
     over = getattr(ns, "vless_over_vpn", False)
@@ -1137,8 +1271,15 @@ def build_checks(ns):
           "$s = @(Get-NetRoute -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object {$_.InterfaceAlias -eq 'wintun' -and $_.DestinationPrefix -in '::/0','::/1','8000::/1'}); "
           "if ($s.Count -ge 1) { 'IPv6 via wintun (' + $s.Count + ' route(s): ' + ($s.DestinationPrefix -join ', ') + ')'; exit 0 }; "
           "Write-Output 'no IPv6 default or wintun split route'; exit 1"),
-        q("DNS configuration",
-          "@(Get-DnsClientServerAddress | ? {$_.ServerAddresses}).Count | % {if ($_ -gt 0) {'DNS configured'} else {throw 'No DNS servers'}}"),
+        # Strengthened from a bare "some adapter has some DNS" count: PASS only
+        # when Windows itself selects the Wintun adapter to reach every resolver we
+        # configured (Find-NetRoute -RemoteIPAddress <resolver> -> wintun). The old
+        # ServerAddresses.Count > 0 check was green even when a DHCP-assigned
+        # physical NIC won DNS selection over Wintun - the on-link gap the split
+        # defaults (0.0.0.0/1) never capture. Detail names the chosen interface so
+        # an accidental physical-NIC pick is visible instead of a silent pass.
+        ("DNS configuration (Wintun is selected source)",
+         lambda: _dns_configuration_check(dns, dns6)),
         q("MTU",
           "Get-NetIPInterface -AddressFamily IPv4 | ? {$_.NlMtu -ge 1280} | select -First 1 | % {'MTU ' + $_.NlMtu}"),
         # wintun may be absent (tunnel not yet up); never use -ErrorAction
@@ -1303,73 +1444,73 @@ def build_checks(ns):
     for _s in (servers or []):
         checks.append((f"Configured endpoint TCP/{ep} ({_s})",
                        lambda _s=_s, ep=ep: _tcp(_s, ep, 8)))
-        # Find-NetRoute emits TWO objects per hit: a NetIPAddress row (which
-        # carries NO DestinationPrefix and NO NextHop) and the NetRoute row.
-        # Filter on DestinationPrefix so the address row can never win the
-        # `select -First 1` and name the WRONG interface - the same trap
-        # egress_scripts.egress_lookup_ps guards against (a route check that
-        # then reports "via Wi-Fi" while the actual /32 is elsewhere).
-        _find = (f"$r = Find-NetRoute -RemoteIPAddress '{ps_quote(_s)}' "
-                 f"-ErrorAction SilentlyContinue | "
-                 f"? {{ $_.DestinationPrefix }} | select -First 1; ")
+        # Find-NetRoute accepts an IP address, not the configured hostname/URL.
+        # Reuse the startup/edit-server resolution cache (zero network I/O on the
+        # UI thread) and test every address for which a host route was installed.
+        _host = _host_from_url(_s) or _s
+        _ep4, _ep6 = _resolve_cached(_s)
+        _server_ips = list(_ep4) + list(_ep6)
+        if not _server_ips:
+            _unresolved = (f"throw 'not resolved yet: {ps_quote(_host)} "
+                           "(endpoint resolver keeps retrying)'")
+            checks.append(q(f"VLESS server route ({_host})", _unresolved))
+            checks.append(q(f"Proxy loop detection ({_host})", _unresolved))
+            continue
+
+        _ip_list = ",".join(f"'{ps_quote(ip)}'" for ip in _server_ips)
+        _find = (
+            f"$ips = @({_ip_list}); "
+            "$r = @($ips | % { Find-NetRoute -RemoteIPAddress $_ "
+            "-ErrorAction SilentlyContinue | "
+            "? { $_.DestinationPrefix } | select -First 1 }); "
+            "if ($r.Count -ne $ips.Count) {Write-Output "
+            "'no route found for one or more resolved endpoint IPs'; exit 1}; ")
+        _tun_scan = (
+            "$a = @($r | % { $n = Get-NetAdapter -Name $_.InterfaceAlias "
+            "-ErrorAction SilentlyContinue; if ((@('"
+            + TUN + "','" + TUN2 + "') -contains $_.InterfaceAlias) -or "
+            "($n.InterfaceDescription -match '" + _TUN_DRIVER_RE
+            + "')) { $_ } }); ")
+        _tun_check = (_tun_scan +
+            "if ($a.Count) {Write-Output ('VLESS endpoint NOT bypassed - "
+            "resolves via tunnel adapter ' + "
+            "(($a | % InterfaceAlias | select -Unique) -join ', ') + "
+            "' (loops into a tunnel)'); exit 1}; ")
         if over:
-            _on_vpn = (f"($vc -contains $r.InterfaceAlias) "
-                       f"-or ($r.InterfaceAlias -match '{VPN_IFACE_RE}')")
-            checks.append(q(f"VLESS server route ({_s})",
+            _bad = ("@($r | ? { -not (($vc -contains $_.InterfaceAlias) -or "
+                    f"($_.InterfaceAlias -match '{VPN_IFACE_RE}')) }})")
+            _aliases = "(($r | % InterfaceAlias | select -Unique) -join ', ')"
+            checks.append(q(f"VLESS server route ({_host})",
                             _vpnconn_ps + _find +
-                            f"if (-not $r) {{Write-Output 'no route found'; exit 1}}; "
-                            f"if ({_on_vpn}) {{'via Windows VPN ' + $r.InterfaceAlias}} "
-                            f"else {{Write-Output ('via ' + $r.InterfaceAlias + ' - NOT on the Windows VPN (expected: ' + ($vc -join ', ') + ') - the helper self-heal re-points it; toggle [V] or restart if this persists'); exit 1}}"))
-            checks.append(q(f"Proxy loop detection ({_s})",
-                            _vpnconn_ps + _find +
-                            f"if (-not $r) {{Write-Output 'no route found'; exit 1}}; "
-                            # The verdict must recognize OUR OWN tunnel adapters by
-                            # ALIAS (1.0.33): the old check only tested the adapter
-                            # DESCRIPTION for 'Wintun', but the vendored tun2socks
-                            # creates our adapter with a description that matches
-                            # neither - so the check kept passing ("bypassed
-                            # through wintun") while the server /32 was pinned
-                            # INTO our own TUN and the transport looped. A route
-                            # that resolves through ANY tunnel-family adapter
-                            # (ours by alias, foreign by driver description) is a
-                            # loop, always.
-                            f"$a = Get-NetAdapter -Name $r.InterfaceAlias -ErrorAction SilentlyContinue; "
-                            f"$tun = (@('{TUN}','{TUN2}') -contains $r.InterfaceAlias) "
-                            f"-or ($a.InterfaceDescription -match '{_TUN_DRIVER_RE}'); "
-                            f"if ($tun) {{Write-Output ('VLESS endpoint NOT bypassed - resolves via tunnel adapter ' + $r.InterfaceAlias + ' (loops into a tunnel)'); exit 1}}; "
-                            # Over-VPN mode: riding the VPN is the POINT. A route
-                            # that resolves through the physical NIC means the
-                            # transport left the VPN (flap, stale pin) - fail
-                            # loudly instead of showing a green "bypassed".
-                            f"if ({_on_vpn}) {{'VLESS endpoint rides Windows VPN ' + $r.InterfaceAlias}} "
-                            f"else {{Write-Output ('VLESS endpoint on ' + $r.InterfaceAlias + ' - expected Windows VPN transport (VLESS via VPN mode)'); exit 1}}"))
+                            f"if ({_bad}.Count) {{Write-Output ('via ' + "
+                            f"{_aliases} + ' - NOT all on the Windows VPN (expected: ' + "
+                            "($vc -join ', ') + ') - the helper self-heal re-points it'); "
+                            f"exit 1}} else {{'via Windows VPN ' + {_aliases}}}"))
+            checks.append(q(f"Proxy loop detection ({_host})",
+                            _vpnconn_ps + _find + _tun_check +
+                            f"if ({_bad}.Count) {{Write-Output ('VLESS endpoint on ' + "
+                            f"{_aliases} + ' - expected Windows VPN transport "
+                            "(VLESS via VPN mode)'); exit 1} else "
+                            "{'VLESS endpoint rides Windows VPN ' + "
+                            f"{_aliases}}}"))
         else:
-            checks.append(q(f"VLESS server route ({_s})",
-                            _find +
-                            f"if ($r) {{'via ' + $r.InterfaceAlias}} else {{Write-Output 'no route found'; exit 1}}"))
-            checks.append(q(f"Proxy loop detection ({_s})",
-                            _find +
-                            f"if (-not $r) {{Write-Output 'no route found'; exit 1}}; "
-                            # The verdict must recognize OUR OWN tunnel adapters by
-                            # ALIAS (1.0.33): the old check only tested the adapter
-                            # DESCRIPTION for 'Wintun', but the vendored tun2socks
-                            # creates our adapter with a description that matches
-                            # neither - so the check kept passing ("bypassed
-                            # through wintun") while the server /32 was pinned
-                            # INTO our own TUN and the transport looped. A route
-                            # that resolves through ANY tunnel-family adapter
-                            # (ours by alias, foreign by driver description) is a
-                            # loop, always.
-                            f"$a = Get-NetAdapter -Name $r.InterfaceAlias -ErrorAction SilentlyContinue; "
-                            f"$tun = (@('{TUN}','{TUN2}') -contains $r.InterfaceAlias) "
-                            f"-or ($a.InterfaceDescription -match '{_TUN_DRIVER_RE}'); "
-                            f"if ($tun) {{Write-Output ('VLESS endpoint NOT bypassed - resolves via tunnel adapter ' + $r.InterfaceAlias + ' (loops into a tunnel)'); exit 1}}; "
-                            f"'VLESS endpoint bypassed through ' + $r.InterfaceAlias"))
+            _aliases = "(($r | % InterfaceAlias | select -Unique) -join ', ')"
+            checks.append(q(f"VLESS server route ({_host})",
+                            _find + "'via ' + " + _aliases))
+            checks.append(q(f"Proxy loop detection ({_host})",
+                            _find + _tun_check +
+                            "'VLESS endpoint bypassed through ' + " + _aliases))
 
     return checks
 
 
 # ─── Telemetry helpers ──────────────────────────────────────────────────────
+
+# A Wintun counter jump larger than this in one sample is a counter/reset
+# artefact, not a plausible per-sample payload.  It is intentionally generous
+# so normal high-speed downloads are not clipped.
+_WINTUN_MAX_SAMPLE_DELTA = 1 << 30  # 1 GiB between two telemetry samples
+
 
 def get_wintun_speed(state_ref):
     """Sample Wintun RX/TX byte counters and return each in KiB/s.
@@ -1377,7 +1518,13 @@ def get_wintun_speed(state_ref):
     state_ref is a one-element list holding (rx_total, tx_total, ts) from the
     previous sample, or None on the first call. Returns
     (rx_kib, tx_kib, rx_total, tx_total). On failure returns
-    (0.0, 0.0, None, None) so callers can tell success from failure."""
+    (0.0, 0.0, None, None) so callers can tell success from failure.
+
+    A positive jump beyond _WINTUN_MAX_SAMPLE_DELTA is treated as a counter
+    discontinuity (for example an adapter/network transition) and is not fed
+    to the speed graph or cumulative traffic total. The new counter becomes
+    the next baseline, so sampling resumes normally.
+    """
     ok, out = _ps(
         "Get-NetAdapterStatistics -Name wintun -ErrorAction SilentlyContinue | "
         "Select ReceivedBytes,SentBytes | ConvertTo-Json -Compress")
@@ -1391,10 +1538,16 @@ def get_wintun_speed(state_ref):
         if state_ref[0] is None:
             state_ref[0] = (rx, tx, now)
             return 0.0, 0.0, rx, tx
-        dt = now - state_ref[0][2]
-        rx_speed = max(0, (rx - state_ref[0][0])) / max(dt, 0.1) / 1024.0
-        tx_speed = max(0, (tx - state_ref[0][1])) / max(dt, 0.1) / 1024.0
+        prev_rx, prev_tx, prev_ts = state_ref[0]
+        dt = now - prev_ts
+        delta_rx = rx - prev_rx
+        delta_tx = tx - prev_tx
         state_ref[0] = (rx, tx, now)
+        if delta_rx > _WINTUN_MAX_SAMPLE_DELTA or \
+                delta_tx > _WINTUN_MAX_SAMPLE_DELTA:
+            return 0.0, 0.0, None, None
+        rx_speed = max(0, delta_rx) / max(dt, 0.1) / 1024.0
+        tx_speed = max(0, delta_tx) / max(dt, 0.1) / 1024.0
         return round(rx_speed, 3), round(tx_speed, 3), rx, tx
     except Exception:
         return 0.0, 0.0, None, None
@@ -1794,10 +1947,10 @@ class BTopTui:
         self._shutdown_stage = ""        # current cleanup step label
         self._shutdown_progress = 0.0    # 0.0..1.0 overall cleanup progress
         self._cleanup_done = False       # True once routes are fully cleared
-        self.speed_hist = []           # combined (RX+TX) KiB/s, for the SPEED card
-        self.rx_hist = []              # download KiB/s, for the graph
-        self.tx_hist = []              # upload KiB/s, for the graph
-        self.ping_samples = []
+        self.speed_hist = collections.deque(maxlen=120)  # combined (RX+TX) KiB/s, SPEED card
+        self.rx_hist = collections.deque(maxlen=120)      # download KiB/s, graph
+        self.tx_hist = collections.deque(maxlen=120)      # upload KiB/s, graph
+        self.ping_samples = collections.deque(maxlen=8)
         self.last_checked = None
         self.baseline_bytes = [None]   # mutable ref for get_wintun_speed: (rx,tx,ts)
         self._last_raw_rx = None       # previous absolute Wintun RX byte total
@@ -1806,7 +1959,7 @@ class BTopTui:
 
         # Render loop tuning - keep the frame cheap and flicker-free.
         self._last_frame = ""          # last rendered screen, to skip no-op redraws
-        self._frame_interval = 0.04     # seconds between scheduled redraws (~25 fps)
+        self._frame_interval = 0.02     # seconds between scheduled redraws (~50 fps)
         self._full_repaint = True       # force a full clear+repaint next frame
         self._prev_lines = []           # previous frame's line list (for diff paint)
         self._prev_w = 0                # previous frame width (resize detection)
@@ -1824,6 +1977,9 @@ class BTopTui:
         self._ping_ts = 0
         self._vpn_cache_ts = 0
         self._vpn_status = None
+        self._vpn_recon_ts = 0          # last VPN-arrival reconciliation
+        self._vpn_was_up = False         # last seen VPN connected state
+        self._vpn_poll_thread = None
         # Tunnel state watcher (loop()): None until the first check primes
         # it, then the machine's state string - it announces tunnel DOWN
         # (terminal state) transitions; every other transition is already
@@ -1841,7 +1997,6 @@ class BTopTui:
         self._tel_lock = threading.Lock()
         self._geo_lock = threading.Lock()
 
-        self.checks = build_checks(args)
         self.log_lines = []
         self._log_snapshot = None
         self._log_scroll = 0        # lines scrolled back from the newest log entry
@@ -1906,6 +2061,10 @@ class BTopTui:
             for ip in _v6:
                 if ip not in self.endpoint_v6:
                     self.endpoint_v6.append(ip)
+        # Build route health checks only after startup DNS resolution has filled
+        # the cache consumed by build_checks().  Previously they were built first
+        # (and, independently, incorrectly passed the raw hostname to Windows).
+        self.checks = build_checks(args)
 
         # Click-map / mouse support (populated each draw(), consumed by
         # _poll_input()). See _init_mouse() for the console-mode setup.
@@ -1973,6 +2132,18 @@ class BTopTui:
         # 123.1:xxxxx -> 185.x.x.x:41144" flood). dest -> [last_log_ts, count].
         self._net_rate = {}
 
+        # --log-adapter-activity state (off by default to avoid log noise).
+        # When True, _poll_connections() also samples UDP/QUIC, ICMP counter
+        # deltas and Wintun throughput deltas into the event log as component
+        # "ADAPTER". Separate dedup maps per protocol keep TCP entries from
+        # suppressing UDP/QUIC/ICMP and vice-versa.
+        self._log_adapter_activity = bool(getattr(
+            self.ns, "log_adapter_activity", _cfgdef.DEFAULT_LOG_ADAPTER_ACTIVITY))
+        self._seen_udp_conns = {}     # per-(proc, remote, port) dedup for UDP/QUIC
+        self._seen_icmp_conns = {}     # per-family absolute ICMP counters (for delta)
+        self._last_adapter_rx = None  # prev absolute Wintun RX bytes (throughput)
+        self._last_adapter_tx = None  # prev absolute Wintun TX bytes (throughput)
+
         # Geo bypass load progress. Two phases feed it:
         #   * geo_parse  - the helper decoding the geoip file (fed by [GEO-PARSE]
         #                  markers while the file is being read), so the panel
@@ -2009,25 +2180,19 @@ class BTopTui:
     def _telemetry(self):
         now = time.time()
 
-        # Speed - sampled ~10x/s for a smooth, responsive graph/reading.
+        # Speed - sampled ~20x/s for a smooth, responsive graph/reading.
         # Runs in the background thread, so the PowerShell call never blocks
         # the UI. The list mutations below are guarded by _tel_lock because
         # draw() reads the same lists from the main thread.
-        if now - self._speed_ts >= 0.1:
+        if now - self._speed_ts >= 0.05:
             self._speed_ts = now
             rx_kib, tx_kib, rx_total, tx_total = get_wintun_speed(self.baseline_bytes)
             with self._tel_lock:
                 # Combined (RX+TX) history drives the SPEED metric card.
                 self.speed_hist.append(rx_kib + tx_kib)
-                if len(self.speed_hist) > 120:
-                    self.speed_hist.pop(0)
                 # Separate RX/TX histories drive the download/upload graph.
                 self.rx_hist.append(rx_kib)
                 self.tx_hist.append(tx_kib)
-                if len(self.rx_hist) > 120:
-                    self.rx_hist.pop(0)
-                if len(self.tx_hist) > 120:
-                    self.tx_hist.pop(0)
                 # Accumulate total traffic from consecutive absolute byte counters.
                 if rx_total is not None and tx_total is not None:
                     if self._last_raw_rx is not None:
@@ -2045,48 +2210,9 @@ class BTopTui:
             if ms is not None:
                 with self._tel_lock:
                     self.ping_samples.append(round(ms))
-                    if len(self.ping_samples) > 8:
-                        self.ping_samples.pop(0)
-
-        # VPN - every 4 s. Sample whenever ANY VPN-dependent feature cares:
-        # [V] vless-over-vpn, geo-via-VPN, or VPN-bypass display. The status
-        # feeds the top-bar chip (red on disconnect) and the live adapter name.
-        # NEVER sample (or re-apply anything) while a stop/teardown is
-        # running: every spawn competes with the route sweep's PowerShell
-        # work and stretches the "stop still in progress" window out - the
-        # "[T] then the app feels frozen" report. Sampling resumes the next
-        # tick after the sweep finishes; the chip shows DOWN meanwhile.
-        stopping = self._stopping.is_set()
-        if getattr(self.ns, "vless_over_vpn", False) or \
-                getattr(self.ns, "geoip", None) or \
-                not getattr(self.ns, "no_vpn_bypass", False):
-            if not stopping and now - self._vpn_cache_ts >= 4.0:
-                self._vpn_cache_ts = now
-                self._vpn_status = get_vpn_status()
-            elif stopping:
-                # Keep the cadence anchors fresh so the first post-stop
-                # sample isn't immediately due mid-teardown either.
-                self._vpn_cache_ts = now
-                self._vpn_recon_ts = now
-        # VPN ARRIVAL reconciliation (every ~5s): the moment a Windows VPN
-        # appears, everything that wanted it but found nothing at apply time
-        # is re-applied - [vpn]-tagged bypass entries stuck at "[route
-        # pending]" and geo-via-VPN requests that aborted with "no connected
-        # Windows VPN". Disappearance needs no action: the VPN's own routes
-        # vanish with the adapter; the pending-state machinery re-fires on
-        # its own the next time the VPN connects. Gated on _stopping: a
-        # mid-sweep _on_vpn_arrived() would re-install routes the sweep is
-        # deleting (the sweep then never converges).
-        if not stopping and now - getattr(self, "_vpn_recon_ts", 0.0) >= 5.0:
-            self._vpn_recon_ts = now
-            vpn_up = bool(self._vpn_status)
-            was_up = getattr(self, "_vpn_was_up", False)
-            self._vpn_was_up = vpn_up
-            if vpn_up and not was_up:
-                self._on_vpn_arrived()
 
     def _telemetry_worker(self):
-        """Background loop: sample speed/ping/vpn off the main thread so the
+        """Background loop: sample speed/ping off the main thread so the
         UI never stalls on a slow PowerShell/subprocess or proxy call. Runs
         until self._telemetry_running is cleared (in loop()'s finally)."""
         while self._telemetry_running:
@@ -2108,7 +2234,62 @@ class BTopTui:
                                       f"frozen): {e}")
                     except Exception:
                         pass
-            time.sleep(0.1)
+            time.sleep(0.05)
+
+    def _vpn_poll_worker(self):
+        """Background thread for Windows-VPN status + arrival reconciliation.
+
+        Decoupled from _telemetry_worker(): a get_vpn_status() call is a
+        1-3s PowerShell spawn on AV-scanned machines, so doing it here keeps
+        it off the speed/ping worker - a slow VPN probe no longer starves
+        speed sampling. A connecting VPN is now noticed within ~2s instead of
+        ~5s.
+
+        Status refreshes every 2s while ANY VPN-dependent feature is active
+        (vless-over-vpn, geo-via-VPN, or the live VPN-bypass display) and is
+        suppressed while a stop is sweeping routes - those spawns would race
+        the sweep's PowerShell work and stretch the 'stop still in progress'
+        window out. The same loop reconciles VPN arrival: a connected->up
+        transition re-applies [vpn] bypass entries stuck at 'route pending'
+        and a geo-via-VPN re-apply (see _on_vpn_arrived()).
+
+        _vpn_status is written only by this thread (single writer); str/None
+        attribute reads are GIL-atomic and draw() already reads it unlocked,
+        so no extra lock is introduced. Halts when _telemetry_running clears
+        (loop()'s finally), alongside _telemetry_worker."""
+        while self._telemetry_running:
+            now = time.time()
+            stopping = self._stopping.is_set()
+            want = (getattr(self.ns, "vless_over_vpn", False)
+                    or getattr(self.ns, "geoip", None)
+                    or not getattr(self.ns, "no_vpn_bypass", False))
+            if want:
+                if not stopping and now - self._vpn_cache_ts >= 2.0:
+                    name = None
+                    try:
+                        name = get_vpn_status()
+                    except Exception:
+                        name = None
+                    self._vpn_cache_ts = time.time()
+                    self._vpn_status = name
+                elif stopping:
+                    # Freshen anchors so the first post-stop check isn't
+                    # overdue mid-teardown.
+                    self._vpn_cache_ts = now
+                    self._vpn_recon_ts = now
+            # Arrival reconciliation - detect a connected-up transition and
+            # re-apply whatever was waiting on the VPN.
+            if not stopping and now - self._vpn_recon_ts >= 2.0:
+                self._vpn_recon_ts = now
+                vpn_up = bool(self._vpn_status)
+                was_up = self._vpn_was_up
+                self._vpn_was_up = vpn_up
+                if vpn_up and not was_up:
+                    try:
+                        self._on_vpn_arrived()
+                    except Exception as e:
+                        self._blog(f"[!] VPN-arrival re-apply failed: {e}")
+            time.sleep(0.2)
 
     @property
     def current_speed(self):
@@ -2851,8 +3032,11 @@ class BTopTui:
     _BYPASS_RETRY_MAX = 60.0        # cap for the retry backoff (seconds)
     _BYPASS_REFRESH = 300.0         # re-resolve a healthy entry this often
 
-    def _blog(self, msg):
-        """Log from either thread (the loop drains self.logs every frame)."""
+    def _blog(self, msg, component="DASHBOARD"):
+        """Log from either thread (the loop drains self.logs every frame).
+        ``component`` tags the entry in the structured event log so the
+        diagnostics export can separate e.g. ADAPTER traffic from DASHBOARD
+        state transitions - defaults to "DASHBOARD" for backward compat."""
         try:
             self.logs.put(msg)
         except Exception:
@@ -2860,7 +3044,7 @@ class BTopTui:
         # Mirror into the structured ring for diagnostics and the event panel.
         sev = _LOG_ERROR if msg.startswith("[!]") else (
             _LOG_WARNING if msg.startswith("[*]") else _LOG_INFO)
-        self.event_log.log(sev, "DASHBOARD", msg)
+        self.event_log.log(sev, component, msg)
 
     def _geo_diag_suppress(self, line):
         """Return True if this geoip diagnostic has already been logged this
@@ -3924,14 +4108,6 @@ class BTopTui:
             self._blog("[!] v6 geo routes on the old physical adapter cannot be"
                        " re-pointed (no v6 egress); leaving them in place.")
             return 0
-        del_rows = []
-        for _fam, dest, iface, gw in move_rows:
-            nh = gw if gw and gw not in ("0.0.0.0", "::") else ""
-            del_rows.append((dest, iface, nh))
-        try:
-            self._batch_delete_routes(del_rows)
-        except Exception:
-            pass
         add_rows = []
         for fam, dest, _iface, _gw in move_rows:
             if fam == "v4":
@@ -3944,12 +4120,24 @@ class BTopTui:
             self._blog(f"[!] Could not re-add live geo routes on the new "
                        f"gateway: {e.__class__.__name__}: {e}")
             return 0
-        if not add_rows or not added:
+        if not add_rows or added != len(add_rows):
+            # Keep the old routes as the safe fallback. The batch helper reports
+            # only a count, so do not claim partial replacements as owned routes.
             self._blog(f"[!] Re-pointed 0/{len(move_rows)} live geo route(s) to the new "
                        f"gateway ({new_iface} {new_gw}) - "
-                       f"{'no usable egress' if not add_rows else 'netsh rejected all adds'}"
-                       f"; old entries remain tracked at the dead gateway.")
+                       f"{'no usable egress' if not add_rows else 'not all replacements were accepted'}; "
+                       f"old entries remain tracked.")
             return 0
+        del_rows = []
+        for _fam, dest, iface, gw in move_rows:
+            nh = gw if gw and gw not in ("0.0.0.0", "::") else ""
+            del_rows.append((dest, iface, nh))
+        try:
+            self._batch_delete_routes(del_rows)
+        except Exception:
+            # The new routes are installed. Keep tracking the new egress; the
+            # cleanup/sweep pass can remove any old duplicate later.
+            pass
         moved = 0
         for fam, dest, iface, gw in move_rows:
             try:
@@ -3973,6 +4161,25 @@ class BTopTui:
         them to the new egress too. Non-fatal end to end."""
         if not (self.proc and self.proc.poll() is None):
             return
+        # A gateway transition can interrupt adapter accounting. Start the
+        # next sample as a fresh baseline so the transition cannot become a
+        # false multi-gigabit download/upload spike in the graph.
+        lock = getattr(self, "_tel_lock", None)
+        if lock is not None:
+            with lock:
+                self.baseline_bytes = [None]
+                self._last_raw_rx = None
+                self._last_raw_tx = None
+                for hist in (self.speed_hist, self.rx_hist, self.tx_hist):
+                    hist.clear()
+        else:
+            self.baseline_bytes = [None]
+            self._last_raw_rx = None
+            self._last_raw_tx = None
+            for hist in (getattr(self, "speed_hist", []),
+                         getattr(self, "rx_hist", []),
+                         getattr(self, "tx_hist", [])):
+                hist.clear()
         # Future [A] adds must resolve their egress fresh (the cache names
         # the OLD adapter/gateway now).
         self._iface_cache = None
@@ -4664,10 +4871,10 @@ class BTopTui:
                 self.checks = build_checks(self.ns)
             except Exception as e:
                 self._blog(f"[!] health-check rebuild failed: {e}")
-            self.speed_hist = []
-            self.rx_hist = []
-            self.tx_hist = []
-            self.ping_samples = []
+            self.speed_hist = collections.deque(maxlen=120)
+            self.rx_hist = collections.deque(maxlen=120)
+            self.tx_hist = collections.deque(maxlen=120)
+            self.ping_samples = collections.deque(maxlen=8)
             self.baseline_bytes = [None]
             self._last_raw_rx = None
             self._last_raw_tx = None
@@ -5211,7 +5418,11 @@ class BTopTui:
         self._blog() (the queue the main loop drains) rather than touching
         self.log_lines directly - loop() reassigns self.log_lines every frame,
         and appending from another thread races that and can silently drop
-        lines."""
+        lines.
+
+        When --log-adapter-activity is on, also samples UDP/QUIC connections,
+        ICMP counter deltas and Wintun throughput deltas (component "ADAPTER").
+        All sampling shares the same 5 s throttle as the TCP poll below."""
         now = time.time()
         if now - self._conn_poll_ts < 5.0:
             return
@@ -5265,6 +5476,87 @@ class BTopTui:
                 for d in [d for d, s in self._net_rate.items()
                           if s[0] < cutoff]:
                     self._net_rate.pop(d, None)
+
+        # ── Adapter activity (UDP / QUIC / ICMP / throughput) ───────────────
+        # Off unless --log-adapter-activity was given. Shares the 5 s throttle
+        # above (same _conn_poll_ts guard), so the extra PowerShell calls do
+        # not multiply on the 0.05 s telemetry tick.
+        if not self._log_adapter_activity:
+            return
+
+        # -- UDP / QUIC --
+        for r in _get_udp_connections():
+            key = (r.get("Proc"), r.get("Remote"), r.get("Rport"))
+            if key in self._seen_udp_conns:
+                self._seen_udp_conns.pop(key)
+                self._seen_udp_conns[key] = now
+                continue
+            self._seen_udp_conns[key] = now
+            if len(self._seen_udp_conns) > 500:
+                excess = len(self._seen_udp_conns) - 300
+                for _ in range(excess):
+                    self._seen_udp_conns.pop(next(iter(self._seen_udp_conns)))
+            dest = f"{r.get('Remote')}:{r.get('Rport')}"
+            st = self._net_rate.get(dest)
+            if st is not None and now - st[0] < self._NET_RATE_WINDOW:
+                st[1] += 1
+                continue
+            record = {
+                "proto": r.get("Proto", "UDP"),
+                "src": r.get("Local", ""),
+                "sport": r.get("Lport", ""),
+                "dst": r.get("Remote", ""),
+                "dport": r.get("Rport", ""),
+                "proc": r.get("Proc", ""),
+                "pid": r.get("Pid", 0),
+            }
+            if st is not None and st[1]:
+                record["suppressed"] = st[1]
+            self._blog(json.dumps(record), component="ADAPTER")
+            self._net_rate[dest] = [now, 0]
+            if len(self._net_rate) > 300:
+                cutoff = now - self._NET_RATE_WINDOW
+                for d in [d for d, s in self._net_rate.items()
+                          if s[0] < cutoff]:
+                    self._net_rate.pop(d, None)
+
+        # -- ICMP counter deltas --
+        # _seen_icmp_conns stores the last absolute counters per family; the
+        # delta since the previous poll is logged (first poll just seeds).
+        icmp = _get_icmp_stats()
+        if icmp:
+            parts = []
+            for fam in ("ipv4", "ipv6"):
+                cur = icmp.get(fam)
+                if not cur:
+                    continue
+                prev = self._seen_icmp_conns.get(fam)
+                self._seen_icmp_conns[fam] = cur
+                if prev is None:
+                    continue
+                di = cur["in"] - prev["in"]
+                do = cur["out"] - prev["out"]
+                if di or do:
+                    parts.append(f"{fam}: in={di} out={do}")
+            if parts:
+                self._blog(
+                    "[icmp] " + " | ".join(parts), component="ADAPTER")
+
+        # -- Wintun throughput deltas --
+        # _get_adapter_throughput returns absolute byte counters; diff against
+        # the previous sample and log the delta (first poll just seeds).
+        tp = _get_adapter_throughput()
+        if tp:
+            rx, tx = tp["rx"], tp["tx"]
+            if self._last_adapter_rx is not None:
+                drx = rx - self._last_adapter_rx
+                dtx = tx - self._last_adapter_tx
+                if drx > 0 or dtx > 0:
+                    self._blog(
+                        f"[adapter] wintun: rx={drx}B tx={dtx}B",
+                        component="ADAPTER")
+            self._last_adapter_rx = rx
+            self._last_adapter_tx = tx
 
     def _handle_key(self, key):
         """Handle one logical key press, from either the keyboard or a mouse
@@ -6048,8 +6340,8 @@ class BTopTui:
         else:
             bl.append(f"{BRIGHT}{pal['endpoint']}ROUTED DIRECT{_R}"
                       f"{GRAY} - these never enter the tunnel{_R}")
-        # Live VPN name for the bypass row: the telemetry worker refreshes
-        # self._vpn_status every ~4s while any VPN-dependent feature is on;
+        # Live VPN name for the bypass row: the VPN poll worker refreshes
+        # self._vpn_status every ~2s while any VPN-dependent feature is on;
         # fall back to a one-shot lookup when nothing else sampled it yet.
         _live_vpn = self._vpn_status
         if _live_vpn is None and not getattr(self.ns, "vless_over_vpn", False):
@@ -6926,6 +7218,9 @@ class BTopTui:
         # proxy or PowerShell call can no longer stall keypress handling.
         self._telemetry_running = True
         threading.Thread(target=self._telemetry_worker, daemon=True).start()
+        self._vpn_poll_thread = threading.Thread(
+            target=self._vpn_poll_worker, daemon=True)
+        self._vpn_poll_thread.start()
         # Bypass-entry resolver: normalises entries, resolves them (with the
         # UDP/DoH fallbacks), retries with backoff while they fail, and installs
         # the /32 - /128 bypass routes as soon as they resolve. Off the UI thread
@@ -7067,7 +7362,7 @@ class BTopTui:
                         # milliseconds behind what happened.
                         if not self.logs.empty():
                             break
-                        time.sleep(0.005)
+                        time.sleep(0.002)
                         continue
                     redraw_now = self._handle_key(key)
         finally:
@@ -7258,6 +7553,10 @@ class BTopTui:
             # Fresh tunnel: fresh dedup for [net] lines (ordered dict; see
             # _poll_connections for why a set is no longer used).
             self._seen_conns = {}
+            self._seen_udp_conns = {}
+            self._seen_icmp_conns = {}
+            self._last_adapter_rx = None
+            self._last_adapter_tx = None
             # Fresh tunnel: drop stale prior-run geo categories / progress.
             # Guarded by _geo_lock for consistency with _update_geo_progress()
             # and draw(), even though no reader thread is live at this point.
@@ -8749,6 +9048,16 @@ def main():
                          "Windows VPN instead of the physical adapter or wintun. "
                          "Overrides --geoip-via-vpn. Falls back to wifi when no "
                          "connected Windows VPN default route is found")
+    ap.add_argument("--log-adapter-activity", action="store_true",
+                    dest="log_adapter_activity",
+                    help="Log adapter traffic activity (UDP/TCP/QUIC/ICMP + "
+                         "throughput) to the event log while the tunnel is up. "
+                         "Off by default to avoid log noise.")
+    ap.add_argument("--no-log-adapter-activity", action="store_false",
+                    dest="log_adapter_activity",
+                    help="Disable adapter-traffic activity logging "
+                         "(the default).")
+
 
     args = ap.parse_args()
 

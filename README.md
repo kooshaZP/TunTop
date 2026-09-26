@@ -26,7 +26,12 @@ v2rayN, Xray, sing-box, Clash Meta — any proxy client with a local SOCKS5 inbo
 - IPv4 and IPv6 full-tunnel routing via Wintun + tun2socks
 - DNS resolution fallback (UDP/53 + DoH) with active leak detection —
   and an optional `--dns-policy strict` that refuses to resolve outside
-  a live tunnel instead of falling back
+  a live tunnel instead of falling back. Wintun is preferred as the
+  OS DNS source (lowered interface metric) so a physical adapter's
+  on-link resolver can't win; `[L]` proves nothing escapes.
+- Optional adapter-activity logging (`--log-adapter-activity`) — UDP/QUIC
+  connections, ICMP counter deltas and Wintun throughput deltas land in the
+  structured event log (off by default; saved in your profile)
 - Kill-safe cleanup — verified teardown on every exit
 - Live bypass add/remove without restarting the tunnel
 - Geo-IP country routing from `geoip.dat`

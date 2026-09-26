@@ -21,9 +21,16 @@ from tuntop.ui import dashboard
 def _app():
     app = dashboard.BTopTui.__new__(dashboard.BTopTui)
     app._blog = mock.Mock()
-    app._live_geo_added = []
+    app._live_geo_added = []  # geo routes installed live by the dashboard
     app._iface_cache = ("Wi-Fi", "192.168.1.1")
     app._gw_geo_repoint_active = False
+    app._tel_lock = None
+    app.baseline_bytes = [1]
+    app._last_raw_rx = 1
+    app._last_raw_tx = 1
+    app.speed_hist = [1.0]
+    app.rx_hist = [1.0]
+    app.tx_hist = [1.0]
     return app
 
 
@@ -72,6 +79,33 @@ class TestRerouteLiveGeoRows(unittest.TestCase):
         bd.assert_not_called()
         ba.assert_not_called()
 
+    def test_replacements_are_added_before_old_routes_are_deleted(self):
+        app = _app()
+        app._live_geo_added.append(
+            ("v4", "5.0.0.0/8", "Wi-Fi", "192.168.1.1"))
+        order = []
+        with mock.patch.object(app, "_batch_add_routes",
+                               side_effect=lambda rows: order.append("add") or 1), \
+             mock.patch.object(app, "_batch_delete_routes",
+                               side_effect=lambda rows: order.append("delete") or 1):
+            moved = app._reroute_live_geo_rows(
+                "Wi-Fi", "Ethernet", "10.0.0.1")
+        self.assertEqual(moved, 1)
+        self.assertEqual(order, ["add", "delete"])
+
+    def test_partial_replacement_keeps_old_routes(self):
+        app = _app()
+        app._live_geo_added.append(
+            ("v4", "5.0.0.0/8", "Wi-Fi", "192.168.1.1"))
+        with mock.patch.object(app, "_batch_add_routes", return_value=0), \
+             mock.patch.object(app, "_batch_delete_routes") as delete:
+            moved = app._reroute_live_geo_rows(
+                "Wi-Fi", "Ethernet", "10.0.0.1")
+        self.assertEqual(moved, 0)
+        delete.assert_not_called()
+        self.assertIn(("v4", "5.0.0.0/8", "Wi-Fi", "192.168.1.1"),
+                      app._live_geo_added)
+
 
 class TestOnGatewayChanged(unittest.TestCase):
     MARKER = ("[GATEWAY] Physical egress changed: "
@@ -90,6 +124,12 @@ class TestOnGatewayChanged(unittest.TestCase):
                                return_value=3) as rg:
             app._on_gateway_changed(self.MARKER)
             rb.assert_called_once()
+            self.assertEqual(app.baseline_bytes, [None])
+            self.assertIsNone(app._last_raw_rx)
+            self.assertIsNone(app._last_raw_tx)
+            self.assertEqual(list(app.speed_hist), [])
+            self.assertEqual(list(app.rx_hist), [])
+            self.assertEqual(list(app.tx_hist), [])
             deadline = time.time() + 5
             while rg.call_count == 0 and time.time() < deadline:
                 time.sleep(0.02)

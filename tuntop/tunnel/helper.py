@@ -296,7 +296,11 @@ def _baseline_control_file():
 # ledgers below track what to undo on cleanup (thread-safe, metric-faithful).
 vpn_override_routes = RouteLedger("vpn-override")
 vpn_saved_routes = []        # original VPN routes we shadowed (for restoration)
-wintun_saved_metric = None    # Wintun InterfaceMetric to restore on exit
+# Wintun InterfaceMetric saved per family so cleanup() can restore the EXACT
+# originals the user had before we lowered them to 2 (below VPN ~25 and the
+# physical adapter's typical ~4270). Captured once on the first set and left
+# alone on later re-sets (idempotent re-apply in self_heal / VPN-shadow path).
+wintun_saved_metric = {"v4": None, "v6": None}
 vpn_override_iface = None     # connected VPN interface we shadowed (set in main)
 phys_bypass_metric_saved = None  # physical (geo) InterfaceMetric to restore on exit
 phys_bypass_iface = None
@@ -387,6 +391,12 @@ def get_ipv6_default():
     VPN-endpoint or geoip bypasses.  Falls back to excluding only
     wintun when no non-VPN IPv6 default route exists at all.
 
+    On-link IPv6 routes (NextHop = '::') are ACCEPTED: they are the normal
+    form of an IPv6 default route on most physical adapters (the next-hop is
+    resolved via neighbor discovery, so there is no gateway address).  An
+    on-link NextHop is normalized to '' so callers (add_v6, the geo installer)
+    treat it as an on-link install with no gateway token.
+
     Returns {"InterfaceAlias":..,"NextHop":..} or None.  IPv6 may legitimately
     be absent, so this must NOT sys.exit() the way get_ipv4_default() does.
     """
@@ -394,7 +404,7 @@ def get_ipv6_default():
         _tun_alias_powershell() + _vpn_alias_powershell() + r"""
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
     Where-Object {
-        $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and
+        $_.State -eq 'Alive' -and
         $tunAliases -notcontains $_.InterfaceAlias -and
         ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
     } |
@@ -403,7 +413,7 @@ $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction Sil
 if ($null -eq $r) {
     # Last resort only: any non-wintun IPv6 default route (may be the VPN).
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -ne '::' -and $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
+        Where-Object { $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
         Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
         Select-Object -First 1 NextHop, InterfaceAlias
 }
@@ -412,6 +422,12 @@ $r | ConvertTo-Json -Compress
 """
     )
     d = ps_json(ps)
+    # IPv6 on-link routes report NextHop '::' (unspecified address).  Normalize
+    # to '' so downstream installers get an on-link route (no gateway token)
+    # instead of passing '::' as a bogus next-hop.  Mirrors IPv4's '0.0.0.0' -> ''
+    # normalization in _route_identity_present / _norm_gw.
+    if d and str(d.get("NextHop", "")).strip() == "::":
+        d["NextHop"] = ""
     return d
 
 
@@ -574,15 +590,20 @@ $best | Select-Object NextHop, InterfaceAlias, InterfaceIndex | ConvertTo-Json -
 def get_vpn_ipv6_default(vpn_interface=None):
     """IPv6 counterpart of get_vpn_ipv4_default. Most Windows VPN profiles
     (PPTP in particular) are IPv4-only, so returning None here is normal
-    and expected, not an error."""
+    and expected, not an error.
+
+    On-link IPv6 routes (NextHop = '::') are accepted and normalized to ''
+    so the caller installs them as on-link routes - the same treatment
+    get_ipv6_default() gives the physical IPv6 default."""
     if vpn_interface:
         d = ps_json(rf"""
 $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias '{ps_quote(vpn_interface)}' -ErrorAction SilentlyContinue |
-    Where-Object {{$_.NextHop -ne '::'}} |
     Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {{ exit 1 }}
 $r | ConvertTo-Json -Compress
 """)
+        if d and str(d.get("NextHop", "")).strip() == "::":
+            d["NextHop"] = ""
         return (d["InterfaceAlias"], d["NextHop"]) if d else None
 
     ps = r"""
@@ -595,7 +616,6 @@ $names = @(
 $best = $null
 foreach ($n in $names) {
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -InterfaceAlias $n -ErrorAction SilentlyContinue |
-        Where-Object {$_.NextHop -ne '::'} |
         Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
     if ($r) { $best = $r; break }
 }
@@ -608,6 +628,8 @@ if ($null -eq $best) { exit 1 }
 $best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
 """
     d = ps_json(ps)
+    if d and str(d.get("NextHop", "")).strip() == "::":
+        d["NextHop"] = ""
     return (d["InterfaceAlias"], d["NextHop"]) if d else None
 
 
@@ -1053,6 +1075,18 @@ def configure_tun(dns4=None, dns6=None):
         # through the TUN proves unreliable.
         pass
 
+    # Prefer Wintun for DNS at the OS level: lower the Wintun adapter's
+    # InterfaceMetric below the physical adapter's so Windows selects Wintun
+    # (not a DHCP-assigned physical-NIC resolver such as 192.168.1.1) when
+    # building the DNS server selection order for the configured public
+    # resolvers. The split-defaults (0.0.0.0/1, ::/1) already pull the public
+    # resolvers through the TUN; this metric step closes the on-link gap where
+    # a physical adapter's *local* resolver would otherwise win. Targets 2, the
+    # same value the Windows-VPN shadow path uses, so regular and VPN paths
+    # converge on identical precedence. Re-applied by wait_for_tunnel_stable's
+    # DoH re-call and by self_heal_tunnel() (both go through configure_tun()).
+    _set_wintun_interface_metric(2)
+
 
 def get_existing_v4_routes(dest):
     """Return existing IPv4 routes for an exact destination prefix."""
@@ -1207,6 +1241,10 @@ def add_v6(dest, iface, gateway=None, metric=1):
     for r in existing:
         r_iface = str(r.get("InterfaceAlias", ""))
         r_gw = str(r.get("NextHop", "") or "")
+        # IPv6 on-link routes report NextHop '::' (unspecified) - normalize
+        # to '' so it compares equal to an on-link install (gateway='').
+        if r_gw == "::":
+            r_gw = ""
         same_iface = r_iface.lower() == iface.lower()
         same_gateway = r_gw == (gateway or "")
         if same_iface and same_gateway:
@@ -1329,20 +1367,36 @@ def _vpn_self_addresses(iface):
 
 
 def _set_wintun_interface_metric(metric):
-    """Set the Wintun adapter's InterfaceMetric (lower = more preferred). Saves
-    the previous value in wintun_saved_metric so cleanup can restore it. Best-effort."""
+    """Lower BOTH IPv4 and IPv6 InterfaceMetric on the Wintun adapter for the
+    `metric` argument (lower = more preferred). Windows DNS-client server
+    selection AND next-hop resolution are metric-ordered, so making Wintun
+    decisively preferred stops a DHCP-assigned physical adapter (e.g. its
+    on-link 192.168.1.1 resolver) from winning DNS lookups over the tunnel.
+
+    The previous value is saved per-family in wintun_saved_metric so cleanup()
+    can restore the exact originals. The save is captured ONCE: wintun_saved_metric
+    is only written when it is still None for that family, so re-calling this on
+    a self-heal or in the VPN-shadow path (override_vpn_routes) is idempotent and
+    never clobbers the real starting metric. Best-effort: never raises, so a
+    non-elevated session or an oddly-named adapter can't fail bring-up."""
     global wintun_saved_metric
-    try:
-        ps = (f"$a = Get-NetIPInterface -InterfaceAlias '{TUN}' -AddressFamily IPv4 "
-              f"-ErrorAction SilentlyContinue | Select-Object -First 1 InterfaceMetric; "
-              f"if ($a) {{ $a.InterfaceMetric }} else {{ 'NONE' }}")
-        _, out, _ = run_ps(ps)
-        cur = out.strip()
-        if cur and cur != "NONE" and cur.isdigit():
-            wintun_saved_metric = int(cur)
-        run_ps(f"Set-NetIPInterface -InterfaceAlias '{TUN}' -InterfaceMetric {metric}")
-    except Exception:
-        pass
+    if not isinstance(wintun_saved_metric, dict):
+        wintun_saved_metric = {"v4": None, "v6": None}
+    for fam, key in (("IPv4", "v4"), ("IPv6", "v6")):
+        try:
+            ps = (f"$a = Get-NetIPInterface -InterfaceAlias '{TUN}' "
+                  f"-AddressFamily {fam} -ErrorAction SilentlyContinue | "
+                  f"Select-Object -First 1 InterfaceMetric; "
+                  f"if ($a) {{ $a.InterfaceMetric }} else {{ 'NONE' }}")
+            _, out, _ = run_ps(ps)
+            cur = out.strip()
+            if cur and cur != "NONE" and cur.isdigit():
+                if wintun_saved_metric.get(key) is None:
+                    wintun_saved_metric[key] = int(cur)
+            run_ps(f"Set-NetIPInterface -InterfaceAlias '{TUN}' -AddressFamily {fam} "
+                   f"-InterfaceMetric {metric}")
+        except Exception:
+            pass
 
 
 def _raw_add_route(fam, dest, iface, gateway, metric):
@@ -1965,11 +2019,16 @@ _gw_pending_since = 0.0
 
 
 def _repoint_geo_batch(rows):
-    """Batch-add (fam, dest, iface, gw) rows via netsh -f scripts - the SAME
-    fast path add_geoip_bypass() uses for the initial install. Never raises."""
+    """Batch-add replacement routes and return the number netsh accepted.
+
+    Replacement routes are intentionally added before the old routes are
+    removed by _repoint_geo_routes().  A gateway transition must not create a
+    window where a large country prefix falls through the Wintun default.
+    """
     if not rows:
-        return
+        return 0
     chunks = [rows[i:i + GEO_SUB_BATCH] for i in range(0, len(rows), GEO_SUB_BATCH)]
+    accepted = 0
 
     def _add_chunk(grp):
         lines = []
@@ -1983,7 +2042,12 @@ def _repoint_geo_batch(rows):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
-            run(["netsh", "-f", path], timeout=GEO_SUB_TIMEOUT)
+            code, out, _err = run(["netsh", "-f", path], timeout=GEO_SUB_TIMEOUT)
+            if code:
+                return 0
+            return sum(1 for line in (out or "").splitlines()
+                       if line.strip() == "Ok."
+                       or "already exists" in line.lower())
         finally:
             try:
                 os.unlink(path)
@@ -1995,17 +2059,19 @@ def _repoint_geo_batch(rows):
         for _fut in concurrent.futures.as_completed(
                 [ex.submit(_add_chunk, c) for c in chunks]):
             try:
-                _fut.result()
+                accepted += _fut.result()
             except Exception:
                 pass
+    return accepted
 
 
 def _repoint_geo_routes(old_iface, new_iface, new_gw):
-    """Re-point every geoip bypass route that was installed via the OLD
-    physical interface at the NEW default gateway (and, for IPv6, at the
-    current native v6 default). Bulk-deletes the old-gw copies, batch-adds
-    the replacements and rewrites geoip_added so a later cleanup() removes
-    exactly what is in the table. Returns how many routes were re-added."""
+    """Re-point geo routes without opening a Wintun fallback window.
+
+    Add replacements first, then remove the old-gateway copies. If any
+    replacement cannot be installed, leave the old routes/tracking intact for
+    the next gateway check instead of opening a routing gap.
+    """
     rows = [it for it in list(geoip_added)
             if str(it[2]).lower() == str(old_iface).lower()]
     if not rows:
@@ -2021,9 +2087,15 @@ def _repoint_geo_routes(old_iface, new_iface, new_gw):
             if d6:
                 new_rows.append((fam, dest, d6["InterfaceAlias"],
                                  d6.get("NextHop") or ""))
+    if not new_rows:
+        return 0
+    accepted = _repoint_geo_batch(new_rows)
+    if accepted != len(new_rows):
+        # Keep the old routes as the safe fallback. The batch helper reports
+        # only a count, so do not claim partial replacements as owned routes;
+        # the normal CIDR cleanup/sweep pass handles any uncertain leftovers.
+        return 0
     _remove_routes_bulk(rows)
-    if new_rows:
-        _repoint_geo_batch(new_rows)
     # Tracking rewrite under the state lock: cleanup() may be snapshotting
     # geoip_added concurrently (teardown during a gateway change) - without
     # the lock a removed row could leak or a new row could vanish.
@@ -2432,19 +2504,39 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
                       f"[!] geoip:{code} bypass skipped (every CIDR overlaps a "
                       f"protected endpoint/bypass prefix).")
             return []
+    # The parsed CIDR counts are NOT installation counts.  A machine can have
+    # thousands of country IPv6 prefixes in geoip.dat but no usable native IPv6
+    # egress (for example, a Wi-Fi link with only a link-local address and no
+    # physical ::/0 route).  In that case v6iface/v6gw are None and the v6
+    # batches are correctly omitted below.  Say that explicitly instead of
+    # printing "Installing ... 1036 IPv6" and then scheduling only IPv4.
+    v4_egress = bool(v4) and bool(iface) and gateway is not None
+    v6_egress = bool(v6) and bool(v6iface) and v6gw is not None
+    if v4_egress:
+        gateway_msg = (f"gw={gateway}" if gateway else
+                       "no gateway - on-link")
+        v4_msg = f"{len(v4)} IPv4 via {iface} ({gateway_msg})"
+    else:
+        v4_msg = (f"{len(v4)} IPv4 skipped (no usable IPv4 egress - "
+                  "no IPv4 default route/interface selected)")
+    if v6_egress:
+        v6_msg = f"{len(v6)} IPv6"
+    elif v6:
+        v6_msg = (f"{len(v6)} IPv6 skipped (no usable IPv6 egress - "
+                  "no IPv6 default route/interface selected)")
+    else:
+        v6_msg = "0 IPv6"
     print(f"[*] Installing geoip:{code} bypass "
-          f"({len(v4)} IPv4, {len(v6)} IPv6) via {iface} "
-          f"(gw={gateway})" if gateway else
-          f"[*] Installing geoip:{code} bypass "
-          f"({len(v4)} IPv4, {len(v6)} IPv6) via {iface} "
-          f"(no gateway - on-link)", flush=True)
+          f"({v4_msg}; {v6_msg})", flush=True)
+    scheduled_total = ((len(v4) if v4_egress else 0)
+                       + (len(v6) if v6_egress else 0))
     # Heartbeat BEFORE the slow pre-install passes below.  The dashboard's
     # startup watchdog extends its grace window while [GEO-LOAD] markers keep
     # arriving; without this early marker the metric fix + conflict sweep
     # (both PowerShell) run in total marker silence and a legitimate-but-slow
     # install gets killed at the plain startup timeout ("helper hung for 90s"
     # right after "Installing geoip..." - the exact report from the field).
-    print(f"[GEO-LOAD] code={code} loaded=0 total={len(v4) + len(v6)}", flush=True)
+    print(f"[GEO-LOAD] code={code} loaded=0 total={scheduled_total}", flush=True)
     # Direct (physical) geo case: a self-healing Windows VPN re-injects its own
     # routes for these exact CIDRs, so beating it requires the physical
     # interface metric to sit below the VPN's.  No-op when geo is routed via
@@ -2470,7 +2562,7 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
     # Heartbeat: the sweep above can take a while on a bloated route table -
     # tell the dashboard it is still alive before the sub-batch installs start
     # emitting their own markers.
-    print(f"[GEO-LOAD] code={code} loaded=0 total={len(v4) + len(v6)}", flush=True)
+    print(f"[GEO-LOAD] code={code} loaded=0 total={scheduled_total}", flush=True)
 
     # Install the routes in sub-batches of GEO_SUB_BATCH entries.  Each sub-batch
     # is a single `netsh -f` script (one netsh process for the whole batch, not
@@ -2523,12 +2615,11 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
             return
         netsh_verb = "ipv4" if fam == "v4" else "ipv6"
         iface_dq = '"' + str(ifa).replace('"', '') + '"'
-        gw_part = str(gw) if gw else ""
-        # The CIDR is passed BARE - netsh treats single/double quotes around the
-        # prefix as part of the token and rejects it ("Invalid prefix parameter
-        # ('5.72.0.0/15')").  Only the interface name (which can contain spaces
-        # like "Wi-Fi") is quoted.
-        lines = ["interface %s add route %s %s %s metric=1 store=active"
+        # IPv6 on-link routes have gw='' (or '::', already normalized to ''
+        # upstream).  netsh requires the gateway part to be omitted entirely
+        # for on-link routes - a bare double-space token is rejected.
+        gw_part = (" " + str(gw)) if gw else ""
+        lines = ["interface %s add route %s %s%s metric=1 store=active"
                  % (netsh_verb, r, iface_dq, gw_part) for r in grp]
         fd, path = tempfile.mkstemp(suffix=".txt", prefix="geo_")
         try:
@@ -2757,14 +2848,23 @@ def cleanup():
         except subprocess.TimeoutExpired:
             tun2_proc.kill()
 
-    # Restore Wintun's original interface metric.
-    if wintun_saved_metric is not None:
-        try:
-            run_ps(f"Set-NetIPInterface -InterfaceAlias '{TUN}' "
-                    f"-InterfaceMetric {wintun_saved_metric}")
-        except Exception:
-            pass
-        wintun_saved_metric = None
+    # Restore Wintun's original per-family interface metric (only the families
+    # we actually lowered). Restore per AddressFamily so an IPv6 value never lands
+    # on IPv4 and vice-versa. Robust to the legacy int/None shape so a stale
+    # module state (or a test that sets the global to None) can't crash cleanup.
+    saved = wintun_saved_metric if isinstance(wintun_saved_metric, dict) else None
+    if saved is not None and (
+            saved.get("v4") is not None or saved.get("v6") is not None):
+        for fam, key in (("IPv4", "v4"), ("IPv6", "v6")):
+            val = saved.get(key)
+            if val is None:
+                continue
+            try:
+                run_ps(f"Set-NetIPInterface -InterfaceAlias '{TUN}' "
+                       f"-AddressFamily {fam} -InterfaceMetric {val}")
+            except Exception:
+                pass
+        wintun_saved_metric = {"v4": None, "v6": None}
 
     # LAST: the long pole. Bulk-remove geoip bypass routes (can be thousands
     # of entries) - if the OS kills us during THIS, only geo routes survive,

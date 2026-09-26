@@ -123,22 +123,17 @@ class TestRepointGeoRoutes(_HelperStateCase):
             ("v4", "2.16.0.0/20", "Ethernet", "10.0.0.1"),   # other egress
             ("v6", "2606:4700::/32", "Wi-Fi", "fe80::1"),
         ])
-        with mock.patch.object(H, "_remove_routes_bulk") as rm, \
-             mock.patch.object(H, "_repoint_geo_batch") as batch, \
+        order = []
+        with mock.patch.object(H, "_remove_routes_bulk",
+                               side_effect=lambda rows: order.append("delete")), \
+             mock.patch.object(H, "_repoint_geo_batch",
+                               side_effect=lambda rows: order.append("add") or len(rows)), \
              mock.patch.object(H, "get_ipv6_default",
                                return_value={"InterfaceAlias": "Wi-Fi",
                                              "NextHop": "fe80::9"}):
             n = H._repoint_geo_routes("Wi-Fi", "Wi-Fi", "192.168.2.1")
         self.assertEqual(n, 3)
-        rm.assert_called_once()
-        self.assertEqual(sorted(rm.call_args[0][0]),
-                         [("v4", "31.13.0.0/16", "Wi-Fi", "192.168.1.1"),
-                          ("v4", "5.0.0.0/8", "Wi-Fi", "192.168.1.1"),
-                          ("v6", "2606:4700::/32", "Wi-Fi", "fe80::1")])
-        self.assertEqual(sorted(batch.call_args[0][0]),
-                         [("v4", "31.13.0.0/16", "Wi-Fi", "192.168.2.1"),
-                          ("v4", "5.0.0.0/8", "Wi-Fi", "192.168.2.1"),
-                          ("v6", "2606:4700::/32", "Wi-Fi", "fe80::9")])
+        self.assertEqual(order, ["add", "delete"])
         # tracking rewritten: old rows gone, new rows in, foreign row kept
         self.assertNotIn(("v4", "5.0.0.0/8", "Wi-Fi", "192.168.1.1"),
                          H.geoip_added)
@@ -155,7 +150,7 @@ class TestRepointGeoRoutes(_HelperStateCase):
             n = H._repoint_geo_routes("Wi-Fi", "Wi-Fi", "192.168.2.1")
         self.assertEqual(n, 0)
         batch.assert_not_called()
-        rm.assert_called_once()          # old copies still removed
+        rm.assert_not_called()  # old route remains as the safe fallback
 
 
 class TestCheckGatewayChange(_HelperStateCase):

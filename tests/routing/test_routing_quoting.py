@@ -111,12 +111,18 @@ class TestHealthCheckScriptQuoting(unittest.TestCase):
             scripts.append(code)
             return True, ""
 
+        def fake_resolve_cached(host):
+            if host == "Bob's server":
+                return ["1.2.3.4"], ["2606:4700::1111"]
+            return [], []
+
         stubs = {name: (lambda *a, **k: (True, "stub"))
                  for name in ("_tcp", "_https", "_socks_greeting",
                               "_socks_connect_domain", "_socks_request",
                               "_socks_request_v6", "_check_udp_assoc",
                               "_leak_check", "_ipv6_tun_verdict")}
         with mock.patch.object(dash, "_ps", fake_ps), \
+                mock.patch.object(dash, "_resolve_cached", fake_resolve_cached), \
                 mock.patch.multiple(dash, **stubs):
             for _label, fn in dash.build_checks(ns):
                 try:
@@ -136,12 +142,15 @@ class TestHealthCheckScriptQuoting(unittest.TestCase):
         self.assertTrue(hits)
         self.assertTrue(any("bob''s bypass" in s.lower() for s in hits))
 
-    def test_server_route_lookup_is_escaped(self):
+    def test_server_route_lookup_uses_resolved_ips_not_hostname(self):
         scripts = self._scripts(self._ns())
-        hits = [s for s in scripts if "Find-NetRoute -RemoteIPAddress" in s]
+        hits = [s for s in scripts
+                if "$ips = @('1.2.3.4','2606:4700::1111')" in s]
         self.assertTrue(hits)
-        self.assertTrue(any("-RemoteIPAddress 'Bob''s server'" in s
-                            for s in hits))
+        for script in hits:
+            self.assertIn("$ips = @('1.2.3.4','2606:4700::1111')", script)
+            self.assertNotIn("Bob's server", script)
+            self.assertNotIn("bob's server", script.lower())
 
     def test_udp_connect_and_ping_use_escaped_dns(self):
         scripts = self._scripts(self._ns())
@@ -162,7 +171,7 @@ class TestHealthCheckScriptQuoting(unittest.TestCase):
         self.assertTrue(hits)
         for s in hits:
             self.assertIn(f"@('{cfgdef.TUN}','{cfgdef.TUN2}')", s)
-            self.assertIn("-contains $r.InterfaceAlias", s)
+            self.assertIn("-contains $_.InterfaceAlias", s)
 
     def test_proxy_loop_check_uses_shared_tun_driver_regex(self):
         from tuntop.network import egress_scripts as es
