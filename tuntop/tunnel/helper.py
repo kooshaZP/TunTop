@@ -3700,6 +3700,70 @@ _VERIFY_URLS = [
 
 _VERIFY_PRINT_LOCK = threading.Lock()
 
+#: DNS-FREE tunnel liveness targets: LITERAL addresses, so no resolver is
+#: consulted and nothing unbounded can be waited on. A TCP connect through the
+#: TUN to one of these proves the tunnel forwards packets, which is the
+#: question the URL round can only answer as a side effect.
+_VERIFY_LITERAL_TCP = (("1.1.1.1", 443), ("8.8.8.8", 443), ("9.9.9.9", 443))
+#: Per-connect ceiling. These are fat anycast edges: connected in ~100ms or
+#: not at all, so this is generous.
+_VERIFY_LITERAL_TIMEOUT = 3.0
+
+
+def _probe_tunnel_no_dns(timeout=None):
+    """(ok, msg) - can the TUN carry a TCP connection to a LITERAL address?
+
+    This is the check that makes the start sequence fast and the log readable.
+    The URL probes all begin with `getaddrinfo`, which has NO timeout: when
+    plain UDP/53 cannot traverse the tunnel - the normal state for a SOCKS5
+    client whose UDP relay does not work - Windows walks EVERY configured
+    resolver (here 8.8.8.8 *and* an IPv6 one) with its own multi-second
+    timeouts, so each of the four URLs cost 5-10s of pure resolver waiting to
+    report the same thing, twice (plain round, then DoH round). That was the
+    "Verifying the tunnel is stable..." spinner and the wall of
+    "DNS resolve ... getaddrinfo failed" lines.
+
+    Connecting to a literal IP skips the resolver entirely: it answers "is the
+    tunnel forwarding packets?" in about a tenth of a second, which is the
+    only question the start sequence actually needs answered. A failure here
+    is a genuinely broken tunnel, and a success here means any later DNS
+    failure is a RESOLVER problem - which the DoH escalation fixes, not more
+    URL retries.
+
+    Probed concurrently, first success wins."""
+    import socket as _socket
+    limit = _VERIFY_LITERAL_TIMEOUT if timeout is None else timeout
+    if limit <= 0:
+        return False, "no time left in the verification budget"
+
+    def _one(host, port):
+        try:
+            with _socket.create_connection((host, port), timeout=limit):
+                return True
+        except Exception as e:
+            return False, f"{host}:{port} {e}"
+
+    ex = concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(_VERIFY_LITERAL_TCP))
+    try:
+        futs = [ex.submit(_one, h, p) for h, p in _VERIFY_LITERAL_TCP]
+        concurrent.futures.wait(futs, timeout=limit)
+        last = ""
+        for (host, port), f in zip(_VERIFY_LITERAL_TCP, futs):
+            if not f.done() or f.cancelled():
+                continue
+            res = f.result()
+            if res is True:
+                return True, f"TUN carries TCP to {host}:{port}"
+            if isinstance(res, tuple):
+                last = res[1]
+        return False, last or "no literal endpoint answered"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
 #: Wall-clock ceiling for the WHOLE start-sequence verification
 #: (both rounds, including the DoH escalation). The tunnel is installed and
 #: carrying traffic before this runs - it is a health signal, not a readiness
@@ -3711,6 +3775,10 @@ _VERIFY_BUDGET = 18.0
 #: Per-round ceiling. The first round races 4 endpoints; the DoH round gets
 #: whatever is left of the total budget.
 _VERIFY_ROUND_BUDGET = 8.0
+#: Once the tunnel is known to forward packets, this many consecutive
+#: getaddrinfo failures mean the RESOLVER is the problem - not the tunnel.
+#: Reaching it skips the remaining doomed round and goes straight to DoH.
+_VERIFY_DNS_GIVEUP = 1
 
 
 def _verify_worker(url, timeout, attempts, tag, shared):
@@ -3741,12 +3809,21 @@ def _verify_worker(url, timeout, attempts, tag, shared):
             if shared["ok"]:
                 return
             shared["last_err"] = msg.split(": ", 1)[-1] if ": " in msg else msg
-            print(f"    [{i}/{attempts}]{tag} {url}: {msg}", flush=True)
+            if dns_fail:
+                # Every URL is racing the same broken resolver, so the
+                # per-attempt line is pure repetition: the round already
+                # speaks for itself with one line. The user's log used to
+                # fill with a dozen identical "DNS resolve ... getaddrinfo
+                # failed" entries, which said nothing except that the
+                # resolver was down.
+                shared["dns_seen"] = True
+                shared["dns_urls"] = shared.get("dns_urls", 0) + 1
+            else:
+                print(f"    [{i}/{attempts}]{tag} {url}: {msg}", flush=True)
         if dns_fail:
             dns_fails += 1
-            if dns_fails >= 1:
+            if dns_fails >= _VERIFY_DNS_GIVEUP:
                 return   # give up on this URL - let the DoH escalation take over
-            time.sleep(1)
         else:
             time.sleep(2)
 
@@ -3783,16 +3860,39 @@ def wait_for_tunnel_stable(timeout=5, budget=None):
     "Verifying..." spinner for a tunnel the user can actually use.
     """
     global _ACTIVE_DNS_MODE
-    shared = {"ok": False, "msg": "", "last_err": ""}
+    shared = {"ok": False, "msg": "", "last_err": "", "dns_seen": False}
     deadline = time.monotonic() + (budget if budget is not None
                                    else _VERIFY_BUDGET)
 
     def _remaining():
         return max(0.0, deadline - time.monotonic())
 
+    # ── Stage 1: is the TUN forwarding packets AT ALL? ───────────────────
+    # Answered with a LITERAL TCP connect, so no resolver is involved and
+    # nothing unbounded can be waited on. This is what makes the start fast:
+    # without it the four URL probes each pay an un-timed-out getaddrinfo
+    # sweep (5-10s apiece when plain UDP/53 cannot cross the tunnel) to report
+    # the same resolver failure, and then the DoH round pays it all again.
+    if _remaining() > 0.5:
+        _tcp_ok, _tcp_msg = _probe_tunnel_no_dns(
+            timeout=min(_VERIFY_LITERAL_TIMEOUT, _remaining()))
+        if not _tcp_ok:
+            print(f"[!] Tunnel is not carrying traffic: a direct TCP connect "
+                  f"through the TUN to a literal address failed ({_tcp_msg}). "
+                  "This is a routing/tun2socks problem, not a DNS problem - "
+                  "not retrying name resolution, the monitor will re-check.",
+                  flush=True)
+            return False
+        # The tunnel forwards. From here on any failure is a RESOLVER failure,
+        # which the DoH escalation below fixes - more URL retries would only
+        # re-run the same doomed sweep.
+        print(f"[*] TUN carries traffic ({_tcp_msg}) - verifying name "
+              "resolution...", flush=True)
+
     def _run_round(tag="", round_budget=None):
         shared["ok"] = False
         shared["msg"] = ""
+        shared["dns_seen"] = False
         stop_at = time.monotonic() + (round_budget if round_budget is not None
                                       else _VERIFY_ROUND_BUDGET)
         # NOT a `with ThreadPoolExecutor(...)` block. The context manager's
@@ -3827,10 +3927,21 @@ def wait_for_tunnel_stable(timeout=5, budget=None):
     if _run_round():
         return True
 
-    print(f"[!] All verification endpoints failed (last: "
-          f"{shared['last_err'] or 'no probe answered'}). "
-          f"Routes are installed but egress through the TUN is not working yet.",
-          flush=True)
+    # The tunnel forwards packets (stage 1 proved it), so every URL failing on
+    # getaddrinfo means the RESOLVER cannot be reached through it - the exact
+    # state DoH over TCP/443 fixes. Say it once, in the terms the user can act
+    # on, instead of the same "DNS resolve ... getaddrinfo failed" line four
+    # more times.
+    if shared.get("dns_seen"):
+        print(f"[!] Name resolution through the TUN is not working (last: "
+              f"{shared['last_err'] or 'getaddrinfo failed'}). The tunnel "
+              "itself is fine; plain UDP/53 cannot cross it, so DNS is being "
+              "escalated to DoH over TCP/443.", flush=True)
+    else:
+        print(f"[!] All verification endpoints failed (last: "
+              f"{shared['last_err'] or 'no probe answered'}). "
+              f"Routes are installed but egress through the TUN is not working yet.",
+              flush=True)
 
     # Auto-escalate to DoH if plain DNS appears broken.
     if _ACTIVE_DNS_MODE == "auto" and _remaining() > 1.0:

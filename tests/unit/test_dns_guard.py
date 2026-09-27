@@ -737,6 +737,96 @@ class TestSingleInstance(unittest.TestCase):
         self.assertGreater(handle, 0)
 
 
+class TestSessionFileRetirement(unittest.TestCase):
+    """A CLEAN exit must not leave its own scratch files behind.
+
+    The user was left with `.last_run.json`, `.tuntop_control.json` and a
+    session log in the exe folder after simply closing the app. The crash
+    marker was already handled; the live-reconfig control file (rewritten on
+    every [N]/[V]/[Y] change) and the session log were not - and the control
+    file is not merely untidy, a stale one is what the next launch's baseline
+    has to reason around.
+    """
+
+    def test_clean_exit_removes_control_file_and_session_log(self):
+        from tuntop.ui import dashboard
+        with tempfile.TemporaryDirectory() as d:
+            control = os.path.join(d, ".tuntop_control.json")
+            log = os.path.join(d, "tuntop_session_20260928.log")
+            log1 = os.path.join(d, "tuntop_session_20260928.log.1")
+            for p in (control, log, log1):
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write("x")
+            with mock.patch.object(dashboard, "_control_file_path",
+                                   return_value=control), \
+                    mock.patch.object(dashboard, "_session_file_dir",
+                                      return_value=d):
+                removed = dashboard._retire_session_files()
+            self.assertIn(".tuntop_control.json", removed)
+            self.assertIn("tuntop_session_20260928.log", removed)
+            self.assertIn("tuntop_session_20260928.log.1", removed)
+            for p in (control, log, log1):
+                self.assertFalse(os.path.exists(p), f"{p} survived a clean exit")
+
+    def test_unrelated_files_are_untouched(self):
+        from tuntop.ui import dashboard
+        with tempfile.TemporaryDirectory() as d:
+            keep = os.path.join(d, "tun2socks-windows-amd64-v3.exe")
+            other = os.path.join(d, "notes.log")
+            for p in (keep, other):
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write("x")
+            with mock.patch.object(dashboard, "_control_file_path",
+                                   return_value=os.path.join(d, "nope.json")), \
+                    mock.patch.object(dashboard, "_session_file_dir",
+                                      return_value=d):
+                dashboard._retire_session_files()
+            self.assertTrue(os.path.isfile(keep))
+            self.assertTrue(os.path.isfile(other))
+
+    def test_missing_files_are_not_an_error(self):
+        from tuntop.ui import dashboard
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(dashboard, "_control_file_path",
+                                   return_value=os.path.join(d, "gone.json")), \
+                    mock.patch.object(dashboard, "_session_file_dir",
+                                      return_value=d):
+                self.assertEqual(dashboard._retire_session_files(), [])
+
+    def test_a_locked_file_does_not_stop_the_rest(self):
+        """An AV scanner holding one file open must not strand the others."""
+        from tuntop.ui import dashboard
+        with tempfile.TemporaryDirectory() as d:
+            control = os.path.join(d, ".tuntop_control.json")
+            log = os.path.join(d, "tuntop_session_20260928.log")
+            for p in (control, log):
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write("x")
+            real_unlink = os.unlink
+
+            def _unlink(path, *a, **k):
+                if path == control:
+                    raise PermissionError("in use")
+                return real_unlink(path, *a, **k)
+
+            with mock.patch.object(dashboard, "_control_file_path",
+                                   return_value=control), \
+                    mock.patch.object(dashboard, "_session_file_dir",
+                                      return_value=d), \
+                    mock.patch("os.unlink", _unlink):
+                removed = dashboard._retire_session_files()
+            self.assertIn("tuntop_session_20260928.log", removed)
+            self.assertNotIn(".tuntop_control.json", removed)
+
+    def test_only_the_verified_clean_branch_calls_it(self):
+        """On an UNCLEAN exit these files must SURVIVE - that is exactly when
+        they are evidence."""
+        from tuntop.ui import dashboard
+        src = open(dashboard.__file__, encoding="utf-8").read()
+        body = src.split("if cleanup_ok and helper_stopped:", 1)[1]
+        self.assertIn("_retire_session_files()", body)
+
+
 class TestStaleWintunDeviceCleanup(unittest.TestCase):
     """An ORPHANED Wintun PnP device node blocks the next start.
 

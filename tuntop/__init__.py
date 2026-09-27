@@ -18,7 +18,7 @@ for backward compatibility.
 """
 from __future__ import annotations
 
-__version__ = "1.0.45"
+__version__ = "1.0.46"
 
 # Public, layered surface. Legacy flat names still resolve via shims.
 __all__ = [

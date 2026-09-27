@@ -17,6 +17,7 @@ Both were reported as "it takes a lot of time":
 
 No Windows calls: the routing/shell layers are mocked. Runs anywhere.
 """
+import io
 import os
 import sys
 import time
@@ -27,6 +28,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
 from tuntop.tunnel import helper as H
+
+
+def _tunnel_up():
+    """Stage 1 of the verification (1.0.45) is a DNS-FREE literal TCP probe,
+    and it is now the GATE: a failure returns immediately, because a tunnel
+    that cannot forward packets must not be "verified" by re-resolving
+    hostnames. Tests about the URL rounds therefore have to let stage 1 pass -
+    this patches it to say the tunnel forwards. The stage itself is covered by
+    TestLiteralTunnelProbe below."""
+    return mock.patch.object(H, "_probe_tunnel_no_dns",
+                             return_value=(True, "TUN carries TCP"))
 
 
 class TestVerifyBudget(unittest.TestCase):
@@ -61,7 +73,7 @@ class TestVerifyBudget(unittest.TestCase):
             calls.append(url)
             return True, "host resolved -> 1.2.3.4; public IP = 1.2.3.4"
         t0 = time.monotonic()
-        with mock.patch.object(H, "_probe_tunnel_once", side_effect=_ok):
+        with mock.patch.object(H, "_probe_tunnel_no_dns", return_value=(True, "TUN carries TCP")), _tunnel_up(), mock.patch.object(H, "_probe_tunnel_once", side_effect=_ok):
             ok = H.wait_for_tunnel_stable(timeout=5, budget=20.0)
         self.assertTrue(ok)
         self.assertLess(time.monotonic() - t0, 5.0)
@@ -74,7 +86,7 @@ class TestVerifyBudget(unittest.TestCase):
         def _dns_fail(url, timeout=5):
             n.append(url)
             return False, f"DNS resolve {_host(url)}: [Errno 11001] getaddrinfo failed"
-        with mock.patch.object(H, "_probe_tunnel_once", side_effect=_dns_fail), \
+        with mock.patch.object(H, "_probe_tunnel_no_dns", return_value=(True, "TUN carries TCP")), _tunnel_up(), mock.patch.object(H, "_probe_tunnel_once", side_effect=_dns_fail), \
                 mock.patch.object(H, "_ACTIVE_DNS_MODE", "plain"), \
                 mock.patch.object(H, "run_ps"), \
                 mock.patch.object(H, "configure_tun"):
@@ -91,7 +103,7 @@ class TestVerifyBudget(unittest.TestCase):
         def _fetch_fail(url, timeout=5):
             n.append(url)
             return False, f"{_host(url)} resolved (1.2.3.4) but fetch failed: timeout"
-        with mock.patch.object(H, "_probe_tunnel_once", side_effect=_fetch_fail), \
+        with mock.patch.object(H, "_probe_tunnel_no_dns", return_value=(True, "TUN carries TCP")), _tunnel_up(), mock.patch.object(H, "_probe_tunnel_once", side_effect=_fetch_fail), \
                 mock.patch.object(H, "_ACTIVE_DNS_MODE", "plain"), \
                 mock.patch.object(H, "time", wraps=time):
             H.wait_for_tunnel_stable(timeout=1, budget=2.0)
@@ -101,8 +113,7 @@ class TestVerifyBudget(unittest.TestCase):
     def test_doh_escalation_is_skipped_when_out_of_budget(self):
         """No point reconfiguring the resolver and flushing the DNS cache when
         there is no time left to verify the result."""
-        with mock.patch.object(H, "_probe_tunnel_once",
-                               side_effect=lambda u, timeout=5:
+        with mock.patch.object(H, "_probe_tunnel_no_dns", return_value=(True, "TUN carries TCP")), _tunnel_up(), mock.patch.object(H, "_probe_tunnel_once", side_effect=lambda u, timeout=5:
                                (False, "DNS resolve x: [Errno 11001] failed")), \
                 mock.patch.object(H, "_ACTIVE_DNS_MODE", "auto"), \
                 mock.patch.object(H, "configure_tun") as cfg, \
@@ -121,13 +132,96 @@ class TestVerifyBudget(unittest.TestCase):
             if len(seen) <= len(H._VERIFY_URLS):
                 return False, "DNS resolve x: [Errno 11001] getaddrinfo failed"
             return True, "host resolved -> 1.2.3.4"
-        with mock.patch.object(H, "_probe_tunnel_once", side_effect=_probe), \
+        with mock.patch.object(H, "_probe_tunnel_no_dns", return_value=(True, "TUN carries TCP")), _tunnel_up(), mock.patch.object(H, "_probe_tunnel_once", side_effect=_probe), \
                 mock.patch.object(H, "_ACTIVE_DNS_MODE", "auto"), \
                 mock.patch.object(H, "configure_tun") as cfg, \
                 mock.patch.object(H, "run_ps"):
             ok = H.wait_for_tunnel_stable(timeout=1, budget=20.0)
         cfg.assert_called_once()
         self.assertTrue(ok)
+
+
+class TestLiteralTunnelProbe(unittest.TestCase):
+    """Stage 1 of the verification (1.0.45): is the TUN forwarding packets?
+
+    The URL probes all START with getaddrinfo, which has no timeout. When
+    plain UDP/53 cannot traverse the tunnel - the normal state for a SOCKS5
+    client without a working UDP relay - Windows walks every configured
+    resolver with its own multi-second timeouts, so each of the four URLs cost
+    5-10s to report the same resolver failure, and then the DoH round paid it
+    all again. That was the "Verifying the tunnel is stable..." spinner and
+    the dozen identical "DNS resolve ... getaddrinfo failed" log lines.
+
+    A TCP connect to a LITERAL address skips the resolver entirely and answers
+    the only question the start sequence actually has, in ~100ms.
+    """
+
+    def test_targets_are_literals_so_no_resolver_is_touched(self):
+        import ipaddress
+        for host, port in H._VERIFY_LITERAL_TCP:
+            ipaddress.IPv4Address(host)      # raises if it is a hostname
+            self.assertGreater(port, 0)
+
+    def test_a_reachable_literal_passes(self):
+        with mock.patch("socket.create_connection") as cc:
+            cc.return_value.__enter__.return_value = None
+            ok, msg = H._probe_tunnel_no_dns(timeout=1)
+        self.assertTrue(ok)
+        self.assertIn("carries TCP", msg)
+
+    def test_all_unreachable_fails_fast(self):
+        def _boom(target, timeout=None):
+            raise OSError("timed out")
+        with mock.patch("socket.create_connection", _boom):
+            t0 = time.monotonic()
+            ok, msg = H._probe_tunnel_no_dns(timeout=1)
+            elapsed = time.monotonic() - t0
+        self.assertFalse(ok)
+        self.assertIn("timed out", msg)
+        # Concurrent, and bounded by the timeout - never one after another.
+        self.assertLess(elapsed, 2.0)
+
+    def test_zero_budget_short_circuits(self):
+        with mock.patch("socket.create_connection") as cc:
+            ok, _msg = H._probe_tunnel_no_dns(timeout=0)
+        self.assertFalse(ok)
+        cc.assert_not_called()
+
+    def test_a_dead_tunnel_never_reaches_the_url_round(self):
+        """The whole point: no point resolving hostnames for a tunnel that
+        cannot forward packets - that is the 5-10s-per-URL trap."""
+        n = []
+
+        def _never(url, timeout=5):
+            n.append(url)
+            return True, "should not be called"
+        with mock.patch.object(H, "_probe_tunnel_no_dns",
+                               return_value=(False, "connect refused")), \
+                mock.patch.object(H, "_probe_tunnel_once", side_effect=_never):
+            ok = H.wait_for_tunnel_stable(timeout=5, budget=20.0)
+        self.assertFalse(ok)
+        self.assertEqual(n, [], "the URL round must not run for a dead tunnel")
+
+    def test_identical_dns_failures_are_reported_once(self):
+        """The user's log filled with a dozen identical getaddrinfo lines,
+        which said nothing except that the resolver was down."""
+        def _dns_fail(url, timeout=5):
+            return False, "DNS resolve x: [Errno 11001] getaddrinfo failed"
+        buf = io.StringIO()
+        with mock.patch.object(H, "_probe_tunnel_no_dns",
+                               return_value=(True, "TUN carries TCP")), \
+                mock.patch.object(H, "_probe_tunnel_once",
+                                  side_effect=_dns_fail), \
+                mock.patch.object(H, "_ACTIVE_DNS_MODE", "plain"), \
+                mock.patch.object(H, "run_ps"), \
+                mock.patch.object(H, "configure_tun"), \
+                mock.patch("sys.stdout", buf):
+            H.wait_for_tunnel_stable(timeout=1, budget=4.0)
+        out = buf.getvalue()
+        self.assertEqual(out.count("getaddrinfo failed"),
+                         out.count("Name resolution through the TUN is not"),
+                         "the per-URL line must not be repeated")
+        self.assertLessEqual(out.count("getaddrinfo failed"), 1)
 
 
 class TestRemoveRouteNetshArguments(unittest.TestCase):

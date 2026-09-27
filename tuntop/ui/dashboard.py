@@ -2232,11 +2232,8 @@ class BTopTui:
         self._session_log_path = None
         if not os.environ.get("TUNTOP_NO_SESSION_LOG"):
             try:
-                _log_dir = (os.path.dirname(os.path.abspath(_sys.executable))
-                            if getattr(_sys, "frozen", False)
-                            else os.path.dirname(os.path.abspath(__file__)))
                 self._session_log_path = os.path.join(
-                    _log_dir, f"tuntop_session_{time.strftime('%Y%m%d')}.log")
+                    _session_file_dir(), f"tuntop_session_{time.strftime('%Y%m%d')}.log")
             except Exception:
                 self._session_log_path = None
         # Guards ITERATION of log_lines (appends are worker-thread writes;
@@ -3386,7 +3383,11 @@ class BTopTui:
         it can find out what happened - the whole "tunnel says it is active
         but nothing is tunnelled" class of report is undiagnosable without
         this file. It is the first thing to ask for, and cheap: one append
-        per line, rotated at 1 MB, never allowed to break the UI."""
+        per line, rotated at 1 MB, never allowed to break the UI.
+
+        A VERIFIED CLEAN exit deletes it again (_retire_session_files): the
+        log exists to explain a session that went wrong, so on a successful
+        one it is litter in the user's folder."""
         try:
             path = getattr(self, "_session_log_path", None)
             if not path:
@@ -9643,6 +9644,58 @@ def _startup_update_check(args, timeout=_STARTUP_UPDATE_TIMEOUT,
     return th
 
 
+def _session_file_dir():
+    """Where this run's scratch/session files live - next to the exe when
+    frozen, next to the module in a source run."""
+    if getattr(_sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(_sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _retire_session_files():
+    """Delete THIS session's scratch files after a VERIFIED clean exit.
+
+    What it removes, and why each was a leftover:
+
+      * `.tuntop_control.json` - the live-reconfig channel, rewritten on every
+        [N]/[V]/[Y] change. It is per-session state, so on a clean exit it is
+        pure litter, and a stale copy is exactly what the next launch's
+        baseline logic has to special-case around.
+      * `tuntop_session_<date>.log` and its `.1` generation - the session log.
+        Its whole purpose is to be evidence of a session that went WRONG; on a
+        clean exit there is nothing to evidence, and a log that accumulates
+        forever in the user's folder is worse than no log.
+
+    Deliberately NOT removed: the crash marker (`.last_run.json`) and the
+    watchdog state - those are already handled by the caller, and on an
+    unclean exit all of these must survive, which is why this is called only
+    from the verified-clean branch. Best-effort: a file held open by an
+    antivirus scanner is simply retried next time."""
+    removed = []
+    for path in [_control_file_path()]:
+        try:
+            if path and os.path.isfile(path):
+                os.unlink(path)
+                removed.append(os.path.basename(path))
+        except OSError:
+            pass
+    try:
+        base = _session_file_dir()
+        for name in os.listdir(base):
+            if name.startswith("tuntop_session_") and name.endswith(
+                    (".log", ".log.1")):
+                try:
+                    os.unlink(os.path.join(base, name))
+                    removed.append(name)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    if removed:
+        print(f"[*] Session files cleaned up: {', '.join(sorted(removed))}")
+    return removed
+
+
 def _acquire_single_instance():
     """Claim the machine-wide TunTop lock. Returns the mutex handle (keep it
     alive for the process lifetime) or None when another instance holds it.
@@ -10161,6 +10214,15 @@ def main():
                     os.unlink(_wd_state)
             except Exception:
                 pass
+            # Same reasoning for the rest of this session's bookkeeping: a
+            # CLEAN exit must not leave its own scratch files in the user's
+            # folder. The live-reconfig control file is rewritten on every
+            # [N]/[V]/[Y] change, and the session log is written on every line,
+            # so before this both survived every exit - and the control file
+            # is not merely untidy: a stale one is what a next launch's
+            # baseline has to reason about. On an UNCLEAN exit they all
+            # deliberately SURVIVE, because that is when they are evidence.
+            _retire_session_files()
         # On failure the marker deliberately SURVIVES: it is the signal that
         # tells the watchdog (this run) and startup recovery (next launch)
         # that leftovers may exist and must be swept.

@@ -2,6 +2,20 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.46] - 2026-09-28
+
+The start sequence no longer waits on a resolver that cannot answer, a clean exit no longer leaves scratch files in the user's folder, and the log says *which* problem it found instead of repeating itself a dozen times.
+
+### Fixed (startup gated on an un-timed-out `getaddrinfo`)
+- **The verification asked the resolver a question the resolver could not answer, and the resolver has no timeout.** `wait_for_tunnel_stable()` probed four URLs, every one of which begins with `socket.getaddrinfo`. When plain UDP/53 cannot traverse the tunnel - the normal state for a SOCKS5 client whose UDP relay does not work - Windows walks **every** configured resolver (here 8.8.8.8 *and* an IPv6 one) with its own multi-second timeouts, so each URL cost 5-10 s of pure resolver waiting to report the same thing, and the DoH escalation round then paid it all again. That was both the "Verifying the tunnel is stable..." spinner and the wall of identical `DNS resolve ... [Errno 11001] getaddrinfo failed` lines. The verification now runs in two stages: **stage 1 asks whether the TUN forwards packets at all**, with a TCP connect to a *literal* address (1.1.1.1/8.8.8.8/9.9.9.9 : 443, raced concurrently, 3 s ceiling) - no resolver is consulted, so the answer takes about a tenth of a second and nothing unbounded can be waited on. A stage-1 failure is a genuine routing/`tun2socks` problem and returns immediately with exactly that wording, because resolving hostnames for a tunnel that cannot forward packets was the whole cost. A stage-1 success means the tunnel is fine, so any subsequent failure is a *resolver* failure - which is what stage 2 and the DoH escalation exist to fix.
+- **The same resolver failure was reported once per URL per attempt.** The workers now record that every failure was a DNS failure and let the round speak for itself, so a broken resolver produces **one** actionable line - "Name resolution through the TUN is not working ... plain UDP/53 cannot cross it, so DNS is being escalated to DoH over TCP/443" - instead of a dozen identical ones. A resolved-but-failed fetch is a different problem and keeps its full retry budget and its per-URL line.
+
+### Fixed (files left behind after a normal exit)
+- **A clean exit did not clean up.** Closing the app left `.tuntop_control.json` (rewritten on every `[N]`/`[V]`/`[Y]` change) and the session log next to the exe. A verified clean exit now retires this session's scratch files: the live-reconfig control file and `tuntop_session_<date>.log` with its `.1` rotation generation. The control file is not merely untidy - a stale one is exactly what the next launch's baseline logic has to reason around - and a session log that accumulates forever is worse than none, given its entire purpose is to explain a session that went *wrong*. **Deliberately NOT removed on an unclean exit**: the crash marker, the watchdog state and both of these files survive a crash precisely because that is when they are evidence. Best-effort throughout: a file an AV scanner is holding open is retried next time, and never blocks the others.
+
+### Tests
+- 1016 passed, 6 skipped (was 1005/7).
+
 ## [1.0.45] - 2026-09-28
 
 The tunnel was silently failing to come up, so the "DNS is protected" verdict was describing a tunnel that was not carrying anything. Diagnosis on the reported machine: `Get-NetAdapter` listed **no wintun adapter at all**, no `0.0.0.0/1` routes, no `tun2socks` process, no NRPT guard rule - while the dashboard still read as an active tunnel. The cause was a Wintun **device node** that outlived its network adapter.
