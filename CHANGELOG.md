@@ -2,6 +2,20 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.45] - 2026-09-28
+
+The tunnel was silently failing to come up, so the "DNS is protected" verdict was describing a tunnel that was not carrying anything. Diagnosis on the reported machine: `Get-NetAdapter` listed **no wintun adapter at all**, no `0.0.0.0/1` routes, no `tun2socks` process, no NRPT guard rule - while the dashboard still read as an active tunnel. The cause was a Wintun **device node** that outlived its network adapter.
+
+### Fixed (a hard kill left a Wintun device node that no later start could clear)
+- **`preflight_cleanup` removed the network ADAPTER and never the device NODE.** After a window closed forcibly or the process was killed, `Get-PnpDevice -Class Net` still showed `tun2socks Tunnel` / `SWD\WINTUN\{B2DC404F-...}` / status **Unknown** while `Get-NetAdapter` listed no wintun at all - the two are different objects, and `Remove-NetAdapter` on an adapter that no longer exists is a silent no-op. The Wintun driver then enumerates that stale node instead of creating a fresh adapter, so the new `tun2socks` finds no interface and exits, the dashboard restarts it, and the loop never converges: the `.last_run.json` marker showed a helper restart, a 3-deep `TunTop` process chain, and no tunnel. `remove_stale_wintun_devices()` now clears orphaned `SWD\WINTUN\*` nodes, and `preflight_cleanup` calls it **after** `Remove-NetAdapter` - with the adapter still present, every node looks legitimately `OK` and the stale one would be skipped. Only nodes whose status is not `OK` are touched, so a foreign Wintun adapter that is actually running (v2rayN/xray TUN mode) keeps its device.
+- **The session log is now persisted, because this whole class of report was undiagnosable.** The log panel is the UI's and dies with the process: a session that ends in a restart loop, a crash or a force kill left *no evidence at all* - neither the user nor anyone debugging it could say what happened. Every line now also appends to `tuntop_session_<date>.log` next to the exe (frozen) or the module (source), with a named severity and the component tag, rotated at 1 MB with one previous generation kept. It never raises and never blocks a line: a read-only folder silently disables it, and `TUNTOP_NO_SESSION_LOG=1` opts out entirely.
+
+### Clarified ("Your DNS requests are exposed" is not the test TunTop's verdict is)
+- A browser leak test answers **"which resolver queried my domain?"** - not "did my ISP see it?" - so it reports a leak whenever the answer is a public resolver, *even when that resolver was reached through the tunnel*. With `8.8.8.8` configured (the default) Google answers every lookup, so such a test shows Google and calls it exposed; your ISP still never sees the query, but Google can log it. Only a resolver running **inside** the tunnel can satisfy that test, and TunTop is a transport, not a resolver: it forwards DNS to whichever resolver you chose. The `[C]`/`[L]` checks answer the question that actually matters here - whether anything **outside** the tunnel answered, and which adapter it came from - and the new `check_dns_leak.ps1` says so explicitly in its verdict.
+
+### Tests
+- 1005 passed, 7 skipped (was 994/6).
+
 ## [1.0.44] - 2026-09-27
 
 A performance release: starting and stopping the tunnel were both dominated by process-launch and unbounded-wait overhead rather than by anything the work actually needed. It also closes the loop on the DNS leak guard, which was installed but repeatedly torn down again.

@@ -737,6 +737,143 @@ class TestSingleInstance(unittest.TestCase):
         self.assertGreater(handle, 0)
 
 
+class TestStaleWintunDeviceCleanup(unittest.TestCase):
+    """An ORPHANED Wintun PnP device node blocks the next start.
+
+    Observed on the reported machine: `Get-PnpDevice -Class Net` showed
+    'tun2socks Tunnel' / `SWD\\WINTUN\\{B2DC404F-...}` / status Unknown while
+    `Get-NetAdapter` listed no wintun at all - the node outlived the network
+    adapter. The Wintun driver then enumerates the stale node instead of
+    creating a fresh adapter, tun2socks finds no interface and exits, and the
+    dashboard restarts it: a loop that never converges, with the tunnel never
+    coming up. `preflight_cleanup` removed the ADAPTER and never the node.
+    """
+
+    def test_only_non_ok_nodes_are_touched(self):
+        """A foreign Wintun adapter that is actually running (v2rayN/xray TUN
+        mode) reports status OK and must keep its device node."""
+        from tuntop.tunnel import helper
+        with mock.patch.object(helper, "run_ps",
+                               return_value=(True, "0", "")) as ps:
+            self.assertEqual(helper.remove_stale_wintun_devices(), 0)
+        script = ps.call_args[0][0]
+        self.assertIn("SWD\\WINTUN\\*", script)
+        self.assertIn("$_.Status -ne 'OK'", script)
+        self.assertIn("Remove-PnpDevice", script)
+
+    def test_reports_how_many_were_removed(self):
+        from tuntop.tunnel import helper
+        with mock.patch.object(helper, "run_ps",
+                               return_value=(True, " 2 ", "")):
+            self.assertEqual(helper.remove_stale_wintun_devices(), 2)
+
+    def test_garbage_output_removes_nothing_silently(self):
+        from tuntop.tunnel import helper
+        for out in ("", None, "Get-PnpDevice : not recognised", "OK"):
+            with mock.patch.object(helper, "run_ps",
+                                   return_value=(True, out, "")):
+                self.assertEqual(helper.remove_stale_wintun_devices(), 0)
+
+    def test_a_broken_shell_is_not_fatal(self):
+        from tuntop.tunnel import helper
+        with mock.patch.object(helper, "run_ps",
+                               side_effect=OSError("no powershell")):
+            self.assertEqual(helper.remove_stale_wintun_devices(), 0)
+
+    def test_preflight_clears_the_node_after_the_adapter(self):
+        """Order matters: with the adapter still present, every node looks
+        legitimately OK and the stale one would be skipped."""
+        from tuntop.tunnel import helper
+        calls = []
+
+        def _ps(script, *a, **kw):
+            calls.append(script)
+            return True, "", ""
+
+        with mock.patch.object(helper, "run_ps", _ps), \
+                mock.patch.object(helper, "run", lambda *a, **k: (0, "")), \
+                mock.patch.object(helper.time, "sleep",
+                                  lambda *_: None):
+            helper.preflight_cleanup()
+        joined = "\n".join(calls)
+        adapter_at = joined.find("Remove-NetAdapter")
+        node_at = joined.find("Remove-PnpDevice")
+        self.assertNotEqual(adapter_at, -1, "adapter must still be removed")
+        self.assertNotEqual(node_at, -1, "orphaned device node must be removed")
+        self.assertLess(adapter_at, node_at)
+
+
+class TestSessionLog(unittest.TestCase):
+    """The log panel is the UI's and dies with the process.
+
+    A session that ends in a helper restart loop, a crash, or a force kill
+    left no evidence at all, so "the tunnel says it is active but nothing is
+    tunnelled" was undiagnosable. The session log is that evidence, and it is
+    the first thing worth asking a user for.
+    """
+
+    def _app(self, path):
+        import queue
+        from tuntop.ui import dashboard
+        from tuntop.structured_log import LogRing
+        app = dashboard.BTopTui.__new__(dashboard.BTopTui)
+        app.logs = queue.Queue()
+        app.log_lines = []
+        app.event_log = LogRing(capacity=50)
+        app._session_log_path = path
+        return app
+
+    def test_lines_land_on_disk(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session.log")
+            app = self._app(path)
+            app._blog("[*] DNS leak guard: pinned to 8.8.8.8", component="HELPER")
+            app._blog("[!] DNS leak guard NOT active: denied", component="HELPER")
+            text = open(path, encoding="utf-8").read()
+        self.assertIn("DNS leak guard: pinned to 8.8.8.8", text)
+        self.assertIn("NOT active", text)
+        # Severity and component, so a failure is greppable after the fact.
+        self.assertIn("[HELPER]", text)
+        self.assertIn("ERROR", text)
+        self.assertIn("WARN", text)
+
+    def test_it_never_breaks_the_ui(self):
+        app = self._app(os.path.join("Z:\\does", "not", "exist", "x.log"))
+        app._blog("[*] still fine")          # must not raise
+        self.assertFalse(app.logs.empty())
+
+    def test_unwritable_path_is_silent(self):
+        app = self._app(None)
+        app._blog("[*] no path - no-op")
+        self.assertFalse(app.logs.empty())
+
+    def test_rotation_keeps_one_generation(self):
+        from tuntop.ui import dashboard
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session.log")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("x" * (dashboard._SESSION_LOG_MAX_BYTES + 10))
+            app = self._app(path)
+            app._blog("[*] after rotation")
+            self.assertTrue(os.path.isfile(path + ".1"))
+            with open(path, encoding="utf-8") as f:
+                self.assertIn("after rotation", f.read())
+
+    def test_env_opt_out(self):
+        """TUNTOP_NO_SESSION_LOG=1 for a user who does not want a log file."""
+        from tuntop.ui import dashboard
+        src = open(dashboard.__file__, encoding="utf-8").read()
+        self.assertIn("TUNTOP_NO_SESSION_LOG", src)
+        self.assertIn("tuntop_session_", src)
+
+    def test_exported_with_the_diagnostics_section(self):
+        """It has to be findable, or it is not evidence - the [D] export
+        names the file so a bug report can carry it."""
+        from tuntop.ui import dashboard
+        src = open(dashboard.__file__, encoding="utf-8").read()
+        self.assertIn("_session_log_path", src)
+
+
 class TestHelperIntegration(unittest.TestCase):
     """The helper side: what the tunnel bring-up / live-DNS path actually
     calls, and that a disabled guard removes instead of installing.

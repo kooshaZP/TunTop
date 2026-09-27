@@ -821,13 +821,54 @@ def reject_competing_tun():
                   "default route) - left untouched.")
 
 
+def remove_stale_wintun_devices():
+    """Remove ORPHANED Wintun PnP device nodes (status != OK).
+
+    `Remove-NetAdapter` above only clears the NETWORK ADAPTER. After a hard
+    kill the device node itself survives in the device tree as
+    `SWD\\WINTUN\\{GUID}` with status Unknown, and the Wintun driver then
+    enumerates that stale node instead of creating a fresh adapter - the new
+    tun2socks finds no interface, exits, and the dashboard restarts it, which
+    is a restart loop that never converges. This is the observed state after
+    one crashed session (Get-PnpDevice -Class Net shows
+    'tun2socks Tunnel' / SWD\\WINTUN\\{...} / Unknown while Get-NetAdapter
+    lists no wintun at all).
+
+    Only nodes that are NOT status OK are touched, so a foreign Wintun
+    adapter that is actually running (v2rayN/xray TUN mode) keeps its device.
+    Best-effort: a machine that refuses the removal just keeps the old
+    behaviour."""
+    try:
+        _, out, _ = run_ps(
+            "$stale = Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.InstanceId -like 'SWD\\WINTUN\\*' -and "
+            "$_.Status -ne 'OK' }; "
+            "$n = @($stale).Count; "
+            "if ($n -gt 0) { $stale | ForEach-Object { "
+            "Remove-PnpDevice -InstanceId $_.InstanceId -Confirm:$false "
+            "-ErrorAction SilentlyContinue } }; "
+            "Write-Output $n")
+    except Exception:
+        return 0
+    n = 0
+    for tok in str(out or "").split():
+        if tok.isdigit():
+            n = int(tok)
+            break
+    if n:
+        print(f"[*] Removed {n} orphaned Wintun device node(s) from a "
+              "previous run - tun2socks can create its adapter again.")
+    return n
+
+
 def preflight_cleanup(tun2socks_path=None):
     """Clear state left behind by a run that didn't exit cleanly (window
     closed forcibly, process killed, previous crash). Leftover Wintun
     routes or an orphaned tun2socks are the main reason a *later* run can
     fail to configure routes, look like it dropped the VPN, or crash on
     startup. Also drop the Wintun adapter itself so tun2socks recreates it
-    fresh (a stale adapter can make tun2socks fail to bind).
+    fresh (a stale adapter can make tun2socks fail to bind), and any
+    ORPHANED Wintun PnP device node (see remove_stale_wintun_devices).
 
     tun2socks_path: the --tun2socks path this run is about to use. Orphan
     kills are OWNERSHIP-SCOPED (vendored binary name or exactly this path),
@@ -858,6 +899,10 @@ def preflight_cleanup(tun2socks_path=None):
 
     run_ps(f"Remove-NetAdapter -Name '{TUN}' -Force -Confirm:$false -ErrorAction SilentlyContinue")
     run_ps(f"Remove-NetAdapter -Name '{TUN2}' -Force -Confirm:$false -ErrorAction SilentlyContinue")
+    # The network adapter is gone; its DEVICE node may not be. This must run
+    # after Remove-NetAdapter, or a still-present adapter would make every
+    # node look legitimately OK.
+    remove_stale_wintun_devices()
     time.sleep(1)
 
 

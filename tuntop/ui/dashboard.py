@@ -119,6 +119,11 @@ from tuntop.structured_log import (              # noqa: E402
     LogRing, INFO as _LOG_INFO, WARNING as _LOG_WARNING,
     ERROR as _LOG_ERROR,
 )
+
+#: On-disk session log rotation threshold (see _session_log_write). One
+#: previous generation is kept as <file>.1, so a runaway loop cannot fill the
+#: disk and the previous run is still available.
+_SESSION_LOG_MAX_BYTES = 1024 * 1024
 from tuntop.health_report import (              # noqa: E402
     format_panel as _health_format_panel,
     counts as _health_counts, CRITICAL as _HEALTH_CRIT,
@@ -2221,6 +2226,19 @@ class BTopTui:
         self._geo_lock = threading.Lock()
 
         self.log_lines = []
+        # On-disk session log (see _session_log_write): the in-memory panel
+        # dies with the process, so a failed session left no evidence. This
+        # is the file to ask a user for. Opt out with TUNTOP_NO_SESSION_LOG=1.
+        self._session_log_path = None
+        if not os.environ.get("TUNTOP_NO_SESSION_LOG"):
+            try:
+                _log_dir = (os.path.dirname(os.path.abspath(_sys.executable))
+                            if getattr(_sys, "frozen", False)
+                            else os.path.dirname(os.path.abspath(__file__)))
+                self._session_log_path = os.path.join(
+                    _log_dir, f"tuntop_session_{time.strftime('%Y%m%d')}.log")
+            except Exception:
+                self._session_log_path = None
         # Guards ITERATION of log_lines (appends are worker-thread writes;
         # draw() and the scroll handlers are readers). See _log_entries().
         self._log_lock = threading.Lock()
@@ -3357,6 +3375,44 @@ class BTopTui:
         sev = _LOG_ERROR if msg.startswith("[!]") else (
             _LOG_WARNING if msg.startswith("[*]") else _LOG_INFO)
         self.event_log.log(sev, component, msg)
+        self._session_log_write(sev, component, msg)
+
+    def _session_log_write(self, sev, component, msg):
+        """Append to the on-disk session log (best-effort, never raises).
+
+        The in-memory log panel is the UI's, and it DIES WITH THE PROCESS:
+        a session that ends in a helper restart loop, a crash, or a force
+        kill leaves nothing behind, so neither the user nor anyone debugging
+        it can find out what happened - the whole "tunnel says it is active
+        but nothing is tunnelled" class of report is undiagnosable without
+        this file. It is the first thing to ask for, and cheap: one append
+        per line, rotated at 1 MB, never allowed to break the UI."""
+        try:
+            path = getattr(self, "_session_log_path", None)
+            if not path:
+                return
+            # NAME the severity, not the raw number: this file is read by a
+            # human (or grepped) long after the session is gone, and
+            # "ERROR" has to be findable without knowing the level table.
+            # Derived from the level constants so it cannot drift.
+            name = {_LOG_INFO: "INFO", _LOG_WARNING: "WARN",
+                    _LOG_ERROR: "ERROR"}.get(sev)
+            if name is None:
+                name = str(sev)
+            line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} {name:<5} "
+                    f"[{component}] {msg}\n")
+            # Rotation BEFORE the append, and only on a real size check, so
+            # the common path stays a single open/write/close.
+            try:
+                if (os.path.isfile(path)
+                        and os.path.getsize(path) > _SESSION_LOG_MAX_BYTES):
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(line)
+        except Exception:
+            pass
 
     def _geo_diag_suppress(self, line):
         """Return True if this geoip diagnostic has already been logged this
