@@ -294,11 +294,18 @@ def egress_lookup_ps(ip, exclude_vpn=True):
     """
     vpn_clause = (" -and $_.InterfaceAlias -notmatch " + VPN_ALIAS_PS_RE
                   if exclude_vpn else "")
+    # SUBSTITUTION ORDER MATTERS: __IP__ is the only token carrying
+    # caller-supplied data, so it goes LAST. Substituting it first meant an
+    # `ip` containing a token's literal text injected that text into the body,
+    # where the NEXT .replace rewrote attacker-supplied data into script
+    # STRUCTURE - and the post-hoc guard could never see it, because every
+    # token had already been consumed by the time it ran. The guard was dead
+    # code for exactly the case it was written for.
     body = (_EGRESS_FOR_BODY
-            .replace("__IP__", ps_quote(ip))
             .replace("__VPN_CLAUSE__", vpn_clause)
             .replace("__V4FILTER_STRICT__", v4_default_filter_ps(True))
-            .replace("__V4FILTER_RELAXED__", v4_default_filter_ps(False)))
+            .replace("__V4FILTER_RELAXED__", v4_default_filter_ps(False))
+            .replace("__IP__", ps_quote(ip)))
     for token in _EGRESS_TOKENS:
         if token in body:
             raise RuntimeError("egress_lookup_ps: unsubstituted " + token)

@@ -63,7 +63,6 @@ class TestSSLContextSecurity(unittest.TestCase):
         self.assertEqual(L._SSL_CONTEXT.minimum_version, ssl.TLSVersion.TLSv1_2)
 
     def test_legacy_protocols_disabled(self):
-        import ssl
         opts = L._SSL_CONTEXT.options
         for flag in ("OP_NO_SSLv3", "OP_NO_TLSv1", "OP_NO_TLSv1_1"):
             self.assertTrue(

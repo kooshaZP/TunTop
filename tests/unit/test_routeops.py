@@ -98,18 +98,56 @@ class TestSweeps(unittest.TestCase):
             {"DestinationPrefix": "10.0.0.0/8", "InterfaceAlias": "Wi-Fi",
              "NextHop": "On-link"},
             {"DestinationPrefix": "172.16.0.0/12", "InterfaceAlias": "Wi-Fi",
-             "NextHop": "192.168.9.9"},          # stale pin
+             "NextHop": "192.168.9.9"},          # FOREIGN static route
             {"DestinationPrefix": "172.16.0.0/12", "InterfaceAlias": "Eth",
              "NextHop": "192.168.9.9"},          # foreign iface
             {"DestinationPrefix": "203.0.113.0/24", "InterfaceAlias": "Wi-Fi",
              "NextHop": "192.168.1.1"},          # not a LAN prefix
         ]
         victims = sweeps.lan_victims(rows, "Wi-Fi", "192.168.1.1")
+        # The 172.16.0.0/12 row via 192.168.9.9 is NOT ours and is not
+        # selected. "A real next-hop from a previous network" is not a
+        # safety property - it is indistinguishable from a corporate static
+        # route (a VPN split tunnel, a NAS subnet), and this function's
+        # output goes straight into a netsh -f delete on both the [Q] exit
+        # sweep and the crash watchdog. Genuinely-installed stale routes are
+        # tracked in the RouteLedger (gateway + metric) so the exit sweep can
+        # remove exactly what this run installed.
         self.assertEqual(victims, [
             ("192.168.0.0/16", "Wi-Fi", "192.168.1.1"),
             ("10.0.0.0/8", "Wi-Fi", "On-link"),
-            ("172.16.0.0/12", "Wi-Fi", "192.168.9.9"),
         ])
+
+    def test_lan_victims_compares_cidrs_canonically(self):
+        """Windows reports the canonical form; a prefix with host bits set
+        must still match the LAN prefix it belongs to."""
+        rows = [
+            {"DestinationPrefix": "192.168.1.5/16", "InterfaceAlias": "Wi-Fi",
+             "NextHop": "192.168.1.1"},
+            {"DestinationPrefix": "2001:db8:0:0:0:0:0:0/32",
+             "InterfaceAlias": "Wi-Fi", "NextHop": "::"},
+        ]
+        self.assertEqual(
+            sweeps.lan_victims(rows, "Wi-Fi", "192.168.1.1",
+                               prefixes=["192.168.0.0/16",
+                                         "2001:db8::/32"]),
+            [("192.168.0.0/16", "Wi-Fi", "192.168.1.1"),
+             ("2001:db8::/32", "Wi-Fi", "::")])
+
+    def test_lan_victims_interface_compare_is_case_insensitive(self):
+        rows = [{"DestinationPrefix": "192.168.0.0/16",
+                 "InterfaceAlias": "wi-fi ", "NextHop": "192.168.1.1"}]
+        self.assertEqual(sweeps.lan_victims(rows, "Wi-Fi", "192.168.1.1"),
+                         [("192.168.0.0/16", "wi-fi ", "192.168.1.1")])
+
+    def test_lan_victims_honours_an_explicit_empty_prefix_list(self):
+        """`prefixes=[]` must mean 'match nothing'; `prefixes or DEFAULT`
+        silently fell back to the full 7-prefix default - the opposite of
+        what the caller asked for."""
+        rows = [{"DestinationPrefix": "192.168.0.0/16",
+                 "InterfaceAlias": "Wi-Fi", "NextHop": "192.168.1.1"}]
+        self.assertEqual(sweeps.lan_victims(rows, "Wi-Fi", "192.168.1.1",
+                                           prefixes=[]), [])
 
     def test_geo_victims_exact_prefix_only(self):
         rows = [
@@ -122,6 +160,18 @@ class TestSweeps(unittest.TestCase):
                          [("5.0.0.0/8", "Wi-Fi", "g")])
         self.assertEqual(sweeps.geo_victims(rows, set()), [])
 
+    def test_geo_victims_match_ipv6_canonically(self):
+        """THE regression: parse_geoip rendered IPv6 uncompressed
+        ("2001:db8:0:0:0:0:0:0/32") while Get-NetRoute returns
+        ("2001:db8::/32"), so a string compare missed EVERY IPv6 geo route
+        and they survived every sweep - the bypass intent stayed armed
+        against a dead tunnel."""
+        rows = [{"DestinationPrefix": "2001:db8::/32",
+                 "InterfaceAlias": "Wi-Fi", "NextHop": "fe80::1"}]
+        self.assertEqual(
+            sweeps.geo_victims(rows, {"2001:db8:0:0:0:0:0:0/32"}),
+            [("2001:db8::/32", "Wi-Fi", "fe80::1")])
+
     def test_host_route_stmts_families(self):
         stmts = sweeps.host_route_stmts(["1.2.3.4", "2606:4700::1111"])
         self.assertEqual(len(stmts), 2)
@@ -129,6 +179,24 @@ class TestSweeps(unittest.TestCase):
         self.assertIn("AddressFamily IPv4", stmts[0])
         self.assertIn("'2606:4700::1111/128'", stmts[1])
         self.assertIn("AddressFamily IPv6", stmts[1])
+
+    def test_host_route_stmts_can_be_scoped_to_an_interface(self):
+        """A bare Remove-NetRoute -DestinationPrefix deletes that prefix on
+        EVERY interface - the exact pattern routing.py documents as forbidden
+        ("TunTop must not delete a route it did not create"). Scoping stops
+        the exit sweep from ripping a VPN-client-pinned host route off a
+        corporate adapter."""
+        stmts = sweeps.host_route_stmts(["1.2.3.4"], aliases=["Wi-Fi", "Eth"])
+        self.assertEqual(len(stmts), 1)
+        self.assertIn("Where-Object", stmts[0])
+        self.assertIn("$_.InterfaceAlias -eq 'Wi-Fi'", stmts[0])
+        self.assertIn("$_.InterfaceAlias -eq 'Eth'", stmts[0])
+
+    def test_host_route_stmts_quote_rather_than_strip(self):
+        """The old sanitiser stripped apostrophes (replace("'", "")) and left
+        ';', '$(...)' and backticks intact. ps_quote doubles them."""
+        stmts = sweeps.host_route_stmts(["1.2.3.4'; rm -rf x"])
+        self.assertIn("1.2.3.4''; rm -rf x/32", stmts[0])
 
 
 if __name__ == "__main__":

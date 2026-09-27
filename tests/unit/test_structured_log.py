@@ -8,7 +8,7 @@ import time
 import unittest
 
 from tuntop.structured_log import (
-    LogRing, LogRecord, Severity, DEBUG, INFO, WARNING, ERROR,
+    LogRing, LogRecord, DEBUG, INFO, WARNING, ERROR,
 )
 
 

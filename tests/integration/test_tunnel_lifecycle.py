@@ -35,7 +35,6 @@ class FakeHelperWorld:
         self.restarts = 0
 
     def startup_probes(self):
-        from tuntop.startup_recovery import Probes
         world = self
 
         class P:

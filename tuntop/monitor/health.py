@@ -213,7 +213,13 @@ def format_panel(results: list[tuple], width: int = 60,
         overhead = 7 + len(mark)
         name_budget = max(width - overhead, 1)
         if len(name) > name_budget:
-            name = name[:name_budget - 3] + "..."
+            # `name_budget - 3` is NEGATIVE for a budget of 1 or 2, and a
+            # negative slice takes characters from the END - which produced a
+            # 3-6 char name, i.e. LONGER than the budget it was meant to fit.
+            if name_budget > 3:
+                name = name[:name_budget - 3] + "..."
+            else:
+                name = name[:max(name_budget - 1, 0)]
         max_detail = max(width - overhead - len(name), 0)
         if len(detail) > max_detail:
             # The ellipsis itself must fit the budget: with no room for it,

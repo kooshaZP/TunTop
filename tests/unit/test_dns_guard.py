@@ -24,11 +24,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(
 from tuntop.network import dns_guard as G
 
 
-def _runner(output, ok=True, calls=None):
-    """A stand-in for routing._ps that records the scripts it was given."""
+def _runner(output, ok=True, calls=None, per_script=None):
+    """A stand-in for routing._ps that records the scripts it was given.
+
+    `per_script` maps a substring of the script to the output that script
+    should produce, so a detect-then-remove flow can be exercised with the
+    markers each script really emits. The real uninstall_script() prints
+    DNS_GUARD_REMOVED, never a DNS_GUARD_STATE line.
+    """
     def _run(script, timeout=8):
         if calls is not None:
             calls.append(script)
+        if per_script:
+            for needle, out in per_script.items():
+                if needle in script:
+                    return ok, out
         return ok, output
     return _run
 
@@ -157,7 +167,7 @@ class TestDetectScript(unittest.TestCase):
 
     def test_parses_a_positive_result(self):
         state = G.parse_detect(
-            "DNS_GUARD_STATE:keys=2;effective=true;servers=8.8.8.8")
+            "DNS_GUARD_STATE:keys=2,effective=true,servers=8.8.8.8")
         self.assertEqual(state["keys"], 2)
         self.assertTrue(state["effective"])
         self.assertEqual(state["servers"], "8.8.8.8")
@@ -166,7 +176,7 @@ class TestDetectScript(unittest.TestCase):
     def test_key_without_effective_policy_is_not_ok(self):
         """A rule Windows silently dropped from its policy protects nothing."""
         state = G.parse_detect(
-            "DNS_GUARD_STATE:keys=2;effective=false;servers=8.8.8.8")
+            "DNS_GUARD_STATE:keys=2,effective=false,servers=8.8.8.8")
         self.assertFalse(state["ok"])
 
     def test_absent_output_is_a_clean_default(self):
@@ -176,13 +186,13 @@ class TestDetectScript(unittest.TestCase):
             self.assertFalse(state["ok"])
 
     def test_garbage_keys_value_does_not_raise(self):
-        state = G.parse_detect("DNS_GUARD_STATE:keys=abc;effective=true")
+        state = G.parse_detect("DNS_GUARD_STATE:keys=abc,effective=true")
         self.assertEqual(state["keys"], 0)
         self.assertFalse(state["ok"])
 
     def test_finds_the_line_among_other_output(self):
         state = G.parse_detect(
-            "some noise\nDNS_GUARD_STATE:keys=1;effective=true;servers=1.1.1.1\n"
+            "some noise\nDNS_GUARD_STATE:keys=1,effective=true,servers=1.1.1.1\n"
             "more noise")
         self.assertTrue(state["ok"])
         self.assertEqual(state["servers"], "1.1.1.1")
@@ -194,7 +204,7 @@ class TestDetectScript(unittest.TestCase):
         was long gone - the monitor loop would log 'DNS pinned' and the health
         row would go green on a dead guard."""
         state = G.parse_detect(
-            "DNS_GUARD_STATE:keys=1;match=0;effective=true;servers=")
+            "DNS_GUARD_STATE:keys=1,match=0,effective=true,servers=")
         self.assertEqual(state["keys"], 1)
         self.assertEqual(state["match"], 0)
         self.assertTrue(state["effective"])   # a foreign catch-all is in force
@@ -202,20 +212,33 @@ class TestDetectScript(unittest.TestCase):
 
     def test_match_present_and_effective_is_ok(self):
         state = G.parse_detect(
-            "DNS_GUARD_STATE:keys=2;match=1;effective=true;servers=8.8.8.8")
+            "DNS_GUARD_STATE:keys=2,match=1,effective=true,servers=8.8.8.8")
         self.assertTrue(state["ok"])
         self.assertEqual(state["match"], 1)
 
     def test_detect_script_reports_the_match_count(self):
         s = G.detect_script()
-        self.assertIn(";match=", s)
+        # ',' is the field separator, NOT ';': the `servers` field is a
+        # resolver LIST joined with ';' by _servers_value(), so a ';' split
+        # truncated every two-family pin to its first resolver.
+        self.assertIn(",match=", s)
         self.assertIn("PSChildName -eq", s)
+
+    def test_detect_line_uses_a_separator_resolvers_cannot_contain(self):
+        """Regression: with ';' as the field separator, `servers=8.8.8.8;
+        2606:4700:4700::1111` was split into a first field plus an orphan
+        part, so state['servers'] was ALWAYS just the first resolver and the
+        v6 half of the pin was invisible in every diagnostic."""
+        st = G.parse_detect(
+            "DNS_GUARD_STATE:keys=1,match=1,effective=true,"
+            "servers=8.8.8.8;2606:4700:4700::1111")
+        self.assertEqual(st["servers"], "8.8.8.8;2606:4700:4700::1111")
 
     def test_a_line_without_the_match_field_still_parses(self):
         """Back-compat: parse_detect falls back to `keys` when `match` is
         absent, so an older cached/recorded line cannot read as a failure."""
         state = G.parse_detect(
-            "DNS_GUARD_STATE:keys=2;effective=true;servers=8.8.8.8")
+            "DNS_GUARD_STATE:keys=2,effective=true,servers=8.8.8.8")
         self.assertIsNone(state["match"])
         self.assertTrue(state["ok"])
 
@@ -301,14 +324,39 @@ class TestInstall(unittest.TestCase):
         """A rule with no override servers is a black hole, not protection."""
         with tempfile.TemporaryDirectory() as d:
             calls = []
-            ok, _msg = G.install([], runner=_runner("DNS_GUARD_STATE:keys=1"
-                                                   ";effective=true",
-                                                   calls=calls),
-                                 path=os.path.join(d, "s.json"))
+            ok, _msg = G.install(
+                [],
+                runner=_runner("", calls=calls, per_script={
+                    "DNS_GUARD_STATE:keys=": "DNS_GUARD_STATE:keys=1"
+                                             ",match=1,effective=true",
+                    "DNS_GUARD_REMOVED": "DNS_GUARD_REMOVED",
+                }),
+                path=os.path.join(d, "s.json"))
             self.assertTrue(ok)
             # detect first, then the removal - never the install script.
             self.assertNotIn("DNS_GUARD_OK", calls[-1])
             self.assertIn("Remove-Item", calls[-1])
+
+    def test_uninstall_with_no_verdict_fails_closed(self):
+        """A sweep that reports NEITHER marker must NOT be called a success.
+
+        uninstall_script() used to run its whole sweep with
+        -ErrorAction SilentlyContinue, so an unreadable DnsPolicyConfig (a
+        non-elevated process, a denied key) produced an empty enumeration and
+        a cheerful DNS_GUARD_REMOVED while the TunTop-* keys were still there
+        - pinning every process on the machine to a tunnel that is being torn
+        down. The script now proves it can read the store, and a still-
+        ambiguous result keeps the install record so the next launch retries.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.json")
+            ok, msg = G.uninstall(runner=_runner("some unrelated output"),
+                                  path=path)
+            self.assertFalse(ok)
+            self.assertIn("no verdict", msg)
+            # The record must survive so a later owner can retry.
+            G.save_state(["8.8.8.8"], path=path)
+            self.assertIsNotNone(G.load_state(path=path))
 
     def test_script_receives_both_families(self):
         calls = []
@@ -404,7 +452,7 @@ class TestUninstallAndEnsure(unittest.TestCase):
         calls = []
         with tempfile.TemporaryDirectory() as d:
             ok, msg = G.ensure_removed(
-                runner=_runner("DNS_GUARD_STATE:keys=0;effective=false",
+                runner=_runner("DNS_GUARD_STATE:keys=0,effective=false",
                                calls=calls),
                 path=os.path.join(d, "s.json"))
         self.assertTrue(ok)
@@ -420,12 +468,26 @@ class TestUninstallAndEnsure(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             calls = []
             ok, _msg = G.ensure_removed(
-                runner=_runner("DNS_GUARD_STATE:keys=2;effective=true",
-                               calls=calls),
+                runner=_runner("", calls=calls, per_script={
+                    "DNS_GUARD_STATE:keys=": "DNS_GUARD_STATE:keys=2"
+                                             ",match=1,effective=true",
+                    "DNS_GUARD_REMOVED": "DNS_GUARD_REMOVED",
+                }),
                 path=os.path.join(d, "s.json"))
             self.assertTrue(ok)
             self.assertEqual(len(calls), 2)
             self.assertIn("Remove-Item", calls[1])
+
+    def test_uninstall_script_proves_the_store_is_readable(self):
+        """An unreadable DnsPolicyConfig must be a FAILURE, not an empty one.
+
+        With every cmdlet on -ErrorAction SilentlyContinue, a non-elevated
+        process (or a denied key) made Get-ChildItem return nothing, $left
+        stayed 0, and the script printed DNS_GUARD_REMOVED while the rule was
+        still installed."""
+        s = G.uninstall_script()
+        self.assertIn("Test-Path -LiteralPath $root", s)
+        self.assertIn("Get-ChildItem -Path $root -ErrorAction Stop", s)
 
     def test_ensure_installed_picks_both_families(self):
         calls = []
@@ -441,7 +503,7 @@ class TestUninstallAndEnsure(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             G.ensure_installed(None, None,
                                runner=_runner("DNS_GUARD_STATE:keys=0"
-                                              ";effective=false", calls=calls),
+                                              ",effective=false", calls=calls),
                                path=os.path.join(d, "s.json"))
         self.assertEqual(len(calls), 1)
         self.assertNotIn("New-ItemProperty", calls[0])
@@ -488,9 +550,15 @@ class TestForeignResolvers(unittest.TestCase):
 
     def test_loopback_is_dropped_per_address_not_per_adapter(self):
         """An adapter publishing 127.0.0.1 AND a real resolver is still a
-        fan-out source; the old per-adapter -notcontains check hid it."""
+        fan-out source; the old per-adapter -notcontains check hid it.
+
+        BOTH loopback families must be filtered: with only 127.0.0.1
+        excluded, an adapter whose only resolver was ::1 was still reported
+        and the leak check cried wolf on a machine that is not leaking."""
         s = G.foreign_resolvers_script()
-        self.assertIn("$_ -ne '127.0.0.1'", s)
+        self.assertIn("'127.0.0.1'", s)
+        self.assertIn("'::1'", s)
+        self.assertIn("$loops -notcontains $_", s)
         self.assertNotIn("$_.ServerAddresses -notcontains '127.0.0.1'", s)
 
     def test_ignores_powershell_noise(self):
@@ -512,9 +580,9 @@ class TestForeignResolvers(unittest.TestCase):
 
     def test_guard_in_force_follows_the_effective_policy(self):
         self.assertTrue(G.guard_in_force(
-            runner=_runner("DNS_GUARD_STATE:keys=2;effective=true")))
+            runner=_runner("DNS_GUARD_STATE:keys=2,effective=true")))
         self.assertFalse(G.guard_in_force(
-            runner=_runner("DNS_GUARD_STATE:keys=2;effective=false")))
+            runner=_runner("DNS_GUARD_STATE:keys=2,effective=false")))
 
     def test_guard_in_force_is_false_when_the_probe_breaks(self):
         def boom(script, timeout=8):
@@ -615,10 +683,22 @@ class TestHelperIntegration(unittest.TestCase):
     def test_cleanup_removes_the_guard_early(self):
         """A surviving rule outliving the tunnel pins every process on the
         machine to a dead proxy, so cleanup() must drop it before the long
-        route sweeps (where the OS may kill us)."""
+        route sweeps (where the OS may kill us).
+
+        Asserts the ORDERING invariant rather than a literal call: cleanup()
+        runs each phase through _step(), so the removal shows up as a
+        reference handed to the step runner. What matters is that it is
+        scheduled before the bulk geo delete."""
         src = open(self.helper.__file__, encoding="utf-8").read()
-        body = src.split("def cleanup(", 1)[1]
-        self.assertIn("_remove_dns_guard()", body)
+        body = src.split("def cleanup(", 1)[1].split("\ndef ", 1)[0]
+        guard_at = body.find("_remove_dns_guard")
+        self.assertNotEqual(guard_at, -1,
+                            "cleanup() must schedule the DNS-guard removal")
+        geo_at = body.find("_remove_routes_bulk")
+        self.assertNotEqual(geo_at, -1)
+        self.assertLess(guard_at, geo_at,
+                        "the DNS guard must be removed BEFORE the long "
+                        "geo bulk delete, which the OS can interrupt")
 
 
 class _FakeGuard:
@@ -671,7 +751,7 @@ class TestDashboardHealthRow(unittest.TestCase):
 
     def test_effective_rule_passes(self):
         (ok, msg), _scripts = self._run(
-            "DNS_GUARD_STATE:keys=2;effective=true;servers=8.8.8.8",
+            "DNS_GUARD_STATE:keys=2,effective=true,servers=8.8.8.8",
             wintun="UP")
         self.assertTrue(ok)
         self.assertIn("8.8.8.8", msg)
@@ -682,7 +762,7 @@ class TestDashboardHealthRow(unittest.TestCase):
         EVERY program on the machine to a dead proxy - that is a failure,
         not a pass, and the message must say how to clear it."""
         (ok, msg), _scripts = self._run(
-            "DNS_GUARD_STATE:keys=2;effective=true;servers=8.8.8.8",
+            "DNS_GUARD_STATE:keys=2,effective=true,servers=8.8.8.8",
             wintun="DOWN")
         self.assertFalse(ok)
         self.assertIn("STALE", msg)
@@ -692,13 +772,13 @@ class TestDashboardHealthRow(unittest.TestCase):
         """A registry key alone proves nothing - Windows can drop a
         malformed rule from its policy, and then nothing is pinned."""
         (ok, msg), _scripts = self._run(
-            "DNS_GUARD_STATE:keys=2;effective=false;servers=8.8.8.8")
+            "DNS_GUARD_STATE:keys=2,effective=false,servers=8.8.8.8")
         self.assertFalse(ok)
         self.assertIn("NOT in force", msg)
 
     def test_no_rule_while_the_tunnel_is_up_fails(self):
         (ok, msg), _scripts = self._run(
-            "DNS_GUARD_STATE:keys=0;effective=false;servers=", wintun="UP")
+            "DNS_GUARD_STATE:keys=0,effective=false,servers=", wintun="UP")
         self.assertFalse(ok)
         self.assertIn("NO DNS-guard rule", msg)
         self.assertIn("--no-dns-guard", msg)
@@ -707,7 +787,7 @@ class TestDashboardHealthRow(unittest.TestCase):
         """The rule only exists while a tunnel is up, so its absence then is
         the CORRECT state, not a leak."""
         (ok, msg), _scripts = self._run(
-            "DNS_GUARD_STATE:keys=0;effective=false;servers=", wintun="DOWN")
+            "DNS_GUARD_STATE:keys=0,effective=false,servers=", wintun="DOWN")
         self.assertTrue(ok)
         self.assertIn("correct while the tunnel is down", msg)
 
@@ -724,7 +804,7 @@ class TestDashboardHealthRow(unittest.TestCase):
 
     def test_failure_names_the_adapters_still_publishing_resolvers(self):
         (ok, msg), _scripts = self._run(
-            "DNS_GUARD_STATE:keys=0;effective=false;servers=", wintun="UP",
+            "DNS_GUARD_STATE:keys=0,effective=false,servers=", wintun="UP",
             foreign=["Wi-Fi=192.168.1.1", "Ethernet=10.0.0.1"])
         self.assertFalse(ok)
         self.assertIn("Wi-Fi=192.168.1.1", msg)
@@ -732,7 +812,7 @@ class TestDashboardHealthRow(unittest.TestCase):
 
     def test_pass_case_also_names_them(self):
         (ok, msg), _scripts = self._run(
-            "DNS_GUARD_STATE:keys=2;effective=true;servers=8.8.8.8",
+            "DNS_GUARD_STATE:keys=2,effective=true,servers=8.8.8.8",
             wintun="UP", foreign=["Wi-Fi=192.168.1.1"])
         self.assertTrue(ok)
         self.assertIn("192.168.1.1", msg)
@@ -741,7 +821,7 @@ class TestDashboardHealthRow(unittest.TestCase):
         """Every probe must go through the dashboard's own _ps: an offline
         test that stubs _ps must never reach PowerShell or the registry."""
         _result, scripts = self._run(
-            "DNS_GUARD_STATE:keys=2;effective=true;servers=8.8.8.8",
+            "DNS_GUARD_STATE:keys=2,effective=true,servers=8.8.8.8",
             wintun="UP", foreign=["Wi-Fi=192.168.1.1"])
         self.assertTrue(any("DNS_GUARD_STATE:" in s for s in scripts))
         self.assertTrue(any("Get-DnsClientServerAddress" in s
@@ -771,7 +851,7 @@ class TestDashboardHealthRow(unittest.TestCase):
         '--no-dns-guard is active, or the install failed' message as a genuine
         install failure - unfixable and indistinguishable from a fault."""
         (ok, msg), _scripts = self._run_enabled(
-            False, "DNS_GUARD_STATE:keys=0;effective=false;servers=",
+            False, "DNS_GUARD_STATE:keys=0,effective=false,servers=",
             wintun="UP")
         self.assertTrue(ok)
         self.assertIn("DISABLED by choice", msg)
@@ -780,7 +860,7 @@ class TestDashboardHealthRow(unittest.TestCase):
 
     def test_the_opt_out_row_still_names_the_foreign_adapters(self):
         (ok, msg), _scripts = self._run_enabled(
-            False, "DNS_GUARD_STATE:keys=0;effective=false;servers=",
+            False, "DNS_GUARD_STATE:keys=0,effective=false,servers=",
             wintun="UP", foreign=["Wi-Fi=192.168.1.1"])
         self.assertTrue(ok)
         self.assertIn("192.168.1.1", msg)
@@ -788,7 +868,7 @@ class TestDashboardHealthRow(unittest.TestCase):
     def test_the_guard_enabled_row_still_fails(self):
         """The opt-out path must not swallow a real failure."""
         (ok, msg), _scripts = self._run_enabled(
-            True, "DNS_GUARD_STATE:keys=0;effective=false;servers=",
+            True, "DNS_GUARD_STATE:keys=0,effective=false,servers=",
             wintun="UP")
         self.assertFalse(ok)
         self.assertIn("NO DNS-guard rule", msg)
@@ -881,7 +961,7 @@ class TestDashboardRowWiring(unittest.TestCase):
 
         def _ps(code, *a, **k):
             if "DNS_GUARD_STATE:" in code:
-                return True, "DNS_GUARD_STATE:keys=1;effective=false;servers="
+                return True, "DNS_GUARD_STATE:keys=1,effective=false,servers="
             if "Get-NetAdapter -Name 'wintun'" in code:
                 return True, "UP"
             if "Get-DnsClientServerAddress" in code:

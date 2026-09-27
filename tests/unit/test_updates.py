@@ -1,7 +1,7 @@
 """Offline regression tests for tuntop.config.updates (GitHub release
 auto-update, 1.0.33).
 
-No network: every fetch is intercepted at urllib.request.urlopen, so the
+No network: every fetch is intercepted at updates._OPENER.open, so the
 verification pipeline (version gating, asset selection, checksum parse,
 SHA-256 match, PE header, staging semantics) is exercised in isolation.
 
@@ -11,7 +11,7 @@ import hashlib
 import io
 import json
 import os
-import sys
+import ssl
 import tempfile
 import unittest
 from unittest import mock
@@ -56,9 +56,10 @@ def _checksums(blob):
 
 
 class _FakeResp:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, url=None):
         self._buf = io.BytesIO(payload)
         self.status = status
+        self.url = url or ""
 
     def read(self, n=-1):
         return self._buf.read(n)
@@ -75,7 +76,7 @@ class TestCheckLatest(unittest.TestCase):
         rel = _release("9.9.9")
         body = json.dumps(rel).encode()
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             # Parse the URL and compare the HOST - never a substring check:
             # "api.github.com" can appear at an arbitrary position in a URL
             # (CodeQL py/incomplete-url-substring-sanitization).
@@ -83,7 +84,7 @@ class TestCheckLatest(unittest.TestCase):
                 return _FakeResp(body)
             raise AssertionError("unexpected fetch " + req.full_url)
 
-        with mock.patch.object(updates.urllib.request, "urlopen", fake_urlopen):
+        with mock.patch.object(updates._OPENER, "open", fake_open):
             info = updates.check_latest("1.0.32")
         self.assertTrue(info["update_available"])
         self.assertEqual(info["version"], "9.9.9")
@@ -91,7 +92,7 @@ class TestCheckLatest(unittest.TestCase):
 
     def test_same_or_older_version_is_no_update(self):
         body = json.dumps(_release("1.0.32")).encode()
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                lambda req, timeout=None: _FakeResp(body)):
             info = updates.check_latest("1.0.32")
         self.assertFalse(info["update_available"])
@@ -99,7 +100,7 @@ class TestCheckLatest(unittest.TestCase):
 
     def test_v_prefixed_tag_is_accepted(self):
         body = json.dumps(_release("2.0.1")).encode()
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                lambda req, timeout=None: _FakeResp(body)):
             info = updates.check_latest("1.0.32")
         self.assertEqual(info["version"], "2.0.1")
@@ -108,7 +109,7 @@ class TestCheckLatest(unittest.TestCase):
         rel = _release("9.9.9")
         rel["prerelease"] = True
         body = json.dumps(rel).encode()
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                lambda req, timeout=None: _FakeResp(body)):
             self.assertRaises(updates.UpdateError, updates.check_latest, "1.0.32")
 
@@ -116,7 +117,7 @@ class TestCheckLatest(unittest.TestCase):
         rel = _release()
         rel["assets"] = rel["assets"][:1]
         body = json.dumps(rel).encode()
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                lambda req, timeout=None: _FakeResp(body)):
             self.assertRaises(updates.UpdateError, updates.check_latest, "1.0.32")
 
@@ -139,7 +140,7 @@ class TestDownloadRelease(unittest.TestCase):
         sums = _checksums(blob) if sums is None else sums
         rel = _release("9.9.9")
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             url = req.full_url
             if url.endswith("releases/latest"):
                 return _FakeResp(json.dumps(rel).encode())
@@ -149,10 +150,10 @@ class TestDownloadRelease(unittest.TestCase):
                 return _FakeResp(sums)
             raise AssertionError("unexpected fetch " + url)
 
-        return fake_urlopen
+        return fake_open
 
     def test_stages_verified_versioned_exe(self):
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                self._install()):
             staged = updates.prepare_update("1.0.32", self.tmp)
         self.assertIsNotNone(staged)
@@ -170,13 +171,13 @@ class TestDownloadRelease(unittest.TestCase):
     def test_up_to_date_returns_none(self):
         rel = _release("1.0.32")
         body = json.dumps(rel).encode()
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                lambda req, timeout=None: _FakeResp(body)):
             self.assertIsNone(updates.prepare_update("1.0.32", self.tmp))
 
     def test_checksum_mismatch_leaves_nothing_behind(self):
         bad_sums = f"TunTop.exe  {'0' * 64}\n".encode()
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                self._install(sums=bad_sums)):
             self.assertRaises(updates.UpdateError,
                               updates.prepare_update, "1.0.32", self.tmp)
@@ -184,7 +185,7 @@ class TestDownloadRelease(unittest.TestCase):
                           if not n.startswith("tuntop_upd_")], [])
 
     def test_not_a_pe_is_rejected(self):
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                self._install(blob=b"not an executable")):
             self.assertRaises(updates.UpdateError,
                               updates.prepare_update, "1.0.32", self.tmp)
@@ -193,32 +194,32 @@ class TestDownloadRelease(unittest.TestCase):
         blob = bytearray(_exe_blob())
         off = int.from_bytes(blob[0x3C:0x40], "little")
         blob[off + 4:off + 6] = (0x014C).to_bytes(2, "little")
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                self._install(blob=bytes(blob))):
             self.assertRaises(updates.UpdateError,
                               updates.prepare_update, "1.0.32", self.tmp)
 
     def test_oversized_exe_is_rejected(self):
         with mock.patch.object(updates, "_MAX_EXE_BYTES", 16):
-            with mock.patch.object(updates.urllib.request, "urlopen",
+            with mock.patch.object(updates._OPENER, "open",
                                    self._install()):
                 self.assertRaises(updates.UpdateError,
                                   updates.prepare_update, "1.0.32", self.tmp)
 
     def test_existing_identical_stage_is_reused(self):
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                self._install()):
             first = updates.prepare_update("1.0.32", self.tmp)
             second = updates.prepare_update("1.0.32", self.tmp)
         self.assertEqual(first.path, second.path)
 
     def test_existing_conflicting_stage_is_rejected(self):
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                self._install()):
             updates.prepare_update("1.0.32", self.tmp)
         other = bytearray(_exe_blob())
         other[-1] ^= 0xFF
-        with mock.patch.object(updates.urllib.request, "urlopen",
+        with mock.patch.object(updates._OPENER, "open",
                                self._install(blob=bytes(other))):
             self.assertRaises(updates.UpdateError,
                               updates.prepare_update, "1.0.32", self.tmp)
@@ -227,8 +228,64 @@ class TestDownloadRelease(unittest.TestCase):
         def offline(req, timeout=None):
             raise urllib.error.URLError("no network")
 
-        with mock.patch.object(updates.urllib.request, "urlopen", offline):
+        with mock.patch.object(updates._OPENER, "open", offline):
             self.assertIsNone(updates.prepare_update("1.0.32", self.tmp))
+
+
+class TestTransportPolicy(unittest.TestCase):
+    """The updater installs a binary. Transport policy is security policy."""
+
+    def test_tls_floor_is_pinned(self):
+        self.assertEqual(updates._SSL_CONTEXT.minimum_version,
+                         ssl.TLSVersion.TLSv1_2)
+        self.assertTrue(updates._SSL_CONTEXT.check_hostname)
+        self.assertEqual(updates._SSL_CONTEXT.verify_mode,
+                         ssl.CERT_REQUIRED)
+
+    def test_https_and_known_host_are_required(self):
+        with self.assertRaises(updates.UpdateError):
+            updates._assert_allowed_url("http://github.com/evil.exe")
+        with self.assertRaises(updates.UpdateError):
+            updates._assert_allowed_url("https://evil.example/x.exe")
+        # The real release CDN hop must keep working.
+        updates._assert_allowed_url(
+            "https://release-assets.githubusercontent.com/x")
+
+    def test_a_redirect_off_the_allowlist_is_refused(self):
+        """urlopen()'s default handler follows a 30x to ANY host, so a
+        302 was followed transparently and whatever the redirector served
+        was treated as the release asset - with checksums.txt fetched over
+        the same redirectable transport, validating the redirector's copy
+        too. The host allow-list must be enforced on every hop."""
+        handler = updates._SameHostRedirectHandler()
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            handler.redirect_request(
+                None, None, 302, "Found", {},
+                "https://evil.example/TunTop.exe")
+        self.assertIn("unexpected host", str(ctx.exception))
+
+    def test_a_redirect_inside_the_allowlist_is_followed(self):
+        handler = updates._SameHostRedirectHandler()
+        req = urllib.request.Request(
+            "https://github.com/kooshaZP/TunTop/releases/download/v1/x.exe")
+        out = handler.redirect_request(
+            req, None, 302, "Found", {},
+            "https://release-assets.githubusercontent.com/x")
+        self.assertIsNotNone(out)
+
+    def test_http_error_is_not_reported_as_offline(self):
+        """HTTPError subclasses OSError, so `except OSError` swallowed every
+        403/404/500 and the updater silently never updated - with no log
+        line at all. A rate limit must be distinguishable from offline."""
+        def rate_limited(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 403, "rate limited", {}, None)
+
+        with mock.patch.object(updates._OPENER, "open", rate_limited):
+            with self.assertRaises(updates.UpdateError) as ctx:
+                updates.prepare_update("1.0.32", tempfile.mkdtemp())
+        self.assertIn("403", str(ctx.exception))
+        self.assertIn("rate limited", str(ctx.exception))
 
 
 if __name__ == "__main__":

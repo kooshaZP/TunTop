@@ -37,6 +37,27 @@ def _ps_process_out(p):
     return p.returncode == 0 and bool(out), out
 
 
+#: Prepended to every PowerShell script. TWO jobs:
+#:   * $ProgressPreference - silence progress/verbose records so they never
+#:     leak as CLIXML into the dashboard.
+#:   * [Console]::OutputEncoding = UTF8 - Windows PowerShell 5.1 writes host
+#:     output using [Console]::OutputEncoding, initialised from the CONSOLE
+#:     code page. _NO_WINDOW (CREATE_NO_WINDOW) gives the child a fresh console
+#:     with the system OEM code page (cp936, cp1251, cp437...), and the
+#:     `chcp 65001` in the .bat / .ps1 launchers does not reliably apply (and
+#:     not at all from Task Scheduler or a double-clicked exe). We decode with
+#:     encoding="utf-8", so without this every non-ASCII byte became U+FFFD:
+#:     a Wi-Fi adapter named "WLAN 无线" came back as "WLAN ", the egress
+#:     lookup returned that mojibake alias, netsh failed to match it, the
+#:     bypass silently never installed, and the scoped delete reported a
+#:     same-prefix route "left untouched" while the route was still live.
+#:     The module already went to the trouble of a UTF-8 BOM for the INPUT
+#:     direction; the output direction was the broken half.
+_PS_PRELUDE = ("$ProgressPreference='SilentlyContinue'; "
+               "[Console]::OutputEncoding = "
+               "[System.Text.Encoding]::UTF8; ")
+
+
 def _ps_file(script, timeout=8):
     """Run PowerShell with the script written to a temp .ps1 FILE.
 
@@ -71,9 +92,7 @@ def _ps(script, timeout=8):
     Small scripts go through -EncodedCommand as before; scripts whose encoded
     command line would approach the 32767-char CreateProcess limit are run
     from a temp .ps1 file instead (see _PS_CMDLINE_SAFE / _ps_file)."""
-    # Silence progress/verbose records so they never leak as CLIXML into the
-    # dashboard; checks report their own status via stdout (+exit code).
-    script = "$ProgressPreference='SilentlyContinue'; " + script
+    script = _PS_PRELUDE + script
     enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     if len(enc) + 80 > _PS_CMDLINE_SAFE:
         return _ps_file(script, timeout)
@@ -150,6 +169,13 @@ def _parse_route_rows(text, full=False):
         parts = [p.strip().replace("'", "") for p in ln.split("|")]
         dest = parts[0]
         if not dest:
+            continue
+        # The guard above only proves the line CONTAINS a '|', so a line with
+        # exactly one (a localized netsh/NetTCPIP warning that happens to
+        # contain a pipe) reaches parts[2] and raises IndexError - aborting
+        # the ENTIRE route-table dump that feeds the snapshot/restore and every
+        # sweep. Check the field count first.
+        if len(parts) < 3:
             continue
         nh = parts[2]
         if nh.lower() in ("0.0.0.0", "::", "on-link"):
@@ -419,25 +445,40 @@ def _add_route_v4(dest, iface, gateway, metric=1):
         return True
     if "already exists" in msg.lower():
         # Could be a PERSISTENT leftover from an older build (registry) that
-        # would survive a reboot. Convert it to active-store-only: delete then
-        # re-add with store=active.
-        _netsh(["interface", "ipv4", "delete", "route", dest, iface, gateway])
+        # would survive a reboot. Convert it to active-store-only: delete it
+        # from BOTH stores, then re-add with store=active.
+        #
+        # `netsh ... delete route` DEFAULTS to store=active, so the old
+        # single delete could never touch a PersistentStore entry: the re-add
+        # hit the same persistent route, said "already exists" again, and
+        # `ok2 or "already exists" in msg2` reported SUCCESS while nothing had
+        # been converted. The user saw "added"; after a reboot the OLD
+        # persistent /32 via the OLD gateway was back and the new one absent -
+        # a silent blackhole.
+        for store in ("persistent", "active"):
+            _netsh(["interface", "ipv4", "delete", "route", dest, iface,
+                    gateway, f"store={store}"])
         ok2, msg2 = _netsh(["interface", "ipv4", "add", "route", dest, iface, gateway, f"metric={metric}", "store=active"])
-        return ok2 or "already exists" in msg2.lower()
+        if ok2:
+            return True
+        # Gate on OUR EXACT route being live, not on the text "already
+        # exists" - that string is exactly what the failed conversion above
+        # produced, so it cannot be a success signal.
+        return _route_matches_v4(dest, iface, gateway, metric)
     return False
 
 
 def _route_exists_v4(dest):
     """True if any IPv4 route with exactly this prefix is in the live table."""
     ok, out = _ps(
-        f"if (Get-NetRoute -DestinationPrefix '{dest}' -AddressFamily IPv4 "
+        f"if (Get-NetRoute -DestinationPrefix '{ps_quote(dest)}' -AddressFamily IPv4 "
         f"-ErrorAction SilentlyContinue) {{ 'yes' }}")
     return ok and "yes" in out
 
 
 def _route_exists_v6(dest):
     ok, out = _ps(
-        f"if (Get-NetRoute -DestinationPrefix '{dest}' -AddressFamily IPv6 "
+        f"if (Get-NetRoute -DestinationPrefix '{ps_quote(dest)}' -AddressFamily IPv6 "
         f"-ErrorAction SilentlyContinue) {{ 'yes' }}")
     return ok and "yes" in out
 
@@ -602,20 +643,29 @@ def _del_route_scoped(dest, fam, known_ifaces=()):
     This is the ONLY prefix-wide-looking delete in TunTop, and it is never
     actually prefix-wide: every Remove-NetRoute carries -InterfaceAlias.
     A same-prefix route on any other interface is foreign (user static
-    route, corporate VPN split tunnel) and must survive."""
+    route, corporate VPN split tunnel) and must survive.
+
+    The return contract is unchanged and load-bearing: `foreign` means ONLY
+    "a same-prefix route survived on an interface outside our scope". A
+    leftover on one of our OWN candidates (the Remove-NetRoute was denied,
+    in use, or hit a transient CIM error) returns (False, False) - the caller
+    still learns the route is not gone from `removed`, which is the flag it
+    acts on, and it must not be told "a foreign route is in the way" when
+    the route is ours."""
     if fam not in ("v4", "v6"):
         return False, False
     fam_ps = "IPv4" if fam == "v4" else "IPv6"
+    dest_q = ps_quote(dest)
     # Candidate interfaces: ours first, deduplicated, order-stable.
     candidates = list(dict.fromkeys(
         [a for a in (known_ifaces or ()) if a] + list(_TUNNEL_ALIASES)))
     for alias in candidates:
-        _ps(f"Remove-NetRoute -DestinationPrefix '{dest}' -AddressFamily {fam_ps} "
+        _ps(f"Remove-NetRoute -DestinationPrefix '{dest_q}' -AddressFamily {fam_ps} "
             f"-InterfaceAlias '{ps_quote(alias)}' "
             f"-Confirm:$false -ErrorAction SilentlyContinue | Out-Null")
     # Anything left with this prefix is on an interface outside our scope.
     ok, out = _ps(
-        f"$r = Get-NetRoute -DestinationPrefix '{dest}' -AddressFamily {fam_ps} "
+        f"$r = Get-NetRoute -DestinationPrefix '{dest_q}' -AddressFamily {fam_ps} "
         f"-ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceAlias "
         f"-Unique; if ($r) {{ $r -join '|' }} else {{ 'none' }}")
     leftover = []
@@ -637,13 +687,19 @@ def _add_route_v6(dest, iface, gateway, metric=1):
     if ok:
         return True
     if "already exists" in msg.lower():
-        # Convert a persistent leftover (see _add_route_v4 for why).
-        del_cmd = ["interface", "ipv6", "delete", "route", dest, iface]
-        if gateway:
-            del_cmd.append(gateway)
-        _netsh(del_cmd)
-        ok2, msg2 = _netsh(cmd)
-        return ok2 or "already exists" in msg2.lower()
+        # Convert a persistent leftover to active-store-only (see
+        # _add_route_v4 for why the store= on the delete is load-bearing, and
+        # why "already exists" cannot be a success signal).
+        for store in ("persistent", "active"):
+            del_cmd = ["interface", "ipv6", "delete", "route", dest, iface,
+                       f"store={store}"]
+            if gateway:
+                del_cmd.insert(-1, gateway)
+            _netsh(del_cmd)
+        ok2, _msg2 = _netsh(cmd)
+        if ok2:
+            return True
+        return _route_matches_v6(dest, iface, gateway, metric)
     return False
 
 
@@ -674,8 +730,19 @@ $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction Sil
     Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
     Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {
+    // Last resort only - and STILL VPN-excluded. The first block was
+    // hardened against a connected Windows VPN advertising a low-metric
+    // ::/0 (IKEv2/SSTP), which would otherwise capture every IPv6 bypass
+    // route onto the corporate adapter. The fallback used to drop the
+    // $vpnAliases clause entirely, so on a box with no native v6 default the
+    // very first candidate WAS the VPN - reintroducing exactly the hijack
+    // the first block prevents, silently and with no log line.
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.State -eq 'Alive' -and $tunAliases -notcontains $_.InterfaceAlias } |
+        Where-Object {
+            $_.State -eq 'Alive' -and
+            $tunAliases -notcontains $_.InterfaceAlias -and
+            ($vpnAliases.Count -eq 0 -or -not ($vpnAliases -contains $_.InterfaceAlias))
+        } |
         Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
         Select-Object -First 1 NextHop, InterfaceAlias
 }

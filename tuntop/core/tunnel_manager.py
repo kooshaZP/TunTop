@@ -107,7 +107,13 @@ class TunnelManager:
             if verify_immediately:
                 self.machine.try_transition(TunnelState.VERIFYING,
                                             "launch attempted")
-        except Exception as e:                       # pragma: no cover
+        except (Exception, SystemExit) as e:           # pragma: no cover
+            # SystemExit matters: make_launch() runs helper.main() IN-PROCESS
+            # and that code exits via sys.exit() on many failure paths. A
+            # SystemExit is a BaseException, so `except Exception` let it
+            # through - the process died instead of transitioning to FAILED,
+            # the UI never learned why, and the route table could be left
+            # half-installed.
             self.machine.try_transition(TunnelState.FAILED, f"launch error: {e}")
             self._blog("ERROR", "CORE", f"launch failed: {e}")
             return False
@@ -128,8 +134,20 @@ class TunnelManager:
         try:
             if self._teardown is not None:
                 self._teardown()
-        finally:
-            self.machine.try_transition(TunnelState.STOPPED, "teardown complete")
+        except (Exception, SystemExit) as e:
+            # A teardown that raises used to land in STOPPED anyway (the
+            # `finally` won), so the UI reported a clean stop while the Wintun
+            # adapter, its routes and the NRPT rule were all still installed.
+            # FAILED is the honest state, and it is reachable in the graph
+            # (STOPPING -> FAILED), which no code path ever used.
+            self.machine.try_transition(
+                TunnelState.FAILED, f"teardown failed: {e}")
+            self._blog("ERROR", "CORE",
+                       f"tunnel teardown FAILED - leftover routes may remain: {e}")
+            return False
+        else:
+            self.machine.try_transition(TunnelState.STOPPED,
+                                        "teardown complete")
         self._blog("INFO", "CORE", "tunnel stopped")
         return True
 

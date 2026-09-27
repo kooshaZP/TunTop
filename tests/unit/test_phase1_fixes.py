@@ -42,10 +42,22 @@ class TestLanVictims(unittest.TestCase):
         victims = WD._lan_victims(rows, self.IFACE, self.GW)
         self.assertEqual(len(victims), 3)
 
-    def test_stale_pin_from_previous_network_is_a_victim(self):
+    def test_stale_pin_from_previous_network_is_NOT_a_victim(self):
+        """A LAN prefix on our adapter but via a DIFFERENT gateway is a
+        foreign static route (a VPN split tunnel, a NAS subnet) - not our
+        stale pin. The old rule treated "a real next-hop that is not the
+        current gateway" as ours; a next-hop-exact delete of a row you
+        selected is still a delete, so the [Q] sweep and the crash watchdog
+        removed corporate routes TunTop never created."""
         rows = [_r("192.168.0.0/16", self.IFACE, "192.168.1.1")]
+        self.assertEqual(WD._lan_victims(rows, self.IFACE, self.GW), [])
+
+    def test_the_same_route_on_the_current_gateway_is_a_victim(self):
+        """The positive counterpart: same prefix, same interface, next hop
+        equal to the gateway the caller passed in."""
+        rows = [_r("192.168.0.0/16", self.IFACE, self.GW)]
         self.assertEqual(WD._lan_victims(rows, self.IFACE, self.GW),
-                         [("192.168.0.0/16", self.IFACE, "192.168.1.1")])
+                         [("192.168.0.0/16", self.IFACE, self.GW)])
 
     def test_foreign_interface_is_never_a_victim(self):
         rows = [_r("192.168.0.0/16", "Ethernet", "192.168.1.1")]

@@ -112,7 +112,16 @@ class Backend:
         return bool(self._exists[op.family](op.dest))
 
     def remove(self, op: RouteOp) -> bool:
-        res = self._del[op.family](op.dest, op.iface, op.gateway)
+        # Pass the metric through. remove_v4/v6 default it to 1, so a
+        # transaction that removes a metric-256 route and then rolls back
+        # re-added it with metric 1 - silently changing which route Windows
+        # prefers, while commit()'s contract promises the routing table is
+        # UNCHANGED.
+        try:
+            res = self._del[op.family](op.dest, op.iface, op.gateway,
+                                       op.metric)
+        except TypeError:            # custom backends with fewer params
+            res = self._del[op.family](op.dest, op.iface, op.gateway)
         if isinstance(res, tuple):        # (removed, foreign)
             res = res[0]
         return bool(res)
@@ -137,7 +146,12 @@ class Backend:
             return None
         try:
             rows = fn(op.dest) or []
-        except TypeError:
+        except Exception:
+            # Any failure of the optional probe (a PowerShell/subprocess
+            # error, not just a signature mismatch) is a "cannot check", not
+            # a transaction-fatal error. `except TypeError` let an OSError
+            # escape into the apply loop and abort the WHOLE transaction,
+            # reporting the probe's error instead of installing the route.
             return None
         ours = None
         for r in rows:
@@ -148,8 +162,16 @@ class Backend:
                 break
         if ours is None or not rows:
             return None
-        best = min(rows, key=lambda r: int(r.get("eff", 0) or 0))
-        if int(best.get("eff", 0) or 0) < int(ours.get("eff", 0) or 0):
+        # An absent/garbage metric must not win the comparison: int(None)
+        # would raise (aborting the transaction) and a silent 0 would
+        # outrank every real metric. Sort it LAST instead.
+        def _eff(r):
+            try:
+                return int(r.get("eff"))
+            except (TypeError, ValueError):
+                return 1 << 30
+        best = min(rows, key=_eff)
+        if _eff(best) < _eff(ours):
             return (f"shadowed by better-metric route "
                     f"on '{best.get('iface')}'")
         return None
@@ -291,6 +313,11 @@ class RouteTransaction:
             result.ok = True
             return result
         # A failure happened: undo everything applied so far, in reverse.
+        # Report the ops that DID take effect even though they are about to be
+        # rolled back: `applied` used to stay empty, so the log and the
+        # diagnostics export claimed nothing was applied even though routes
+        # were installed and then removed.
+        result.applied = list(applied)
         result.errors = self._rollback(applied, result.rolled_back)
         return result
 

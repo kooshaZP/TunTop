@@ -14,6 +14,10 @@ import hashlib
 import json
 import os
 import re
+import socket
+import ssl
+import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -32,6 +36,75 @@ _TIMEOUT = 20
 _UA = {"User-Agent": "TunTop-Updater"}
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _SHA256_RE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.+)$")
+
+#: Hosts every request (and every redirect hop) must stay on. The release
+#: API is api.github.com; artifact URLs are served from github.com under
+#: _ASSET_BASE and legitimately 302 to release-assets.githubusercontent.com
+#: (GitHub's own asset CDN) for the actual bytes. That last one is part of
+#: the same trust boundary, so it is allowed by name; anything else - a
+#: typosquat, a proxy, a hijacked DNS answer - is refused.
+_ALLOWED_HOSTS = (
+    "github.com",
+    "api.github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+
+#: TLS floor, pinned explicitly. Without it the module inherits whatever the
+#: interpreter's default context allows, and nothing in this file proves the
+#: protocol is 1.2+.
+_SSL_CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+_SSL_CONTEXT.load_default_certs()
+_SSL_CONTEXT.check_hostname = True
+_SSL_CONTEXT.verify_mode = ssl.CERT_REQUIRED
+if hasattr(ssl, "TLSVersion"):
+    _SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+
+
+class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse a 30x that leaves the expected hosts.
+
+    urlopen() installs the DEFAULT redirect handler, which follows a 302 to
+    ANY host and ANY scheme. check_latest() verified the URLs it was GIVEN
+    start with _ASSET_BASE, then handed them straight to urlopen - so a
+    redirect was followed transparently and whatever the redirector served
+    was treated as the release asset. The checksums file came over the same
+    redirectable transport, so it validated the redirector's copy too.
+
+    Re-raise instead of following, so the caller sees the real failure.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            host = urllib.parse.urlsplit(newurl).hostname or ""
+        except ValueError:
+            raise urllib.error.HTTPError(
+                newurl, code, f"malformed redirect target: {msg}",
+                headers, fp)
+        if host.lower() not in _ALLOWED_HOSTS:
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"refusing redirect to an unexpected host ({host})",
+                headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(
+    _SameHostRedirectHandler(),
+    urllib.request.HTTPSHandler(context=_SSL_CONTEXT),
+)
+
+
+def _assert_allowed_url(url: str) -> None:
+    """Fail closed on a URL that is not HTTPS on an expected host."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError as e:
+        raise UpdateError(f"malformed asset URL: {e}")
+    if parts.scheme != "https":
+        raise UpdateError(f"asset URL is not https: {url}")
+    if (parts.hostname or "").lower() not in _ALLOWED_HOSTS:
+        raise UpdateError(f"asset URL is not on an expected host: {url}")
 
 
 class UpdateError(Exception):
@@ -72,12 +145,21 @@ def _fetch(url: str, limit: int, timeout: Optional[int] = None) -> bytes:
     `timeout` overrides the module default so a CALLER can bound the wait:
     the startup check runs inline, before the dashboard opens, and a
     20-second network stall there would look like a hung app (it passes a
-    short one; the background download keeps the full default)."""
+    short one; the background download keeps the full default).
+
+    Goes through _OPENER, not urlopen: the opener carries the explicit
+    TLS 1.2+ floor and the same-host redirect policy, both of which
+    urlopen() would bypass. The FINAL url is re-checked after the response
+    arrives, so a redirect that slipped through is caught before a single
+    byte is used."""
+    _assert_allowed_url(url)
     req = urllib.request.Request(url, headers=_UA)
-    with urllib.request.urlopen(
+    with _OPENER.open(
             req, timeout=_TIMEOUT if timeout is None else timeout) as resp:
+        final = getattr(resp, "url", None) or url
+        _assert_allowed_url(final)
         if getattr(resp, "status", 200) != 200:
-            raise UpdateError(f"HTTP {resp.status} for {url}")
+            raise UpdateError(f"HTTP {resp.status} for {final}")
         return _bigger_then_strip(resp.read(limit + 1), limit)
 
 
@@ -245,7 +327,18 @@ def prepare_update(current_version: str, directory: str,
         if "unsupported release tag" in str(e) or "draft/prerelease" in str(e):
             return None
         raise
-    except OSError:
+    except urllib.error.HTTPError as e:
+        # HTTPError is a subclass of OSError, so the old `except OSError`
+        # swallowed it: a 403 rate-limit, a 404 (release renamed) and a 500
+        # were all indistinguishable from "offline", so the updater silently
+        # never updated and logged nothing at all. Surface the code - the
+        # caller shows it to the user.
+        raise UpdateError(
+            f"update check failed: HTTP {e.code} from "
+            f"{getattr(e, 'url', 'the release feed')}"
+            + (" (rate limited - try again later)"
+               if e.code in (403, 429) else "")) from e
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
         return None
     if not info["update_available"]:
         return None

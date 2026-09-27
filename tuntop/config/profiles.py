@@ -33,6 +33,36 @@ def profile_file(package_dir: str) -> str:
     return os.path.join(package_dir, PROFILE_FILENAME)
 
 
+def _atomic_write_store(path: str, data: dict) -> None:
+    """Write the profiles store ATOMICALLY, creating the directory if needed.
+
+    Every save / delete / default-change / UI-preference write went through
+    `open(path, "w")` + json.dump, which truncates the single
+    MyTunTopProfile.json to zero before the first write lands. A crash,
+    Ctrl+C or a full disk mid-dump left a half-written file, after which
+    load_store reports an error and save_snapshot REFUSES to touch it
+    ("Could not read profiles.json") - so the user lost every profile, with
+    no backup anywhere. Temp file in the same directory + os.replace()
+    (atomic on Windows for same-volume paths) removes the window entirely.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def snapshot_from_args(ns) -> dict:
     """Capture everything that defines a setup from the argparse
     namespace. Only settings - never credentials (VLESS auth lives in
@@ -83,7 +113,7 @@ def save_snapshot(path: str, name: str, snapshot: dict) -> tuple:
     name = (name or "").strip()
     if not name:
         return False, "[!] Empty profile name - not saved."
-    if name == DEFAULT_KEY or name == UI_KEY:
+    if name in RESERVED_KEYS:
         return False, (f"[!] '{name}' is a reserved name "
                        "(default marker / UI settings) - not saved.")
     try:
@@ -91,8 +121,7 @@ def save_snapshot(path: str, name: str, snapshot: dict) -> tuple:
         if err and err != "missing":
             return False, f"[!] Could not read profiles.json: {err}"
         data[name] = snapshot
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_store(path, data)
     except Exception as e:
         return False, f"[!] Could not write profiles.json: {e}"
     # Count only real profiles - the reserved _default/_ui keys are settings,
@@ -109,13 +138,25 @@ DEFAULT_KEY = "_default"
 #: never a profile: the [I] picker and every profile count skip it.
 UI_KEY = "_ui"
 
+#: Reserved store keys. A profile name may be NEITHER of these: save_snapshot
+#: refuses both, and so must every other mutator. set_default_profile() used
+#: to check only DEFAULT_KEY, so with "_ui" present in the store a user could
+#: mark the UI-preferences blob as the default - get_default_profile() then
+#: returned "_ui" and the startup path fed it to apply_to_args(), which
+#: unconditionally sets ns.server = [] and clears every bypass list. The app
+#: would come up with no server at all, and no error anywhere.
+RESERVED_KEYS = (DEFAULT_KEY, UI_KEY)
+
 
 def delete_profile(path: str, name: str) -> tuple:
     """Remove one named profile from the store. Returns (ok, message) with
     the message UI-ready. Deleting the DEFAULT profile also clears the
     auto-load marker (there is nothing left to auto-load)."""
     name = (name or "").strip()
-    if not name or name == DEFAULT_KEY:
+    if not name or name in RESERVED_KEYS:
+        # UI_KEY included: delete_profile("_ui") used to succeed and wipe
+        # every remembered UI preference through the profile code path, even
+        # though _ui is not a profile and is never listed as one.
         return False, "[!] Invalid profile name - nothing deleted."
     try:
         data, err = load_store(path)
@@ -128,8 +169,7 @@ def delete_profile(path: str, name: str) -> tuple:
         if data.get(DEFAULT_KEY) == name:
             data.pop(DEFAULT_KEY, None)
             cleared = True
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_store(path, data)
     except Exception as e:
         return False, f"[!] Could not write the profiles store: {e}"
     msg = f"[+] Profile '{name}' deleted."
@@ -149,15 +189,20 @@ def set_default_profile(path: str, name) -> tuple:
         name = (name or "").strip() or None
         if name is None:
             data.pop(DEFAULT_KEY, None)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            _atomic_write_store(path, data)
             return True, "[i] Default profile cleared - no auto-load on start."
-        if name == DEFAULT_KEY or name not in data:
+        if name in RESERVED_KEYS or name not in data:
+            # RESERVED_KEYS, not just DEFAULT_KEY: pointing the auto-load
+            # marker at "_ui" made the startup path apply a UI-preferences
+            # blob as a setup, which wipes ns.server and every bypass list.
+            if name in RESERVED_KEYS:
+                return False, (f"[!] '{name}' is a reserved key (the "
+                               "default marker / UI settings), not a profile "
+                               "- not set as default.")
             return False, (f"[!] Profile '{name}' does not exist - "
                            "not set as default.")
         data[DEFAULT_KEY] = name
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_store(path, data)
     except Exception as e:
         return False, f"[!] Could not write the profiles store: {e}"
     return True, (f"[+] Default profile set to '{name}' - it auto-loads "
@@ -171,7 +216,9 @@ def get_default_profile(path: str):
     if err:
         return None
     name = data.get(DEFAULT_KEY)
-    if isinstance(name, str) and name in data:
+    # Never hand back a reserved key: a hand-edited or previously-corrupted
+    # store must not be able to auto-load the UI blob as a setup.
+    if isinstance(name, str) and name in data and name not in RESERVED_KEYS:
         return name
     return None
 
@@ -206,8 +253,7 @@ def save_ui_state(path: str, updates: dict) -> tuple:
             ui = {}
         ui.update(updates)
         data[UI_KEY] = ui
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_store(path, data)
         return True, None
     except Exception as e:
         return False, str(e)
@@ -276,10 +322,12 @@ def export_profile(path: str, name: str, snapshot: dict) -> tuple:
     name = (name or "").strip()
     if not name:
         return False, "[!] Empty profile name - not exported."
+    if name in RESERVED_KEYS:
+        return False, (f"[!] '{name}' is a reserved name - cannot be "
+                       "exported as a profile.")
     try:
         envelope = {"name": name, "snapshot": snapshot}
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(envelope, f, indent=2)
+        _atomic_write_store(path, envelope)
     except Exception as e:
         return False, f"[!] Could not write profile: {e}"
     return True, f"[+] Profile '{name}' exported to {os.path.basename(path)}."
@@ -300,10 +348,18 @@ def import_profile(path: str) -> tuple:
 
     if not isinstance(data, dict):
         return None, None, "Invalid profile file (not a JSON object)."
-    name = data.get("name", "").strip()
+    # str() before strip(): a hand-edited file with "name": null raised
+    # AttributeError, which is not caught by the read guard above - so the
+    # import handler crashed its caller instead of returning the documented
+    # (None, None, error) triple.
+    name = str(data.get("name") or "").strip()
     snap = data.get("snapshot")
     if not name:
         return None, None, "Profile file missing 'name' field."
+    if name in RESERVED_KEYS:
+        return None, None, (f"'{name}' is a reserved key (the default marker "
+                            "/ UI settings) and cannot be imported as a "
+                            "profile.")
     if not isinstance(snap, dict):
         return None, None, "Profile file missing or invalid 'snapshot' field."
     return name, snap, None

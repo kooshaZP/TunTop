@@ -96,6 +96,14 @@ NRPT_ROOT = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyCon
 NRPT_PS_ROOT = ("HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache"
                 "\\Parameters\\DnsPolicyConfig")
 
+# Re-exported so callers can reach the shared VPN-adapter pattern from here
+# too. It is DEFINED in tuntop.config.defaults (one definition, imported by
+# the helper, the egress script builder and the health checks - it used to be
+# re-hardcoded in seven places across three modules, and any disagreement made
+# a route get pointed at an interface the rest of the code believed was "not
+# a VPN").
+from tuntop.config.defaults import VPN_IFACE_RE as VPN_IFACE_RE  # noqa: F401
+
 #: Where the install record lives. Frozen exe: next to TunTop.exe (stable
 #: across runs, identical for the helper child and the watchdog); source run:
 #: next to this module - the same rule core/startup_recovery.py uses for
@@ -226,6 +234,18 @@ def uninstall_script() -> str:
     return f"""$ErrorActionPreference = 'Stop'
 $root = {_ps_quote(NRPT_PS_ROOT)}
 try {{
+    # PROVE we can actually READ the store before sweeping. Without this,
+    # every cmdlet below runs with -ErrorAction SilentlyContinue: a
+    # non-elevated process (or an ACL-denied DnsPolicyConfig) makes
+    # Get-ChildItem return nothing, $left.Count is 0, and the script happily
+    # printed DNS_GUARD_REMOVED while the TunTop-* keys were still there -
+    # pinning all name resolution to a tunnel that is being torn down. An
+    # unreadable store is a FAILURE, not an empty one.
+    if (-not (Test-Path -LiteralPath $root)) {{
+        Write-Output 'DNS_GUARD_REMOVED'
+        return
+    }}
+    $probe = @(Get-ChildItem -Path $root -ErrorAction Stop)
     Get-ChildItem -Path $root -ErrorAction SilentlyContinue |
         Where-Object {{ $_.PSChildName -like {_ps_quote(GUARD_KEY_PREFIX + '*')} }} |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -250,7 +270,7 @@ try {{
 def detect_script() -> str:
     """PowerShell that reports the guard's state in one parseable line:
 
-        DNS_GUARD_STATE:keys=<n>;match=<n>;effective=<true|false>;servers=<...>
+        DNS_GUARD_STATE:keys=<n>,match=<n>,effective=<true|false>,servers=<...>
 
     `keys` counts our registry rules (the catch-all plus any exemption);
     `match` counts ONLY the catch-all, so a caller can tell "our pin is
@@ -276,7 +296,13 @@ try {{
         $eff = $true
     }}
 }} catch {{ }}
-Write-Output ('DNS_GUARD_STATE:keys=' + @($keys).Count + ';match=' + $match + ';effective=' + $eff.ToString().ToLower() + ';servers=' + $servers)
+# FIELD SEPARATOR: ',' - NOT ';'. The `servers` field is a resolver LIST
+# joined with ';' by _servers_value(), so splitting the line on ';' chopped a
+# two-resolver value ("8.8.8.8;2606:4700:4700::1111") into a first field
+# "8.8.8.8" plus an orphan part that matched no branch and was dropped. Every
+# diagnostic then reported only the first resolver, hiding the v6 half of the
+# pin. A resolver list can never contain ',', so ',' is unambiguous.
+Write-Output ('DNS_GUARD_STATE:keys=' + @($keys).Count + ',match=' + $match + ',effective=' + $eff.ToString().ToLower() + ',servers=' + $servers)
 """
 
 
@@ -301,7 +327,9 @@ def parse_detect(out) -> dict:
             break
     if not line:
         return state
-    for part in line.split(";"):
+    # ',' - see the FIELD SEPARATOR note on detect_script(). A ';' here
+    # truncated every multi-resolver `servers` value to its first entry.
+    for part in line.split(","):
         key, _, val = part.partition("=")
         key = key.strip().lower()
         val = val.strip()
@@ -338,8 +366,27 @@ def save_state(resolvers, exempt=(), path: Optional[str] = None) -> bool:
         "since": time.time(),
     }
     try:
-        with open(target, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
+        # ATOMIC. open(target, "w") truncates to zero before the first write
+        # reaches the file, and this record has FOUR independent readers (the
+        # helper's cleanup, startup recovery, the detached watchdog and the
+        # dashboard's own sweeps). A reader landing in that window got "",
+        # json.load raised, load_state returned None, and it concluded "no
+        # guard installed" and skipped the removal - while a live catch-all
+        # pin remained. Write to a temp file in the same directory and
+        # os.replace() (atomic on Windows for same-volume paths).
+        tmp = f"{target}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, target)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
         return True
     except Exception:
         return False
@@ -434,10 +481,23 @@ def uninstall(runner: Optional[Callable] = None,
     if "DNS_GUARD_REMOVED" in text:
         clear_state(path=path)
         return True, "removed"
-    # The command ran and reported neither marker: nothing of ours was found
-    # (a missing NRPT store is a clean state, not an error).
-    clear_state(path=path)
-    return True, "removed (nothing to remove)"
+    # The command ran and reported NEITHER marker. That is not proof that
+    # nothing of ours was found: uninstall_script() sweeps with
+    # -ErrorAction SilentlyContinue, so on a non-elevated process (or an
+    # ACL-denied DnsPolicyConfig key) Get-ChildItem returns nothing, the
+    # count is 0, and it prints DNS_GUARD_REMOVED even though the TunTop-*
+    # keys are still there. The script now distinguishes that case with its
+    # own marker; if we still see no marker at all, something else went
+    # wrong (a parse error, truncated stdout) and the safe answer is to
+    # report failure and KEEP the record, so the next launch's recovery
+    # still knows a rule may be alive. install_script() fails closed; the
+    # uninstall must too - a rule that outlives the tunnel pins every
+    # process on the machine to resolvers that are now dead.
+    return False, ("guard removal gave no verdict (the NRPT store could not "
+                   "be read, or the sweep did not run) - treating it as a "
+                   "failure so the install record is kept and the next "
+                   "TunTop start retries. Re-run as Administrator if this "
+                   "persists.")
 
 
 def detect(runner: Optional[Callable] = None) -> tuple:
@@ -500,7 +560,10 @@ def foreign_resolvers_script(aliases=DEFAULT_TUNNEL_ALIASES) -> str:
     which the caller treats as "nothing to see" rather than a leak verdict.
 
     Loopback entries are dropped per address rather than per adapter, so an
-    adapter publishing 127.0.0.1 *and* a real resolver is still reported."""
+    adapter publishing 127.0.0.1 *and* a real resolver is still reported.
+    BOTH loopback families are filtered: with only '127.0.0.1' excluded, an
+    adapter whose sole resolver was ::1 was still reported, which made the
+    leak check declare "DNS is leaking" on a machine that is not."""
     tun = [str(a).replace("'", "''") for a in (aliases or ()) if str(a).strip()]
     if not tun:
         tun = ["wintun", "wintun2"]
@@ -508,11 +571,12 @@ def foreign_resolvers_script(aliases=DEFAULT_TUNNEL_ALIASES) -> str:
             "Where-Object { $_.Status -eq 'Up' } | "
             "ForEach-Object { $_.Name }); "
             "$t = @(" + ",".join("'" + a + "'" for a in tun) + "); "
+            "$loops = @('127.0.0.1', '::1'); "
             "Get-DnsClientServerAddress -ErrorAction SilentlyContinue | "
             "Where-Object { $up -contains $_.InterfaceAlias -and "
             "$t -notcontains $_.InterfaceAlias } | "
             "ForEach-Object { $a = @($_.ServerAddresses | "
-            "Where-Object { $_ -and $_ -ne '127.0.0.1' }); "
+            "Where-Object { $_ -and $loops -notcontains $_ }); "
             "if ($a.Count -gt 0) { $_.InterfaceAlias + '=' + ($a -join ',') } }")
 
 

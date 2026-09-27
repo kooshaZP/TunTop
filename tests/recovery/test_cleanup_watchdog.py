@@ -13,8 +13,6 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 from tuntop.core.cleanup_watchdog import (
-    DEFAULT_GRACE_SECONDS,
-    LOG_FILE,
     kill_pid,
     main,
     sweep_after_unclean_exit,
@@ -72,25 +70,34 @@ class TestKillPid(unittest.TestCase):
 
     def test_taskkill_success(self):
         with patch("sys.platform", "win"), \
-             patch("subprocess.call", return_value=0) as mock_call:
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
             self.assertTrue(kill_pid(1234))
-            mock_call.assert_called_once()
-            args = mock_call.call_args[0][0]
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
             self.assertEqual(args, ["taskkill", "/F", "/T", "/PID", "1234"])
+            # A hung taskkill used to park the watchdog forever: every other
+            # netsh/PowerShell call in the watchdog is bounded, this was not.
+            self.assertEqual(mock_run.call_args[1]["timeout"], 30)
+
+    def test_taskkill_timeout_falls_back(self):
+        """A hung taskkill must not block the sweep - fall through to
+        TerminateProcess."""
+        with patch("sys.platform", "win"), \
+             patch("subprocess.run", side_effect=TimeoutError("hung")), \
+             patch("tuntop.core.cleanup_watchdog._kernel32") as mock_k32:
+            mock_k32.return_value.OpenProcess.return_value = "FAKE_HANDLE"
+            mock_k32.return_value.TerminateProcess.return_value = True
+            self.assertTrue(kill_pid(1234))
 
     def test_taskkill_fails_falls_back(self):
         """taskkill non-zero -> TerminateProcess fallback."""
         with patch("sys.platform", "win"), \
-             patch("subprocess.call", return_value=1), \
-             patch("ctypes.windll") as mock_windll:
-            mock_k32 = MagicMock()
-            mock_windll.kernel32 = mock_k32
-            fake_h = "FAKE_HANDLE"
-            mock_k32.OpenProcess.return_value = fake_h
-            mock_k32.TerminateProcess.return_value = True
-            import ctypes
-            with patch.dict("sys.modules", {"ctypes": MagicMock(windll=mock_windll, GetLastError=lambda: 0, c_int=MagicMock(), c_ulong=MagicMock())}):
-                pass  # complex mock - skip detailed assertion
+             patch("subprocess.run") as mock_run, \
+             patch("tuntop.core.cleanup_watchdog._kernel32") as mock_k32:
+            mock_run.return_value = MagicMock(returncode=1)
+            mock_k32.return_value.OpenProcess.return_value = "FAKE_HANDLE"
+            mock_k32.return_value.TerminateProcess.return_value = True
             self.assertTrue(kill_pid(1234))
 
 

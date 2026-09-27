@@ -46,13 +46,30 @@ v2rayN, Xray, sing-box, Clash Meta — any proxy client with a local SOCKS5 inbo
 - Optional adapter-activity logging (`--log-adapter-activity`) — UDP/QUIC
   connections, ICMP counter deltas and Wintun throughput deltas land in the
   structured event log (off by default; saved in your profile)
-- Kill-safe cleanup — verified teardown on every exit
+- **Kill-safe cleanup — verified teardown on every exit.** Each teardown
+  phase is isolated, so one failing step cannot skip the rest; the geo
+  install threads are cancelled *and joined* before the route ledger is
+  snapshotted; and a repeated Ctrl+C can no longer abort a teardown that is
+  already running.
 - Live bypass add/remove without restarting the tunnel
 - Geo-IP country routing from `geoip.dat`
-- Health monitoring with 42+ live checks (route, DNS, leak, proxy, geo)
-- Self-healing — auto-restarts on tunnel failure
+- **Health monitoring with 42+ live checks** (route, DNS, leak, proxy, geo).
+  Checks are **tri-state**: `✔` verified, `✗` a real fault, and a grey `?`
+  for "this probe could not answer" (no route to probe right now, an
+  ICMP-filtered host, a DNS family you never configured). The `?` rows are
+  counted separately as `n/a` and never drive the UNHEALTHY badge — a
+  check that proved nothing is not a fault in your setup. The health panel
+  title also shows the visible row range once the list is longer than the
+  panel, so you can see there are more rows below.
+- Self-healing — auto-restarts on tunnel failure, with a crash-loop
+  backoff that genuinely escalates (a helper that keeps dying right after
+  launch is caught instead of being reset to attempt 1 forever)
 - btop-style dashboard with throughput graphs, 7 color themes
-- Leak test, diagnostics export, profiles
+- Leak test, diagnostics export, profiles. **Crash logs and the `[D]`
+  diagnostics export are written next to `TunTop.exe`**, so they survive
+  the process (they used to land in the onefile extraction directory,
+  which is deleted on exit — from the standalone exe, every crash report
+  and diagnostics file was being lost).
 - Protocol-agnostic — VLESS, VMess, Trojan, Shadowsocks, anything your
   client speaks; TunTop only needs its local SOCKS5 inbound
 - Zero pip dependencies
@@ -263,6 +280,31 @@ when you run it, and what has / has not been verified:
   A hostile source could serve a wrong geo database — it could not achieve
   code execution, but it could route countries incorrectly; pin/ship your
   own `geoip.dat` if that threat matters to you.
+- **What a hostile `geoip.dat` CAN and CANNOT do** (since 1.0.41): a geo
+  database is data, never code. The decoded-CIDR cache the helper writes
+  next to the install used to be a `pickle`, which is a deserialization
+  primitive — any unprivileged process able to write next to the install
+  would have gained code execution in the **elevated** helper on the next
+  `[S]`. It is now plain JSON, shape-validated on read. A geo CIDR that
+  decodes to a `/0` is rejected outright (a default route is never a
+  country range), so a tampered `.dat` can still misroute traffic but
+  cannot take over the process.
+- **The auto-updater's transport is pinned.** Release checks use TLS 1.2+
+  with hostname verification, and every request — *including each redirect
+  hop* — must stay on GitHub's own hosts. The release metadata, the exe and
+  its `checksums.txt` all go through the same allow-list, so a redirect
+  cannot substitute an artifact (and cannot substitute the checksum that
+  "verifies" it). A non-200 response is reported with its status code and is
+  never reported as "offline".
+- **What TunTop will never touch:** TunTop deletes routes it can attribute to
+  itself. Same-prefix routes on adapters outside its own scope are treated as
+  foreign and left alone, the crash sweeps re-check the session marker
+  (and its PID's liveness) immediately before the first destructive step, and
+  `tun2socks` processes are only ever killed when the binary is either one
+  this session spawned, the exact configured path, or the vendored filename
+  **in a directory TunTop put it in** — the vendored name is also the
+  upstream tun2socks release asset name, so a bare name match is not proof
+  of ownership.
 - **Battle-testing:** the automation suite (see [Tests](#tests)) runs on every push, but
   real-world exposure is still low — few outside users, no broad hardware /
   network matrix coverage beyond the
@@ -328,11 +370,32 @@ tests/                     <- test suite across 5 tiers (count via: python -m un
 - **Traffic leaks** — run `[L]` to compare direct vs tunneled exit IP, and confirm v2rayN's SOCKS5 inbound is listening on the port TunTop uses (`[P]`).
 - **Tunnel starts but nothing connects** — check the `SERVER`/`RESOLVED` rows in the `[2]` panel: the origin must resolve and be listed under **DIRECT**. See *Set the server (the proxy origin)* above; if the origin is behind a CDN, bypass that domain too (`[A]` → direct).
 - **Running alongside another VPN** — use VPN mode (`[V]`) and VPN bypass (`[Y]`) so TunTop rides the existing VPN instead of fighting for the default route.
+- **The badge says UNHEALTHY but every listed row is green** — look for a grey
+  `?` row and the `n/a` count in the health-panel title. Those are probes that
+  could not answer, not faults. If one of them is a DNS row, it is almost
+  always a resolver family you never configured: set one with `[N]`, or ignore
+  it. Press `[C]` to rescan.
+- **A health row is cut off / you cannot see the failing row** — the health
+  panel title now shows `(from-to of N)` once the list is longer than the
+  panel. Scroll with the mouse wheel or `j`/`k` after hovering it, and
+  `<`/`End` to jump back to the newest row.
+- **I launched TunTop twice by accident** — the second window now detects that
+  the first one's session is still live and leaves its tunnel, routes and DNS
+  guard **completely alone** (it says so in the log). Close the first window
+  before starting a second one; they do not share a tunnel.
+- **A geo country is not being bypassed (IPv6 especially)** — press `[D]` and
+  check the `GEO BYPASS` section. Since 1.0.41 the CIDR comparison is
+  canonical on both sides, so IPv6 country ranges are matched and swept
+  correctly; an older build could leave them installed and unswept.
+- **A geo removal says some routes could not be removed** — that is now the
+  honest report: the count is verified against the routing table, so the
+  remainder are still in it (denied, in use, or re-added by Windows). Those
+  destinations may still follow the old bypass until the next full restart.
 - **Still stuck?** Open an issue and attach the diagnostics file from `[D]`. See also [FAQ](FAQ.md).
 
 ## Tests
 
-Pure-stdlib test suite (350+ tests; exact count via the command below — it changes with every release), runnable on any OS with no admin
+Pure-stdlib test suite (800+ tests; exact count via the command below — it changes with every release), runnable on any OS with no admin
 rights (current count prints with the command below):
 
 ```bash

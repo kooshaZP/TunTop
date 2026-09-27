@@ -33,6 +33,14 @@ class RouteResult:
         # (ok, err) unpacking - reads like the old (bool, str) pairs.
         return iter((self.ok, self.err))
 
+    def __bool__(self):
+        # Without this, `if result:` is ALWAYS True (the class has __slots__
+        # and no __len__), so the natural shorthand for the __iter__-enabled
+        # (ok, err) pair silently turns every failure into a pass. Two
+        # different RouteResult classes exist in this codebase and only one
+        # had __bool__, which is exactly how that lands unnoticed.
+        return self.ok
+
     def __repr__(self):
         return f"RouteResult(ok={self.ok}, err={self.err!r})"
 

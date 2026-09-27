@@ -33,7 +33,7 @@ class TestDashboardPause(unittest.TestCase):
         app._scroll_log(-100)
         self.assertEqual(app._log_scroll, 0)
         self.assertIsNone(app._log_snapshot)
-        self.assertEqual(app._log_entries(), app.log_lines)
+        self.assertEqual(app._log_entries(), tuple(app.log_lines))
 
     def test_up_freezes_history_before_new_logs_and_pruning(self):
         app = _app()
@@ -65,7 +65,7 @@ class TestDashboardPause(unittest.TestCase):
         app._handle_key_action(" ")
         self.assertIsNone(app._log_snapshot)
         self.assertEqual(app._log_scroll, 0)
-        self.assertEqual(app._log_entries(), ["pruned"])
+        self.assertEqual(app._log_entries(), ("pruned",))
 
     def test_end_resumes_live_and_follows_newest(self):
         app = _app()
@@ -76,13 +76,13 @@ class TestDashboardPause(unittest.TestCase):
         self.assertEqual(app._log_scroll, 0)
         app.log_lines.append("newest")
         self.assertEqual(app._log_entries()[-1], "newest")
-        self.assertEqual(app._log_entries(), app.log_lines)
+        self.assertEqual(app._log_entries(), tuple(app.log_lines))
 
     def test_j_follows_newest_only_when_live(self):
         app = _app()
         self.assertTrue(app._handle_key_action("j"))
         self.assertEqual(app._log_scroll, 0)
-        self.assertEqual(app._log_entries(), app.log_lines)
+        self.assertEqual(app._log_entries(), tuple(app.log_lines))
 
     def test_home_freezes_at_oldest_frozen_row(self):
         app = _app()
@@ -96,7 +96,7 @@ class TestDashboardPause(unittest.TestCase):
         app = _app()
         app._scroll_log(0)
         self.assertIsNone(app._log_snapshot)
-        self.assertEqual(app._log_entries(), app.log_lines)
+        self.assertEqual(app._log_entries(), tuple(app.log_lines))
 
 
 if __name__ == "__main__":

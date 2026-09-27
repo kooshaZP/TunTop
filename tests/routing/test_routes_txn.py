@@ -9,7 +9,7 @@ Run:  python -m unittest discover -s tests -t . -v
 import unittest
 
 from tests.fakes import FakeRouter
-from tuntop.routes_txn import RouteOp, RouteTransaction
+from tuntop.routes_txn import RouteTransaction
 
 
 def txn_on(router, *ops_setup):

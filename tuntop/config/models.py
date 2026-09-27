@@ -46,12 +46,43 @@ class Profile:
         default_factory=lambda: list(DEFAULT_DNS_GUARD_EXEMPT))
     secret_ref: Optional[str] = None   # key into the protected secret store
 
+    #: Fields a snapshot may SET. An explicit allow-list, not hasattr(): the
+    #: old loop let a hand-edited or shared snapshot overwrite `name` (the
+    #: key the profile is stored under) and assign anything at all to any
+    #: attribute, including the list fields with a plain string - which then
+    #: iterated PER CHARACTER downstream.
+    _SNAPSHOT_FIELDS = frozenset((
+        "server", "port", "dns4", "dns6", "dns_policy", "endpoint_port",
+        "bypass_ip", "vpn_bypass_ip", "proxy2_bypass_ip", "proxy2_port",
+        "proxy2_server", "geoip", "geoip_code", "geoip_target",
+        "vless_over_vpn", "no_vpn_bypass", "vpn_interface",
+        "log_adapter_activity", "dns_guard", "dns_guard_exempt",
+        "secret_ref",
+    ))
+
+    #: List-typed fields: a string must never be assigned straight in, and a
+    #: non-list becomes an empty list rather than a per-character iterable.
+    _SNAPSHOT_LISTS = frozenset((
+        "server", "bypass_ip", "vpn_bypass_ip", "proxy2_bypass_ip",
+        "proxy2_server", "dns_guard_exempt",
+    ))
+
     @classmethod
     def from_snapshot(cls, name: str, snap: dict) -> "Profile":
         p = cls(name=name)
-        for k, v in snap.items():
-            if hasattr(p, k):
-                setattr(p, k, v)
+        for k, v in (snap or {}).items():
+            if k not in cls._SNAPSHOT_FIELDS:
+                continue
+            if k in cls._SNAPSHOT_LISTS:
+                if v is None:
+                    v = []
+                elif isinstance(v, str):
+                    v = [v]
+                elif not isinstance(v, (list, tuple)):
+                    continue
+                else:
+                    v = list(v)
+            setattr(p, k, v)
         return p
 
     def to_snapshot(self) -> dict:
@@ -76,4 +107,10 @@ class Profile:
             "log_adapter_activity": self.log_adapter_activity,
             "dns_guard": self.dns_guard,
             "dns_guard_exempt": list(self.dns_guard_exempt),
+            # secret_ref MUST round-trip. Profile.secret_ref exists precisely
+            # so a profile points at the protected (DPAPI) store; dropping it
+            # here silently detached a profile from its stored credential on
+            # the first save/load cycle, and the orphaned secret was never
+            # cleaned up.
+            "secret_ref": self.secret_ref,
         }

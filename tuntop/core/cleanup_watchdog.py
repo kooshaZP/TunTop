@@ -35,14 +35,12 @@ tested without Windows (tests/recovery/test_cleanup_watchdog.py).
 from __future__ import annotations
 
 import argparse
-import base64            # routing._ps dependency - eager, see _MEI note
+import ipaddress         # CIDR-vs-CIDR comparison in the geo sweep
 import json
 import os
-import socket            # tuntop.network.dns chain - eager, see _MEI note
 import subprocess
 import sys
 import tempfile          # sweep batch files - eager, see _MEI note
-import threading         # tuntop.network.dns chain - eager, see _MEI note
 import time
 import traceback         # sweep failure diagnosis (full stack in the log)
 
@@ -131,17 +129,45 @@ def _log(msg: str, log=None) -> None:
         pass
 
 
+def _kernel32():
+    """A kernel32 handle that actually REPORTS GetLastError, with the 64-bit
+    prototypes declared.
+
+    Both details are load-bearing:
+      * ctypes.windll does NOT set use_last_error, so ctypes.GetLastError()
+        on its functions is meaningless - the watchdog could not tell
+        "access denied (process alive)" from "no such process" and treated a
+        LIVE dashboard as dead, then tore its tunnel down.
+      * Without an explicit restype, OpenProcess's 64-bit HANDLE is
+        sign-extended into a 32-bit int: a handle above 4 GiB becomes a
+        different (or negative) value, so WaitForSingleObject is handed a
+        bogus handle and the wait never completes.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.TerminateProcess.restype = wintypes.BOOL
+    return k32
+
+
 def wait_for_exit(pid: int, timeout_s: float = None) -> bool:
-    """Block until the process `pid` is gone. Returns True when it is gone
-    (or was never there / the OS refuses to tell us - the sweep then runs
-    against a system where nothing of the session should be left anyway).
-    Best-effort by design: the watchdog must never hang forever on a
-    missing handle."""
+    """Block until the process `pid` is gone. Returns True when it is gone.
+    Best-effort by design, but NEVER optimistic: "I could not tell" keeps
+    polling until the deadline rather than reporting the process as gone -
+    reporting a live dashboard as dead tears down a working tunnel."""
     if not sys.platform.startswith("win") or int(pid) <= 0:
         return True
     try:
         import ctypes
-        k32 = ctypes.windll.kernel32
+        k32 = _kernel32()
         deadline = None if timeout_s is None else time.time() + timeout_s
         while True:
             h = k32.OpenProcess(_SYNCHRONIZE, False, int(pid))
@@ -154,16 +180,19 @@ def wait_for_exit(pid: int, timeout_s: float = None) -> bool:
                 finally:
                     k32.CloseHandle(h)
             else:
-                err = ctypes.GetLastError()
+                err = ctypes.get_last_error()
                 if err == _ERROR_INVALID_PARAMETER:
                     return True            # no such process: already gone
-                if err != 5:               # 5 = access denied: still alive
-                    return True            # can't observe - assume gone
+                if err == 5:               # 5 = access denied: still alive
+                    _log(f"watchdog: cannot open PID {pid} (access denied) "
+                         "- assuming it is still running", None)
+                # any other error: cannot observe - keep polling until the
+                # deadline instead of declaring a possibly-live process gone.
             if deadline is not None and time.time() >= deadline:
                 return False
             time.sleep(0.5)
     except Exception:
-        return True
+        return False
 
 
 def kill_pid(pid: int, log=None) -> bool:
@@ -175,19 +204,22 @@ def kill_pid(pid: int, log=None) -> bool:
     if not sys.platform.startswith("win"):
         return False
     try:
-        rc = subprocess.call(["taskkill", "/F", "/T", "/PID", str(int(pid))],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL,
-                             stdin=subprocess.DEVNULL,
-                             creationflags=_NO_WINDOW)
+        rc = subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            stdin=subprocess.DEVNULL,
+                            creationflags=_NO_WINDOW,
+                            timeout=30).returncode
         if rc == 0:
             _log(f"watchdog: helper tree (PID {pid}) terminated", log)
             return True
+    except subprocess.TimeoutExpired:
+        _log(f"watchdog: taskkill for PID {pid} timed out - falling back to "
+             "TerminateProcess", log)
     except Exception:
         pass
     try:
-        import ctypes
-        k32 = ctypes.windll.kernel32
+        k32 = _kernel32()
         h = k32.OpenProcess(_PROCESS_TERMINATE, False, int(pid))
         if h:
             try:
@@ -295,6 +327,18 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
         cidrs = set(parse_geoip(geoip, geoip_code))
         if not cidrs:
             return 0
+        # Compare CIDRs as NETWORKS, not strings. parse_geoip renders IPv6 in
+        # the uncompressed eight-group form ("2001:db8:0:0:0:0:0:0/32")
+        # while Get-NetRoute returns Windows' canonical compressed form
+        # ("2001:db8::/32") - a string compare misses EVERY IPv6 geo route,
+        # so they survived every sweep and kept routing that country's
+        # traffic around a dead tunnel. Same for a CIDR with host bits set.
+        wanted = set()
+        for c in cidrs:
+            try:
+                wanted.add(str(ipaddress.ip_network(str(c), strict=False)))
+            except ValueError:
+                continue
         ok, out = routing._ps(
             "Get-NetRoute -AddressFamily IPv4,IPv6 -ErrorAction SilentlyContinue | "
             "Select-Object DestinationPrefix,InterfaceAlias,NextHop | "
@@ -308,7 +352,11 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
         victims = []
         for r in rows:
             dp = str(r.get("DestinationPrefix", ""))
-            if dp not in cidrs:
+            try:
+                dp = str(ipaddress.ip_network(dp, strict=False))
+            except ValueError:
+                pass
+            if dp not in wanted:
                 continue
             alias = str(r.get("InterfaceAlias", "") or "").replace("'", "")
             nh = str(r.get("NextHop", "") or "")
@@ -332,17 +380,41 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         f.write("\n".join(lines))
-                    subprocess.run(["netsh", "-f", tmp],
-                                   capture_output=True, timeout=180,
-                                   creationflags=_NO_WINDOW)
+                    proc = subprocess.run(["netsh", "-f", tmp],
+                                          capture_output=True, timeout=180,
+                                          creationflags=_NO_WINDOW)
+                    # netsh -f reports per-line failures in its OUTPUT and
+                    # still exits 0, so a non-zero code (or no output at all,
+                    # which means the file was not read) means the chunk did
+                    # NOT go through. Counting the chunk anyway cleared the
+                    # crash marker while the routes were still installed.
+                    out_txt = (proc.stdout or b"").decode(
+                        "utf-8", "replace") + (proc.stderr or b"").decode(
+                        "utf-8", "replace")
                 finally:
                     try:
                         os.unlink(tmp)
                     except Exception:
                         pass
+                if proc.returncode != 0:
+                    _log(f"watchdog: geo sweep chunk failed (netsh rc="
+                         f"{proc.returncode}) - {len(chunk)} route(s) kept, "
+                         "marker retained", log)
+                    return None
+                if not out_txt.strip():
+                    _log(f"watchdog: geo sweep chunk produced no netsh output "
+                         f"- {len(chunk)} route(s) unconfirmed, marker "
+                         "retained", log)
+                    return None
                 removed += len(chunk)
-            except Exception:
-                pass
+            except subprocess.TimeoutExpired:
+                _log(f"watchdog: geo sweep chunk timed out - {len(chunk)} "
+                     "route(s) may remain, marker retained", log)
+                return None
+            except Exception as e:
+                _log(f"watchdog: geo sweep chunk error ({e}) - marker "
+                     "retained", log)
+                return None
         return removed
     except Exception as e:
         _log(f"watchdog: geo sweep failed: {e}\n"
@@ -384,6 +456,25 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
     if marker_pid != int(pid):
         _log(f"watchdog: marker belongs to session {marker_pid}, not "
              f"{pid} - a newer session owns it, leaving it alone", log)
+        return False
+
+    # Re-read the marker IMMEDIATELY before the first destructive step. The
+    # 3 s grace period is exactly the window in which a user relaunches
+    # TunTop; a newer session writes its own marker and starts its own
+    # tunnel. The pid check below only guarded the marker CLEAR, so this
+    # watchdog used to kill the new session's helper and rip the Wintun
+    # adapter out from under a live, working tunnel.
+    try:
+        current = read_marker(marker_path)
+        current_pid = int((current or {}).get("pid", -1) or -1)
+    except Exception as e:
+        _log(f"watchdog: marker became unreadable before the sweep ({e}) - "
+             "aborting, leaving the system untouched", log)
+        return False
+    if current_pid != int(pid):
+        _log(f"watchdog: marker now belongs to session {current_pid} - a "
+             "newer session started during the grace period, leaving it "
+             "alone", log)
         return False
 
     # Unclean exit confirmed. The helper dies FIRST: with its tun2socks
@@ -492,7 +583,16 @@ def main(argv=None) -> int:
              "recovery can still clean up")
 
     try:
-        wait_for_exit(args.pid)
+        # Bounded wait: the dashboard normally exits within seconds, but a
+        # wedged one (a hung console read, a blocked PowerShell) must not
+        # park the watchdog forever - every sweep below is deadline-free
+        # otherwise and nothing would ever run. 15 minutes is far beyond any
+        # legitimate dashboard lifetime.
+        if not wait_for_exit(args.pid, timeout_s=900.0):
+            _log("watchdog: dashboard still alive after 15m - abandoning "
+                 "the sweep (refusing to tear down a running session)",
+                 None)
+            return 0
         # Grace: a clean exit may still be tearing routes down right now
         # (atexit runs inside the parent, but the OS can report the exit a
         # moment before the last route delete lands).

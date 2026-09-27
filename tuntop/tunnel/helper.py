@@ -44,15 +44,12 @@ Your proxy client's SOCKS5 inbound must support UDP if you want UDP applications
 
 import argparse
 import atexit
-import base64
 import concurrent.futures
 import ctypes
 import ipaddress
 import json
 import os
-import pickle
 import signal
-import hashlib
 import socket
 import subprocess
 import sys
@@ -73,14 +70,12 @@ if _PKG_PARENT not in _sys.path:
 from tuntop.psshell import ps_quote  # noqa: E402
 from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
     TUN, TUN4, TUN4_MASK, TUN6, TUN2, TUN2_IP4, TUN2_IP6,
-    DNS4, DNS6, LAN_BYPASS_PREFIXES, VPN_IFACE_RE,
-    GEO_SUB_BATCH, GEO_MAX_WORKERS, GEO_SUB_TIMEOUT,
-    DEFAULT_SOCKS_PORT, DEFAULT_ENDPOINT_PORT,
-    WINTUN4_NET, WINTUN6_NET,
+    DNS4, DNS6, LAN_BYPASS_PREFIXES, GEO_SUB_BATCH, GEO_MAX_WORKERS, GEO_SUB_TIMEOUT,
+    DEFAULT_SOCKS_PORT, WINTUN4_NET, WINTUN6_NET,
 )
 from tuntop.network import egress_scripts as _es
 from tuntop.network import dns_guard as _dns_guard  # noqa: E402  (DNS leak guard)
-from tuntop.network.routeops import RouteLedger, RouteResult, sweeps as _rsweeps  # noqa: E402
+from tuntop.network.routeops import RouteLedger, RouteResult  # noqa: E402
 from tuntop.tunnel.exec import (  # noqa: E402  (moved Phase 4: state-free primitives)
     run, ps_json, run_ps, _clean_err, _NO_WINDOW,
 )
@@ -157,9 +152,42 @@ geoip_added = RouteLedger("geo")   # country-range bypass routes from --geoip (p
 # config - so self-heal also keeps the NEW choice instead of reverting to the
 # launch-time --dns4/--dns6 values. Cheap: the loop only stats the file until
 # its mtime actually changes.
+# Re-exported for tests and for callers that already import the helper's
+# symbols wholesale. Unused inside this module, but part of its public
+# surface - do not let an "unused import" sweep delete it.
+from tuntop.network.dns_guard import NRPT_PS_ROOT as NRPT_PS_ROOT  # noqa: F401
+from tuntop.config.defaults import VPN_IFACE_RE as VPN_IFACE_RE  # noqa: F401
+
 CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             ".tuntop_control.json")
 _control_mtime = 0.0
+
+#: Sentinel returned by _validated_dns for a present-but-invalid value, so
+#: "invalid" and "cleared" (None) stay distinguishable.
+_INVALID = object()
+
+
+def _validated_dns(value, family):
+    """Normalise a control-file DNS value: None when cleared, a validated
+    address string, or _INVALID when present but not a usable address.
+
+    Control-file values are written by another process. Without this check a
+    truncated or malformed value reaches `netsh ... address=<garbage>` and the
+    catch-all NRPT rule's GenericDNSServers - pinning ALL of Windows name
+    resolution to a resolver that does not exist.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return _INVALID
+    if addr.version != family:
+        return _INVALID
+    return str(addr)
 
 
 def poll_control_file():
@@ -174,7 +202,12 @@ def poll_control_file():
         return False
     if mtime == _control_mtime:
         return False
-    _control_mtime = mtime
+    # NOTE: _control_mtime is committed only AFTER a successful parse (below).
+    # The dashboard writer truncates the file before dumping JSON, so the
+    # 1 s monitor tick can read a zero-length/partial file. Consuming the
+    # mtime first would mark that change as seen and never retry it - the
+    # DNS the user just picked with [N] would be silently discarded for the
+    # rest of the session.
     try:
         with open(CONTROL_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -182,20 +215,27 @@ def poll_control_file():
         return False
     if not isinstance(data, dict):
         return False
+    _control_mtime = mtime
     changed = []
     # Key-aware: the dashboard writes BOTH keys on every [N] change, so a
     # present-but-empty value means "clear this family" (e.g. the user picked
     # an IPv4-only DNS), not "leave it alone". A missing key = no change.
     if "dns4" in data:
-        d4 = str(data["dns4"]).strip() if data["dns4"] else None
-        if d4 != _ACTIVE_DNS4:
-            _ACTIVE_DNS4 = d4
-            changed.append(f"DNS4 -> {d4 or '(cleared - IPv4 DNS unset)'}")
+        d4 = _validated_dns(data["dns4"], 4)
+        if d4 is _INVALID:
+            print("[!] Live DNS4 change ignored: not a valid IPv4 address.", flush=True)
+        else:
+            if d4 != _ACTIVE_DNS4:
+                _ACTIVE_DNS4 = d4
+                changed.append(f"DNS4 -> {d4 or '(cleared - IPv4 DNS unset)'}")
     if "dns6" in data:
-        d6 = str(data["dns6"]).strip() if data["dns6"] else None
-        if d6 != _ACTIVE_DNS6:
-            _ACTIVE_DNS6 = d6
-            changed.append(f"DNS6 -> {d6 or '(cleared - IPv6 DNS unset)'}")
+        d6 = _validated_dns(data["dns6"], 6)
+        if d6 is _INVALID:
+            print("[!] Live DNS6 change ignored: not a valid IPv6 address.", flush=True)
+        else:
+            if d6 != _ACTIVE_DNS6:
+                _ACTIVE_DNS6 = d6
+                changed.append(f"DNS6 -> {d6 or '(cleared - IPv6 DNS unset)'}")
     if "dns_policy" in data:
         pol = str(data["dns_policy"] or "availability")
         if pol not in ("availability", "strict"):
@@ -324,6 +364,11 @@ phys_bypass_iface = None
 tun_proc = None
 tun2_proc = None   # second proxy pipe's tun2socks process (None = disabled)
 cleaned = False
+
+#: Set while cleanup() is running so a repeat Ctrl+C (the dashboard retries
+#: the break, and a user mashing Ctrl+C does too) cannot re-enter the signal
+#: handler and os._exit() out of a half-finished teardown.
+_cleanup_in_progress = False
 
 # NOTE: bulk geoip route removal (_remove_routes_bulk) deliberately shares the
 # installer's tuning (GEO_SUB_BATCH / GEO_MAX_WORKERS) and its `netsh -f`
@@ -1500,16 +1545,27 @@ if ($r) {{ $r | ConvertTo-Json -Compress }} else {{ exit 1 }}
                 run(["netsh", "interface", "ipv4", "set", "dnsservers",
                      f"name={TUN}", "source=static", f"address={_ACTIVE_DNS4}",
                      "register=none", "validate=no"])
-            # If we're in DoH mode, re-enable DoH on the recreated adapter so
-            # DNS keeps riding over TCP/443 instead of broken UDP/53.
-            if _ACTIVE_DNS_MODE == "doh":
-                tmpl = _ACTIVE_DOH_TEMPLATE or _doh_template_for(addr)
-                _enable_doh_on_wintun(addr, tmpl)
+            _res = _ACTIVE_DNS4
         else:
             run(["netsh", "interface", "ipv6", "add", "address", TUN, f"{addr}/{suffix}"])
             if _ACTIVE_DNS6:  # None = the user chose no IPv6 DNS
                 run(["netsh", "interface", "ipv6", "add", "dnsserver",
                      TUN, _ACTIVE_DNS6, "index=1"])
+            _res = _ACTIVE_DNS6
+        # If we're in DoH mode, re-enable DoH on the recreated adapter so
+        # DNS keeps riding over TCP/443 instead of broken UDP/53. The
+        # RESOLVER must be passed here, NOT `addr`: `addr` is the adapter's
+        # own TUN4/TUN6 address, and registering DoH against it would set
+        # wintun's entire resolver list to the adapter itself - every lookup
+        # would be sent to 192.168.123.1 and nothing would resolve.
+        if _ACTIVE_DNS_MODE == "doh" and _res:
+            tmpl = _ACTIVE_DOH_TEMPLATE or _doh_template_for(_res)
+            _enable_doh_on_wintun(_res, tmpl)
+        # tun2socks recreates the adapter, so NetBIOS-over-TCP/IP is enabled
+        # again (the UDP/137 broadcast flood + loopback-port exhaustion
+        # configure_tun() guards against). Re-disable on every re-add.
+        if family == "IPv4":
+            _disable_netbios_on_wintun()
         time.sleep(1)
     print(f"[!] Could not ensure Wintun {family} address {addr}; route installs may fail.")
     return False
@@ -2176,6 +2232,12 @@ _geo_install_cancel = threading.Event()
 #: The geo-install daemon thread (set in main() so _on_signal can join it).
 _geo_install_thread = None
 
+#: The gateway-re-point daemon thread. Also published so cleanup() can join
+#: it: it installs replacement routes BEFORE rewriting the ledger, so a
+#: cleanup() that snapshotted the ledger in between recorded nothing while
+#: the new-gateway routes sat in the table - permanently untrackable.
+_geo_repoint_thread = None
+
 #: Debounce state for the gateway monitor (candidate, first-seen timestamp).
 _gw_pending = None
 _gw_pending_since = 0.0
@@ -2311,8 +2373,19 @@ def _repoint_pinned_routes(old_iface, old_gw, new_iface, new_gw,
         if ok:
             moved += 1
         else:
+            # Put the receipt back. It was removed BEFORE the re-add, and the
+            # old-gateway route is still installed in the OS table - so
+            # dropping the tracking made it invisible to cleanup(), i.e. it
+            # survived every later stop/start of the tunnel, permanently
+            # pinned to a gateway that no longer exists (usually the VLESS
+            # server /32, which then became unreachable).
+            try:
+                added_routes.append(item, metric=metric)
+            except Exception:
+                pass
             print(f"[!] Could not re-point {dest} to {tgt[0]} ({tgt[1]}); "
-                  f"it stays on the old egress.", flush=True)
+                  f"it stays on the old egress and is still tracked for "
+                  "cleanup.", flush=True)
     return moved
 
 
@@ -2323,6 +2396,7 @@ def _check_gateway_change():
     mid-DHCP transition is never mistaken for the final state. Never raises;
     prints [GATEWAY] markers the dashboard surfaces."""
     global _gw_pending, _gw_pending_since
+    global _geo_repoint_thread
     phys = _live_mode.get("phys")
     if not phys:
         return
@@ -2370,6 +2444,12 @@ def _check_gateway_change():
     if any(str(it[2]).lower() == old_iface.lower() for it in list(geoip_added)):
         def _worker():
             try:
+                # Honour a teardown that started while we were queued: this
+                # worker installs replacement routes BEFORE rewriting the
+                # ledger, so a cleanup() that snapshotted in between would
+                # leave them in the table with nothing tracking them.
+                if _geo_install_cancel.is_set():
+                    return
                 with _geo_repoint_lock:
                     n = _repoint_geo_routes(old_iface, iface, gw)
                 if n:
@@ -2378,8 +2458,11 @@ def _check_gateway_change():
             except Exception as e:
                 print(f"[!] geoip gateway re-point failed: "
                       f"{e.__class__.__name__}: {e}", flush=True)
-        threading.Thread(target=_worker, name="geo-repoint",
-                         daemon=True).start()
+        # Publish the handle so cleanup() can join it (see
+        # _stop_geo_installer). The thread used to be fire-and-forget.
+        _geo_repoint_thread = threading.Thread(
+            target=_worker, name="geo-repoint", daemon=True)
+        _geo_repoint_thread.start()
     # The metric lowering (if any) was applied to the OLD interface: put it
     # back, then re-arm on the new one (no-op without a connected VPN).
     try:
@@ -2948,28 +3031,57 @@ def _remove_routes_bulk(routes):
                 pass
 
 
+def _say(msg):
+    """Print a teardown line without ever raising.
+
+    The helper's stdout is a PIPE owned by the dashboard. If the dashboard
+    is gone (crash, Alt+F4, Task Manager), every print raises
+    BrokenPipeError/OSError - and a raising print used to abort cleanup()
+    outright, leaving stale /32s, the split-defaults, a lowered interface
+    metric, a live tun2socks.exe and the catch-all NRPT DNS pin behind.
+    Progress output is never worth a skipped teardown step."""
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+
+
+def _step(label, fn):
+    """Run one teardown phase, containing any failure to THAT phase.
+
+    cleanup() must never abort part-way: whatever is left behind (stale
+    routes, a live tun2socks, a pinned resolver) is exactly the state the
+    exit sweeps and the detached watchdog exist to repair, and they can only
+    do that if the small critical steps actually ran.
+    """
+    try:
+        return fn()
+    except Exception as e:
+        _say(f"[!] Cleanup step '{label}' failed: {e}")
+        return None
+
+
 def cleanup():
     global cleaned
     global wintun_saved_metric
     global _control_mtime
     if cleaned:
         return
-    cleaned = True
-    # Drop the live-reconfig control file so a DNS choice made via [N] in
-    # THIS session can never leak into a future run (the next helper run
-    # also baselines the file's mtime - this just removes the stale state).
-    try:
-        os.remove(CONTROL_FILE)
-        _control_mtime = 0.0
-    except OSError:
-        pass
-    # Restore the physical (geo) interface metric we may have lowered to beat a
-    # self-healing Windows VPN, before touching any other state.
-    restore_physical_metric()
+    # NOTE: `cleaned = True` moves to the END. Setting it first meant a
+    # single failure in the first second permanently disabled cleanup for
+    # the process (a later atexit/second-signal call returned immediately),
+    # so a transient error turned into "no teardown at all".
+    _step("drop control file", _drop_control_file)
+    _step("restore physical interface metric", restore_physical_metric)
     # Drop the DNS leak guard right away: it rewrites system-wide name
     # resolution, so it must not outlive the tunnel even if the OS kills this
     # process during the longer route sweeps below.
-    _remove_dns_guard()
+    _step("remove DNS leak guard", _remove_dns_guard)
+    # The geo install thread can still be adding routes; stop it and WAIT for
+    # it before snapshotting the ledger, or a sub-batch that lands after the
+    # snapshot installs routes nothing will ever track (uncleanable, and the
+    # [Q] sweep has no receipts to match).
+    _step("stop geo installer", _stop_geo_installer)
 
     # ORDER MATTERS (this was the Alt+F4 hole): cleanup() runs inside the
     # console-close window, and the OS may kill us mid-way when it expires.
@@ -2980,72 +3092,120 @@ def cleanup():
     # one long pole (the thousands-of-routes geo bulk delete) so a kill
     # mid-cleanup can only ever leave geo routes behind - those the exit
     # sweeps and the detached watchdog still remove by CIDR matching.
-    print("\n[*] Cleaning up routes...")
+    _say("\n[*] Cleaning up routes...")
     # Remove the VPN-override routes we added to keep the tunnel the sole egress,
     # then restore the VPN's original injected routes we shadowed.
     if vpn_override_routes:
-        print(f"[*] Removing {len(vpn_override_routes)} VPN-override routes...")
-        for item in reversed(list(vpn_override_routes)):
+        _say(f"[*] Removing {len(vpn_override_routes)} VPN-override routes...")
+        _step("remove VPN-override routes", lambda: [
             remove_route(item)
+            for item in reversed(list(vpn_override_routes))])
         vpn_override_routes.clear()
     if vpn_saved_routes:
-        print(f"[*] Restoring {len(vpn_saved_routes)} VPN routes...")
-        for fam, dest, iface, gateway, metric in reversed(vpn_saved_routes):
+        _say(f"[*] Restoring {len(vpn_saved_routes)} VPN routes...")
+        _step("restore shadowed VPN routes", lambda: [
             _raw_add_route(fam, dest, iface, gateway, metric)
+            for fam, dest, iface, gateway, metric
+            in reversed(vpn_saved_routes)])
         vpn_saved_routes.clear()
     # Remove every route this helper installed (endpoint /32+/128 bypasses,
     # LAN bypasses, TUN default/split routes) - small, fast, CRITICAL.
-    for item in reversed(list(added_routes)):
-        remove_route(item)
+    _step("remove installed routes", lambda: [
+        remove_route(item) for item in reversed(list(added_routes))])
     added_routes.clear()
 
-    if tun_proc is not None and tun_proc.poll() is None:
-        print("[*] Stopping tun2socks...")
-        tun_proc.terminate()
-        try:
-            tun_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            tun_proc.kill()
-
-    if tun2_proc is not None and tun2_proc.poll() is None:
-        print("[*] Stopping tun2socks (second proxy pipe)...")
-        tun2_proc.terminate()
-        try:
-            tun2_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            tun2_proc.kill()
+    _step("stop tun2socks", _stop_tun2socks)
 
     # Restore Wintun's original per-family interface metric (only the families
     # we actually lowered). Restore per AddressFamily so an IPv6 value never lands
     # on IPv4 and vice-versa. Robust to the legacy int/None shape so a stale
     # module state (or a test that sets the global to None) can't crash cleanup.
-    saved = wintun_saved_metric if isinstance(wintun_saved_metric, dict) else None
-    if saved is not None and (
-            saved.get("v4") is not None or saved.get("v6") is not None):
-        for fam, key in (("IPv4", "v4"), ("IPv6", "v6")):
-            val = saved.get(key)
-            if val is None:
-                continue
-            try:
-                run_ps(f"Set-NetIPInterface -InterfaceAlias '{TUN}' "
-                       f"-AddressFamily {fam} -InterfaceMetric {val}")
-            except Exception:
-                pass
-        wintun_saved_metric = {"v4": None, "v6": None}
+    _step("restore wintun interface metric", _restore_wintun_metric)
 
     # LAST: the long pole. Bulk-remove geoip bypass routes (can be thousands
     # of entries) - if the OS kills us during THIS, only geo routes survive,
     # and the dashboard's exit sweep / the watchdog remove those by CIDR.
     # Snapshot + clear under the state lock so a concurrently registering
     # install (or a gateway re-point rewrite) can never leak untracked rows.
-    with _geo_state_lock:
-        geo_rows = list(geoip_added)
-        geoip_added.clear()
-    if geo_rows:
-        print(f"[*] Cleaning up {len(geo_rows)} geoip bypass routes...")
-        _remove_routes_bulk(geo_rows)
+    def _geo_sweep():
+        with _geo_state_lock:
+            geo_rows = list(geoip_added)
+            geoip_added.clear()
+        if geo_rows:
+            _say(f"[*] Cleaning up {len(geo_rows)} geoip bypass routes...")
+            _remove_routes_bulk(geo_rows)
+    _step("remove geoip bypass routes", _geo_sweep)
 
-    print("[*] Done.")
+    _say("[*] Done.")
+    # Only now: cleanup is complete and a second call is genuinely redundant.
+    cleaned = True
+
+
+def _drop_control_file():
+    """Drop the live-reconfig control file so a DNS choice made via [N] in
+    THIS session can never leak into a future run (the next helper run also
+    baselines the file's mtime - this just removes the stale state)."""
+    global _control_mtime
+    try:
+        os.remove(CONTROL_FILE)
+        _control_mtime = 0.0
+    except OSError:
+        pass
+
+
+def _stop_geo_installer():
+    """Cancel and JOIN the geo install / re-point threads.
+
+    Only _on_signal used to do this. On a NORMAL exit (tun2socks dies, the
+    monitor loop ends, main() returns, atexit fires) cleanup() raced the
+    still-running daemon thread: it snapshotted and cleared the ledger, then
+    the thread installed a batch AFTER the delete - routes in the table that
+    no ledger and no later sweep could match.
+    """
+    global _geo_install_thread, _geo_repoint_thread
+    _geo_install_cancel.set()
+    for _name in ("_geo_install_thread", "_geo_repoint_thread"):
+        t = globals().get(_name)
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            try:
+                t.join(timeout=30)
+            except Exception:
+                pass
+
+
+def _stop_tun2socks():
+    for _name, _label in (("tun_proc", ""),
+                          ("tun2_proc", " (second proxy pipe)")):
+        p = globals().get(_name)
+        if p is None or p.poll() is not None:
+            continue
+        _say(f"[*] Stopping tun2socks{_label}...")
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        except Exception as e:
+            _say(f"[!] Could not stop tun2socks{_label}: {e}")
+
+
+def _restore_wintun_metric():
+    global wintun_saved_metric
+    saved = wintun_saved_metric if isinstance(wintun_saved_metric, dict) else None
+    if saved is None or not (saved.get("v4") is not None
+                             or saved.get("v6") is not None):
+        return
+    for fam, key in (("IPv4", "v4"), ("IPv6", "v6")):
+        val = saved.get(key)
+        if val is None:
+            continue
+        try:
+            run_ps(f"Set-NetIPInterface -InterfaceAlias '{TUN}' "
+                   f"-AddressFamily {fam} -InterfaceMetric {val}")
+        except Exception:
+            pass
+    wintun_saved_metric = {"v4": None, "v6": None}
 
 
 def _probe_tunnel_once(url="https://api.ipify.org/", timeout=5):
@@ -3311,14 +3471,20 @@ def self_heal_tunnel(dns4, dns6):
             add_v6(prefix, TUN, TUN6, metric=1)
         # Re-apply LAN-bypass so local traffic (NetBIOS/Delivery Optimization)
         # stays off the tunnel after a self-heal too.
+        # get_ipv4_default() sys.exit()s when the IPv4 default route is
+        # momentarily absent (a Wi-Fi roam / DHCP renewal / VPN flap - all
+        # routine). SystemExit is a BaseException, so `except Exception` does
+        # NOT catch it: it used to unwind out of this function, out of the
+        # monitor loop, and tear the whole tunnel down over one blip. Use
+        # RouteResult.unwrap, which treats the exit as "no result".
         try:
-            _phys = get_ipv4_default()
-            if _phys:
-                _add_lan_bypass(_phys[0], _phys[1])
+            _res = RouteResult.unwrap(get_ipv4_default)
+            if _res.ok and _res.value:
+                _add_lan_bypass(_res.value[0], _res.value[1])
         except Exception:
             pass
         print("[+] Self-heal applied.", flush=True)
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         print(f"[!] Self-heal failed: {e}")
 
 
@@ -3359,6 +3525,34 @@ def start_tun2socks_pipe(device_name, ip4, ip6, port, tun2socks_path,
     ]
     print("[*] Starting tun2socks without --interface:")
     print("    " + " ".join(cmd))
+
+    proc = None
+
+    def _fail(msg):
+        # Kill the child we just spawned BEFORE giving up. _fail used to
+        # return/exit while the tun2socks process was still running, and on
+        # the fatal path `sys.exit` raised out of this function *before* the
+        # caller's `tun_proc = start_tun2socks_pipe(...)` assignment
+        # completed - so the global stayed None, cleanup() could never kill
+        # it, and the orphan kept the Wintun adapter open (every later start
+        # then failed with "Wintun adapter did not appear").
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            except Exception:
+                pass
+        if fatal:
+            sys.exit(msg)
+        print(f"[!] {msg}")
+        return None
 
     try:
         proc = subprocess.Popen(cmd, creationflags=_NO_WINDOW)
@@ -3559,6 +3753,20 @@ def main():
     # sends CTRL_BREAK_EVENT) - not only on a clean interpreter exit. cleanup()
     # is idempotent, so a later atexit call is a harmless no-op.
     def _on_signal(signum, frame):
+        # `global` is required: without it the flag below is a local, and
+        # reading it on the first signal raises UnboundLocalError - out of a
+        # signal handler, so the process would die immediately on Ctrl+C
+        # without running cleanup() at all.
+        global _cleanup_in_progress
+        # A SECOND signal arriving while cleanup() is mid-teardown used to
+        # re-enter here, find `cleaned` already True, return immediately
+        # from cleanup() and then os._exit(0) - killing the process in the
+        # middle of the route sweeps, leaving exactly the broken state
+        # cleanup() exists to prevent. Ignore repeats instead: the
+        # in-flight teardown will finish.
+        if _cleanup_in_progress:
+            return
+        _cleanup_in_progress = True
         # Stop the background geo install FIRST and let it wind down
         # briefly: os._exit() mid-install leaves a half-installed country's
         # routes behind. The cancel flag makes the installer skip its
@@ -3573,8 +3781,14 @@ def main():
             pass
         try:
             cleanup()
-        finally:
-            os._exit(0)
+        except BaseException as e:
+            # cleanup() is now internally guarded, but a BaseException
+            # (Ctrl+C during a netsh wait) must still not skip the exit -
+            # and the process must NOT exit 0 after a failed teardown, or
+            # a parent watching the status sees a clean shutdown.
+            _say(f"[!] Cleanup on signal {signum} failed: {e}")
+            os._exit(1)
+        os._exit(0)
     for _sig in (getattr(signal, "SIGINT", None),
                  getattr(signal, "SIGTERM", None),
                  getattr(signal, "SIGBREAK", None)):
@@ -3847,6 +4061,14 @@ def main():
     # ones below, plus live additions from the dashboard's proxy2 targeting).
     # Nothing in this block runs unless --proxy2-port was given.
     if args.proxy2_port is not None:
+        # Pre-bind every proxy2 collection BEFORE the branch below. They were
+        # only assigned inside the "wintun2 pipe active" else-branch, so a
+        # --proxy2-port whose SOCKS5 is not listening left them UNBOUND - and
+        # the geo background thread (which tests `args.proxy2_port is not
+        # None`, not whether the pipe came up) hit NameError and installed
+        # NO country bypass at all, with an error naming a variable instead
+        # of the real cause.
+        p2_v4, p2_v6, _p2b_v4, _p2b_v6 = [], [], [], []
         if args.proxy2_port == args.port:
             sys.exit(f"[!] --proxy2-port {args.proxy2_port} equals the primary "
                      "--port; a second pipe to the same proxy is pointless and "
@@ -3865,20 +4087,19 @@ def main():
             # SOCKS5 not listening: skip the wintun2 pipe rather than killing
             # the whole helper (which would take the primary tunnel down too).
             print(f"[!] Second proxy at 127.0.0.1:{args.proxy2_port} is not "
-                  "reachable — starting WITHOUT the wintun2 pipe. The primary "
+                  "reachable - starting WITHOUT the wintun2 pipe. The primary "
                   "tunnel is unaffected; restart the tunnel once the second "
                   "proxy is listening to enable it.")
-            print(f"[*] proxy2 pipe skipped — SOCKS5 not listening at "
+            print(f"[*] proxy2 pipe skipped - SOCKS5 not listening at "
                   f"127.0.0.1:{args.proxy2_port}")
         else:
-            print(f"[*] proxy2 pipe active — wintun2 ready for "
+            print(f"[*] proxy2 pipe active - wintun2 ready for "
                   f"127.0.0.1:{args.proxy2_port}")
 
             # The second proxy's own upstream server(s) get physical-NIC bypass
             # routes - same reasoning as the primary --server bypass above: without
             # them the proxy2 transport is captured by the TUN default route and
             # loops back into 127.0.0.1.
-            p2_v4, p2_v6 = [], []
             for entry in (args.proxy2_server or []):
                 ep4, ep6 = resolve_all_safe(entry, label=f"proxy2-server {entry}")
                 if ep4 is None and ep6 is None:
@@ -3931,7 +4152,6 @@ def main():
             # Their prefixes are also collected so the geoip pass below never
             # removes/overrides them (a geo CIDR equal to one of these /32s would
             # otherwise be swept away and re-pointed at the geo egress).
-            _p2b_v4, _p2b_v6 = [], []
             for entry in (args.proxy2_bypass_ip or []):
                 ep4, ep6 = resolve_all_safe(entry, label=f"proxy2-bypass {entry}")
                 if ep4 is None and ep6 is None:
@@ -4046,6 +4266,19 @@ def main():
             except Exception as e:
                 print(f"[!] geoip bypass install failed ({code}): {e}; continuing without it.")
 
+    if args.geoip or args.geoip_code:
+        # Validate the pair BEFORE spawning anything. The "[!] --geoip given
+        # without --geoip-code" line used to live inside the thread that only
+        # starts when --geoip is set, so passing --geoip-code ALONE produced
+        # no message, no bypass and no hint that the flag was dropped.
+        if args.geoip and not (args.geoip_code or "").strip():
+            print("[!] --geoip given without --geoip-code - no country "
+                  "bypass installed. Add --geoip-code <cc> (e.g. cn, ir) to "
+                  "say WHICH country's ranges to bypass.")
+        if args.geoip_code and not args.geoip:
+            print("[!] --geoip-code given without --geoip - no country "
+                  "bypass installed. Add --geoip <path to geoip.dat>, or "
+                  "press [W] in the dashboard to download it.")
     if args.geoip:
         # Background daemon: never blocks the startup sequence (see the
         # docstring on _geo_install). Daemon because a Ctrl+C/[T] stop must

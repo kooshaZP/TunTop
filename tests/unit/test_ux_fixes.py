@@ -10,10 +10,7 @@ Covers:
   no longer a LEAK when the tunnel exit answered directly too).
 """
 import argparse
-import subprocess
-import threading
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 from tuntop.ui import dashboard

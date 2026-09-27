@@ -16,14 +16,26 @@ Ownership rules - a tun2socks* process belongs to TunTop iff ANY holds:
   2. its ExecutablePath equals the tun2socks path TunTop was configured
      to run (--tun2socks), compared case/separator-insensitively;
   3. its executable's file name is the distinctive vendored name
-     (``TUN2SOCKS_BINARY``). This covers crash recovery after a frozen
-     (PyInstaller onefile) run: the child ran from a throwaway per-run
-     extraction dir whose exact path differs between runs, so rule 2
-     cannot match - but that file name is specific enough to TunTop that
-     a generic ``tun2socks.exe`` shipped by another tool never hits it.
+     (``TUN2SOCKS_BINARY``) AND it lives somewhere TunTop put it: next to
+     TunTop.exe, or in a PyInstaller ``_MEI*`` extraction dir. This covers
+     crash recovery after a frozen (PyInstaller onefile) run: the child ran
+     from a throwaway per-run extraction dir whose exact path differs
+     between runs, so rule 2 cannot match.
+
+Rule 3's LOCATION half is load-bearing, not decoration. The vendored name
+is ``tun2socks-windows-amd64-v3.exe`` - which is the UPSTREAM
+xjasonlyu/tun2socks v2.7.0 release asset name (see Run_Helper.ps1 and
+.github/workflows/release.yml, which download exactly that file). Any user
+who installed tun2socks from its own upstream release - or any tool that
+vendors the same build (v2rayN, xray, nekoray) - has a process whose
+basename matches EXACTLY. Matching on the bare name therefore made
+``taskkill /F /T`` terminate a foreign proxy on every TunTop teardown,
+startup recovery and watchdog sweep. The name alone is not TunTop's; the
+name plus a TunTop-controlled directory is.
 
 A generic ``tun2socks.exe`` from another tool matches NONE of the rules:
-it is never killed and never counted, even when TunTop's sweep runs.
+it is never killed and never counted, even when TunTop's sweep runs. Neither
+does an upstream-named binary installed somewhere else.
 
 Pure stdlib; the PowerShell plumbing comes from tuntop.network.routing
 (imported lazily inside the call, so this module stays import-safe from
@@ -33,11 +45,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import sys
 
 #: The vendored tun2socks file name (mirrors build_release.BINARIES and
-#: dashboard.py's default --tun2socks). Distinctive: another tool shipping
-#: its own tun2socks almost always names it plain ``tun2socks.exe``.
+#: dashboard.py's default --tun2socks). NOTE: this is also the upstream
+#: release asset name, so it is only ever matched together with a
+#: TunTop-controlled location - see the module docstring and rule 3.
 TUN2SOCKS_BINARY = "tun2socks-windows-amd64-v3.exe"
 
 #: One probe returns everything we need to decide ownership: PID, image
@@ -117,6 +132,63 @@ def _norm(path: str) -> str:
         return ""
 
 
+#: A PyInstaller onefile extraction dir: %TEMP%\_MEIxxxxxx. The frozen
+#: helper's tun2socks child is spawned from there, and the exact name
+#: changes every run - which is the only reason rule 3 exists at all.
+_MEI_RE = re.compile(r"(^|/)_mei[0-9a-z]+(/|$)", re.IGNORECASE)
+
+
+def _norm_dir(path: str) -> str:
+    """Normalize a DIRECTORY into the same form _norm() produces for a file
+    path (lower-cased, forward slashes), so the two can be compared."""
+    try:
+        if not path:
+            return ""
+        return str(path).replace("\\", "/").rstrip("/").lower()
+    except Exception:
+        return ""
+
+
+def _tuntop_owned_locations():
+    """Directories TunTop itself puts binaries in: next to TunTop.exe (frozen),
+    next to this package (source run), plus the PyInstaller extraction root."""
+    locs = []
+    exe = getattr(sys, "executable", "") or ""
+    if exe and getattr(sys, "frozen", False):
+        locs.append(os.path.dirname(os.path.abspath(exe)))
+    # Source run: the package dir, the APP ROOT (one level up - that is
+    # where a checkout/release keeps tun2socks-windows-amd64-v3.exe,
+    # wintun.dll and geoip.dat, and what the dashboard's default --tun2socks
+    # resolves to), and the CWD.
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    locs.append(pkg_dir)
+    locs.append(os.path.dirname(pkg_dir))
+    try:
+        locs.append(os.getcwd())
+    except Exception:
+        pass
+    try:
+        tmp = os.environ.get("TEMP") or os.environ.get("TMP") or ""
+        if tmp:
+            locs.append(tmp)
+    except Exception:
+        pass
+    return {_norm_dir(p) for p in locs if p}
+
+
+def _is_tuntop_location(exe_norm: str) -> bool:
+    """True when `exe_norm` (a normalized absolute path) sits somewhere
+    TunTop put a binary, or in a PyInstaller extraction dir."""
+    if not exe_norm:
+        return False
+    if _MEI_RE.search(exe_norm):
+        return True
+    if "/" not in exe_norm:
+        return False            # a bare name proves nothing about location
+    parent = os.path.dirname(exe_norm)
+    return parent in _tuntop_owned_locations()
+
+
 def select_own(rows: list, tun2socks_path=None, recorded=()) -> list:
     """PURE ownership filter - the heart of this module, unit-testable on
     any OS (tests/unit/test_procguard.py). Returns the subset of `rows`
@@ -128,6 +200,15 @@ def select_own(rows: list, tun2socks_path=None, recorded=()) -> list:
         except Exception:
             continue
     want_path = _norm(tun2socks_path) if tun2socks_path else ""
+    if want_path and "/" not in want_path:
+        # A bare configured name can never equal CIM's absolute
+        # ExecutablePath, so rule 2 was silently inert. Resolve it against
+        # the locations TunTop actually uses.
+        for _loc in sorted(_tuntop_owned_locations()):
+            _cand = os.path.join(_loc, want_path)
+            if os.path.exists(_cand):
+                want_path = _norm(_cand)
+                break
     own = []
     for r in rows or []:
         if not str(r.get("name", "")).lower().startswith("tun2socks"):
@@ -138,9 +219,19 @@ def select_own(rows: list, tun2socks_path=None, recorded=()) -> list:
         # to the image name itself.
         base = (os.path.basename(exe_norm) if exe_norm
                 else str(r.get("name") or "").lower())
-        if (r.get("pid") in recorded_ids
-                or (want_path and exe_norm == want_path)
-                or base == _norm(TUN2SOCKS_BINARY)):
+        if r.get("pid") in recorded_ids:
+            own.append(r)
+            continue
+        if want_path and exe_norm == want_path:
+            own.append(r)
+            continue
+        # Rule 3: the vendored NAME, but only from a directory TunTop put
+        # it in. The name alone is the upstream release asset name, so
+        # matching it anywhere would kill another application's proxy.
+        if base == _norm(TUN2SOCKS_BINARY) and (
+                _is_tuntop_location(exe_norm)
+                or not exe_norm          # no path at all: recorded PIDs only
+                or os.path.dirname(exe_norm) in _tuntop_owned_locations()):
             own.append(r)
     return own
 

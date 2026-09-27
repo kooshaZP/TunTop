@@ -280,8 +280,16 @@ class TunnelStateMachine:
                             f"{type(target).__name__}")
         with self._lock:
             source = self._current
-            if source is target:
+            if source is target and not force:
                 raise TransitionError(source, target, "already in that state")
+            if source is target and force:
+                # A forced no-op move still records the reason (that is the
+                # point of the safety hatch - "reset" wants the state machine
+                # to KNOW it was reset). Silently ignoring it would hide the
+                # call. Returning None is honest: nothing changed, so there
+                # is no event to announce to observers.
+                self._last_reason = reason or self._last_reason
+                return None
             if not force and target not in TRANSITIONS[source]:
                 raise TransitionError(source, target)
             event = StateTransition(source=source, target=target,
@@ -308,8 +316,13 @@ class TunnelStateMachine:
         except (TransitionError, TypeError):
             return None
 
-    def reset(self, reason: str = "reset") -> StateTransition:
-        """Force back to STOPPED (diagnostics/safety hatch; announced)."""
+    def reset(self, reason: str = "reset") -> Optional[StateTransition]:
+        """Force back to STOPPED (diagnostics/safety hatch; announced).
+
+        Safe to call on an already-STOPPED machine - that used to raise
+        TransitionError, i.e. the safety hatch raised in the single most
+        common state it could be called in. Returns the announced event, or
+        None when there was nothing to change."""
         return self.transition(TunnelState.STOPPED, reason, force=True)
 
     # -- Observers ----------------------------------------------------------

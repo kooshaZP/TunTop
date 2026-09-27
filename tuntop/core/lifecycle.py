@@ -11,7 +11,7 @@ in any Administrator-only code paths.
 """
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable
 
 
 def make_launch() -> Callable[[], None]:
@@ -47,8 +47,31 @@ def make_verify_binaries() -> Callable[[], bool]:
     """Return a callable that verifies the vendored binaries."""
     def _verify() -> bool:
         from tuntop.core import integrity
-        return integrity.verify_for_launch()
+        try:
+            # verify_for_launch REQUIRES the tun2socks path. Calling it with
+            # no argument raised TypeError instead of reporting "unverified",
+            # and TunnelManager.verify_binaries has no handler - so the
+            # documented production wiring (wire_default_manager) crashed
+            # rather than answering. Resolve the default here; an absent
+            # file is reported as MISSING by verify_file, which is a clean
+            # False.
+            return bool(integrity.verify_for_launch(_default_tun2socks()))
+        except Exception:
+            return False
     return _verify
+
+
+def _default_tun2socks() -> str:
+    """The vendored tun2socks next to TunTop.exe / this package."""
+    import os
+    import sys
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
+    from tuntop.network.procguard import TUN2SOCKS_BINARY
+    return os.path.join(base, TUN2SOCKS_BINARY)
 
 
 def wire_default_manager(machine=None, recovery=None,

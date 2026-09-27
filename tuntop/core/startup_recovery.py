@@ -51,11 +51,35 @@ if getattr(sys, "frozen", False):
 
 # ── Crash marker ────────────────────────────────────────────────────────
 
+def _atomic_write_json(path: str, payload: dict) -> None:
+    """Write JSON so a concurrent reader NEVER observes a partial file.
+
+    open(path, "w") truncates to zero before the first write lands, and
+    record_helper is a read-modify-write on the same file. The watchdog polls
+    this file on its own schedule, so a plain truncate-then-dump let it read
+    "" or a half-written object, get a decode error, and conclude "the
+    previous run exited cleanly" - skipping the entire recovery sweep while
+    routes stayed installed. Same class of bug for the helper PID update.
+    """
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)        # atomic on Windows, same volume
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+
+
 def write_marker(pid: int, path: str = MARKER_FILE) -> None:
     """Mark 'a tunnel is running' (best-effort; never blocks the launch)."""
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"pid": int(pid), "started": time.time()}, f)
+        _atomic_write_json(path, {"pid": int(pid), "started": time.time()})
     except Exception:
         pass
 
@@ -82,8 +106,7 @@ def record_helper(helper_pid: int, path: str = MARKER_FILE) -> None:
         if int(data.get("pid", 0) or 0) <= 0:
             return                      # no live session marker: nothing to do
         data["helper_pid"] = int(helper_pid)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        _atomic_write_json(path, data)
     except Exception:
         pass
 
@@ -97,6 +120,61 @@ def read_marker(path: str = MARKER_FILE) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+
+def marker_is_live(path: str = MARKER_FILE) -> Optional[bool]:
+    """Is the session that wrote this marker STILL RUNNING?
+
+    True  - the recorded dashboard PID is alive, so its tunnel is live and
+            must not be torn down
+    False - the PID is gone (a genuine unclean exit)
+    None  - cannot tell (no marker, no PID, or the probe failed)
+
+    This is what stops one launch from destroying another launch's working
+    tunnel: there is no single-instance guard, so a user double-clicking the
+    exe twice used to have the second instance kill the first instance's
+    tun2socks, remove its Wintun adapter and sweep its routes on the way
+    past. Callers must treat None as LIVE (do not touch) - the cost of
+    skipping a needed cleanup is far lower than killing a running tunnel.
+    """
+    marker = read_marker(path)
+    if not marker:
+        return None
+    try:
+        pid = int(marker.get("pid", -1) or -1)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                        wintypes.DWORD]
+            k32.OpenProcess.restype = wintypes.HANDLE
+            h = k32.OpenProcess(0x100000, False, pid)   # SYNCHRONIZE
+            if not h:
+                err = ctypes.get_last_error()
+                if err == 5:
+                    return True         # access denied: it exists, not ours
+                return None              # cannot tell
+            try:
+                return k32.WaitForSingleObject(h, 0) == 0x102   # WAIT_TIMEOUT
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return None
+    return True
 
 
 # ── Probes (Windows defaults, injectable for tests) ─────────────────────
@@ -276,9 +354,15 @@ class StartupFindings:
     #: never removed it): system-wide name resolution is still pinned to a
     #: tunnel that no longer exists - remove it before anything else.
     dns_guard: bool = False
+    #: The marker's dashboard PID is STILL ALIVE: a second TunTop window is
+    #: running with a working tunnel. Nothing that marker points at may be
+    #: torn down - this launch must not kill another instance's session.
+    live_session: Optional[int] = None
 
     @property
     def dirty(self) -> bool:
+        if self.live_session:
+            return False                # a live session owns this state
         return bool(self.marker or self.orphan_tun2socks
                     or self.wintun_routes or self.host_routes
                     or self.dns_guard)
@@ -286,6 +370,11 @@ class StartupFindings:
     def summary_lines(self) -> list:
         """Human-readable 'what we found' lines for the startup log."""
         lines = []
+        if self.live_session:
+            lines.append(f"another TunTop session (PID {self.live_session}) "
+                         "is still running - its tunnel was left untouched; "
+                         "close that window before starting a second one")
+            return lines
         if self.marker:
             pid = self.marker.get("pid")
             lines.append(f"previous run (PID {pid}) did not exit cleanly")
@@ -305,11 +394,34 @@ class StartupFindings:
 
 
 def scan(hosts=None, probes: Optional[Probes] = None,
-         marker_path: str = MARKER_FILE) -> StartupFindings:
+         marker_path: str = MARKER_FILE,
+         marker_live: Optional[Callable[[str], Optional[bool]]] = None
+         ) -> StartupFindings:
     """Look for leftovers of a previous run. Cheap PowerShell probes, run
-    once at startup - never in a loop."""
+    once at startup - never in a loop.
+
+    A marker whose dashboard PID is STILL ALIVE belongs to a running session,
+    not to a crashed one. There is no single-instance guard, so without this
+    check a second launch found the first launch's marker and - believing it
+    was a crash - killed that instance's tun2socks, removed its Wintun
+    adapter and swept its routes, leaving the user's live tunnel dead.
+    `marker_live` is injectable for tests; defaults to the real probe.
+    """
     p = probes or default_probes()
     findings = StartupFindings(marker=read_marker(marker_path))
+    if findings.marker:
+        live = marker_live(marker_path) if marker_live else \
+            globals()["marker_is_live"](marker_path)
+        if live:
+            findings.live_session = int(
+                findings.marker.get("pid", -1) or -1)
+            # Nothing this marker points at may be touched.
+            findings.marker = None
+            findings.orphan_tun2socks = 0
+            findings.wintun_routes = 0
+            findings.host_routes = []
+            findings.dns_guard = False
+            return findings
     # Never let one broken probe hide the others (each returns a safe
     # default on failure, but a hard raise here must not crash startup).
     try:
@@ -350,6 +462,15 @@ def recover(findings: StartupFindings,
     log = log or (lambda msg: None)
     actions = []
 
+    if findings.live_session:
+        # A live session owns everything we would have swept. Say so and
+        # touch nothing - this is the "launched TunTop twice" case.
+        msg = (f"another TunTop session (PID {findings.live_session}) is "
+               "still running - its tunnel, routes and DNS guard were left "
+               "alone; close that window first if you meant to replace it")
+        log(f"[*] Recovery: {msg}")
+        return [msg]
+
     tasks = []
     if findings.dns_guard:
         # FIRST: a leftover NRPT rule pins every process's name resolution to
@@ -372,7 +493,10 @@ def recover(findings: StartupFindings,
                 pass
         try:
             detail = fn(p, findings)
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # SystemExit matters: the platform probes legitimately call
+            # sys.exit() on failure, and a BaseException here would abort
+            # every remaining cleanup step AND the caller's startup.
             log(f"[!] Recovery step '{label}' failed: {e}")
             detail = f"failed: {e}"
         msg = f"{label}" + (f" - {detail}" if detail else "")
@@ -399,7 +523,12 @@ def _do_dns_guard(p: Probes, f: StartupFindings) -> str:
 
 
 def _do_teardown(p: Probes, f: StartupFindings) -> str:
-    p.teardown_adapter()
+    # Report what the probe actually said. Discarding its verdict made a
+    # teardown that returned False log "routes and adapter cleared" - the
+    # log claimed a clean slate while the adapter and its routes stayed.
+    ok = p.teardown_adapter()
+    if ok is False:
+        return "removal reported a failure - the next launch retries"
     return "routes and adapter cleared"
 
 
@@ -415,6 +544,14 @@ def startup_recover(hosts=None, log=None, marker_path: str = MARKER_FILE,
     system)."""
     p = probes
     findings = scan(hosts=hosts, probes=p, marker_path=marker_path)
+    if findings.live_session:
+        # Deliberately do NOT write our own marker: that would steal
+        # ownership from the session that is still running, so its watchdog
+        # would no longer recognise the marker as its own.
+        for _line in findings.summary_lines():
+            log(_line) if log else None
+        return [f"skipped recovery - a live session (PID "
+                f"{findings.live_session}) owns this system"]
     if not findings.dirty:
         write_marker(os.getpid(), marker_path)
         return []

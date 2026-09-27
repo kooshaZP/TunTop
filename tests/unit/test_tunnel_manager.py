@@ -8,7 +8,6 @@ calling Windows internals directly (Phase 1 layering rule).
 Pure stdlib, no Windows calls.
 """
 import unittest
-from unittest import mock
 
 from tuntop.core.state import TunnelState, TunnelStateMachine
 from tuntop.core.tunnel_manager import TunnelManager

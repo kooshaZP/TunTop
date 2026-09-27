@@ -5,11 +5,8 @@ import hashlib
 import ipaddress
 import json
 import os
-import pickle
-import struct
 import tempfile
 import threading
-import time
 import urllib.request
 
 
@@ -58,9 +55,15 @@ def _clean_err(err):
 
 
 def _geoip_parse_cidr(msg):
-    """Return (ip_bytes, prefix) for one CIDR message."""
+    """Return (ip_bytes, prefix) for one CIDR message.
+
+    `prefix` starts as None, NOT 0: a truncated/hand-edited .dat whose CIDR
+    message carries no prefix field used to decode as "1.2.3.4/0", which
+    normalises to 0.0.0.0/0 and routed the ENTIRE internet to the direct
+    egress. A missing prefix is now reported as such and dropped.
+    """
     ip = None
-    prefix = 0
+    prefix = None
     pos = 0
     n = len(msg)
     while pos < n:
@@ -77,19 +80,39 @@ def _geoip_parse_cidr(msg):
 
 
 def _geoip_cidr_to_str(ip, prefix):
-    if ip is None:
+    """Render one CIDR, NORMALISED through ipaddress.
+
+    Two bugs this removes:
+      * a missing prefix became 0 -> "1.2.3.4/0" -> 0.0.0.0/0, i.e. the whole
+        IPv4 (or IPv6) space routed to the direct egress. A default route is
+        never a geoip country range, so it is rejected outright.
+      * IPv6 came out as eight uncompressed groups ("2001:db8:0:0:0:0:0:0/32")
+        while Get-NetRoute and the exit sweeps use the canonical compressed
+        form ("2001:db8::/32") - so every IPv6 geo route failed every string
+        comparison against the live route table and survived every sweep.
+    """
+    if ip is None or prefix is None:
+        return None
+    maxlen = 32 if len(ip) == 4 else 128 if len(ip) == 16 else None
+    if maxlen is None:
         return None
     try:
         if len(ip) == 4:
             addr = ".".join(str(b) for b in ip)
-        elif len(ip) == 16:
+        else:
             addr = ":".join("%x" % int.from_bytes(ip[i:i + 2], "big")
                             for i in range(0, 16, 2))
-        else:
-            return None
+        plen = int(prefix)
     except Exception:
         return None
-    return "%s/%d" % (addr, prefix)
+    if not 0 <= plen < maxlen:
+        # 0 (and anything out of range) would be a default route: never a
+        # country range, and the worst possible thing to install.
+        return None
+    try:
+        return str(ipaddress.ip_network("%s/%d" % (addr, plen), strict=False))
+    except ValueError:
+        return None
 
 
 def _geoip_parse_entry(msg):
@@ -217,9 +240,11 @@ def download_geoip(dest_path, url=GEOIP_DAT_URL, sha_url=GEOIP_DAT_SHA_URL,
 # tuntop/helper.py is a brand-new Python process on every [S]/[T]→[S] cycle,
 # so the in-memory _GEOIP_CACHE below is wiped each time and the
 # whole .dat would be re-parsed from scratch every single run.  We mirror the
-# decoded result to a small pickle next to the script, keyed on the source
+# decoded result to a small JSON file next to the script, keyed on the source
 # file's path + mtime + size (+ requested code), so a repeat run reuses the
 # previous decode instead of paying the multi-megabyte parse cost again.
+# JSON, not pickle: see _geo_disk_load's note on why deserialising a
+# user-writable file was a privilege-escalation hazard.
 
 _GEO_DISK_CACHE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".geo_cache")
@@ -231,16 +256,34 @@ def _geo_cache_key(file_path, code):
 
 
 def _geo_disk_load(file_path, code):
+    """Read the mirror cache.
+
+    JSON, never pickle. This file lives in a user-writable directory (and in
+    a source tree it is the repo itself) and its name is a deterministic
+    SHA-256 of the source file's path/mtime/size plus the code - trivially
+    predictable. pickle.load() on it gave any unprivileged process that could
+    write next to the install arbitrary code execution in the ELEVATED
+    helper on the next [S]. JSON keeps the cache useful (a list of CIDR
+    strings) with no deserialization risk.
+    """
     try:
         if not os.path.isdir(_GEO_DISK_CACHE_DIR):
             return None
         key = _geo_cache_key(file_path, code)
         path = os.path.join(_GEO_DISK_CACHE_DIR,
-                            hashlib.sha256(key.encode("utf-8")).hexdigest() + ".pkl")
+                            hashlib.sha256(key.encode("utf-8")).hexdigest() + ".json")
         if not os.path.exists(path):
             return None
-        with open(path, "rb") as f:
-            return pickle.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Validate the shape: a wrong-typed value used to reach
+        # all_codes.get(code) and raise AttributeError on every lookup.
+        if isinstance(data, dict) and all(
+                isinstance(k, str) and isinstance(v, list)
+                and all(isinstance(x, str) for x in v)
+                for k, v in data.items()):
+            return data
+        return None
     except Exception:
         return None
 
@@ -248,21 +291,23 @@ def _geo_disk_load(file_path, code):
 def _geo_disk_save(file_path, code, value):
     """Persist the decoded result in a BACKGROUND thread (atomic temp+replace).
 
-    Pickling a full-country dict can take noticeable time on slow disks; doing
-    it inline stalled the tunnel-start sequence right after route install.
-    The in-memory result is already handed back to the caller - this write is
-    purely for the NEXT process's cross-run cache, so it can finish later."""
+    Serialising a full-country mapping can take noticeable time on slow
+    disks; doing it inline stalled the tunnel-start sequence right after
+    route install. The in-memory result is already handed back to the caller
+    - this write is purely for the NEXT process's cross-run cache, so it can
+    finish later.
+    """
     def _write():
         try:
             os.makedirs(_GEO_DISK_CACHE_DIR, exist_ok=True)
             path = os.path.join(
                 _GEO_DISK_CACHE_DIR,
-                hashlib.sha256(_geo_cache_key(file_path, code).encode("utf-8")).hexdigest() + ".pkl")
-            fd, tmp = tempfile.mkstemp(suffix=".pkl.tmp",
+                hashlib.sha256(_geo_cache_key(file_path, code).encode("utf-8")).hexdigest() + ".json")
+            fd, tmp = tempfile.mkstemp(suffix=".json.tmp",
                                        dir=_GEO_DISK_CACHE_DIR)
             try:
-                with os.fdopen(fd, "wb") as f:
-                    pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(value, f)
                 os.replace(tmp, path)
             finally:
                 try:
@@ -392,6 +437,15 @@ def _geoip_decode_pure(data, code=None, on_progress=None):
             msg, pos = _read_bytes(data, pos)
             country, cidrs = _geoip_parse_entry(msg)
             if not country or (code_l is not None and country.lower() != code_l):
+                # Report progress BEFORE skipping: the ~250 entries that are
+                # not the requested country are most of the file, so a
+                # `continue` here left the dashboard's [GEO-PARSE] bar frozen
+                # at its initial value for the whole multi-MB decode and then
+                # snapping to 100% - exactly what the progress callback
+                # exists to prevent.
+                if on_progress is not None and pos >= _next_report:
+                    on_progress(pos, n)
+                    _next_report = pos + max(1, n // 100)
                 continue
             lst = out.setdefault(country.lower(), [])
             for ip, prefix in cidrs:

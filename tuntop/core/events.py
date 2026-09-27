@@ -119,10 +119,16 @@ class LogRing:
         return rec
 
     def recent(self, n: int | None = None) -> list[LogRecord]:
-        """Return the last N records (or all if n is None), newest last."""
+        """Return the last N records (or all if n is None), newest last.
+
+        n <= 0 returns NOTHING. `items[-0:]` is `items[0:]`, so a caller
+        asking for a zero-height panel budget used to get the whole
+        200/500-record buffer rendered in a single frame."""
         with self._lock:
             items = list(self._buf)
         if n is not None:
+            if n <= 0:
+                return []
             items = items[-n:]
         return items
 

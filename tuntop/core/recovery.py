@@ -94,7 +94,8 @@ class RecoveryEngine:
                  log: Optional[Callable[[str], None]] = None,
                  max_attempts: int = 3,
                  give_up_after: int = 3,
-                 delay_scale: float = 1.0):
+                 delay_scale: float = 1.0,
+                 stability_window: float = 30.0):
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         self._machine = machine
@@ -102,6 +103,7 @@ class RecoveryEngine:
         self._max_attempts = max_attempts
         self._give_up_after = give_up_after
         self._delay_scale = float(delay_scale)
+        self._stability_window = float(stability_window)
         self._ladders: dict = {}
         self._lock = threading.RLock()
         self._wakeup = threading.Event()
@@ -109,8 +111,10 @@ class RecoveryEngine:
         self._paused = False
         self._incident: Optional[_Incident] = None
         self._in_attempt = False     # a repair is executing right now
+        self._pending_report = None  # a report absorbed DURING an attempt
         self._consecutive_failed = 0  # incidents that exhausted all attempts
         self._gave_up = False
+        self._last_success_at: Optional[float] = None
         self._worker: Optional[threading.Thread] = None
         self._stats = {"incidents": 0, "repairs_ok": 0,
                        "repairs_failed": 0, "give_ups": 0}
@@ -184,6 +188,22 @@ class RecoveryEngine:
         with self._lock:
             return self._gave_up
 
+    @property
+    def running(self) -> bool:
+        """True when the worker thread is alive and has not been shut down.
+
+        TunnelManager.start() gates on this; before the property existed its
+        `getattr(engine, "running", True)` defaulted to True, so the
+        condition was permanently False and a freshly built, unstarted
+        engine never got a worker: every report_failure was accepted and
+        logged as "recovery attempt 1 in 1s" and then never executed.
+        """
+        with self._lock:
+            if self._stopped:
+                return False
+            w = self._worker
+            return w is not None and w.is_alive()
+
     # -- Reporting ----------------------------------------------------------
 
     @staticmethod
@@ -200,10 +220,23 @@ class RecoveryEngine:
         reset the backoff schedule). `delay` overrides the first wait."""
         if not isinstance(kind, FailureKind):
             raise TypeError("kind must be a FailureKind")
+        pending = None
         with self._lock:
             if self._stopped or self._paused or self._gave_up:
                 return
-            if self._incident is not None or self._in_attempt:
+            if self._in_attempt:
+                # A repair is running RIGHT NOW. Absorb the report into a
+                # pending slot instead of dropping it: the reader thread
+                # reports a dead helper only once, so discarding it here
+                # left the tunnel down with nothing scheduled to fix it
+                # (the in-flight ladder rung was for a different, older
+                # incident and may well succeed).
+                self._pending_report = (kind, detail, delay)
+                self._log(f"[i] {kind.value} problem reported while a "
+                          f"recovery attempt is running - it will be acted on "
+                          f"as soon as that attempt finishes.")
+                return
+            if self._incident is not None:
                 # Already handling something: absorbed, NOT rescheduled.
                 return
             if kind not in self._ladders:
@@ -219,18 +252,47 @@ class RecoveryEngine:
             self._log(f"[!] Problem detected ({kind.value}"
                       + (f": {detail}" if detail else "")
                       + f") - recovery attempt 1 in {self._fmt(first)}.")
+            pending = self._pending_report
+            self._pending_report = None
         self._wakeup.set()
+        if pending is not None:
+            # A report that arrived before this one was already open; the
+            # ladder is now running for it too, so re-report after.
+            self.report_failure(*pending)
 
     def report_success(self):
         """The tunnel is verified healthy: close any incident and reset the
-        crash-loop counter (one verified success wipes the bad streak)."""
+        crash-loop counter.
+
+        Only a SUSTAINED success clears the streak. Every ladder's verify is
+        just "the helper process is still there" a second after launch, so a
+        helper that comes up and dies 5 s later counted as a verified success
+        and reset `_consecutive_failed`. Each death then opened a FRESH
+        incident at attempt 1: the 1/2/4s backoff never escalated,
+        `max_attempts` was never exhausted, `give_up_after` never tripped, and
+        the app sat in an infinite restart loop (a new tun2socks every second,
+        the whole route table re-installed each time).
+        """
         with self._lock:
             had = self._incident is not None
             self._incident = None
-            self._consecutive_failed = 0
+            now = time.monotonic()
+            last = self._last_success_at
+            stable = last is not None and \
+                (now - last) >= self._stability_window
+            if stable or last is None:
+                self._consecutive_failed = 0
             if had:
                 self._log("[+] Recovery: tunnel verified healthy again - "
                           "incident closed.")
+                if not stable and last is not None:
+                    self._log(
+                        f"[i] That success held for less than "
+                        f"{self._stability_window:.0f}s, so the crash-loop "
+                        f"counter is NOT reset - a helper that keeps dying "
+                        f"right after launch will still escalate.")
+            if stable:
+                self._last_success_at = now
         self._wakeup.set()
 
     def _first_delay_for(self, kind: FailureKind) -> float:
@@ -289,7 +351,30 @@ class RecoveryEngine:
             self._wakeup.clear()
 
     def _run_attempt(self, incident: _Incident):
-        """Execute one ladder rung: RECOVERING, repair, verify, judge."""
+        """Execute one ladder rung: RECOVERING, repair, verify, judge.
+
+        The whole body is inside one try/finally. Without it, a BaseException
+        out of `action.repair()` - a SystemExit from the injected platform
+        helpers, which this codebase raises deliberately - killed the
+        `TunTop-recovery` worker thread AND left `_in_attempt = True`
+        forever. After that, `report_failure` returned early on every call,
+        so auto-recovery was permanently dead with nothing logged."""
+        try:
+            self._run_attempt_inner(incident)
+        except (Exception, SystemExit) as e:
+            with self._lock:
+                self._in_attempt = False
+                self._pending_report = None
+                self._log(f"[!] Recovery attempt {incident.attempt} crashed "
+                          f"({e}) - the engine stays armed and will retry on "
+                          "the next reported problem.")
+        finally:
+            # Belt and braces: _in_attempt must NEVER stay set, whatever
+            # happened above.
+            with self._lock:
+                self._in_attempt = False
+
+    def _run_attempt_inner(self, incident: _Incident):
         incident.attempt += 1
         with self._lock:
             actions, _fd = self._ladders.get(incident.kind, ((), None))
@@ -310,25 +395,30 @@ class RecoveryEngine:
         err = ""
         try:
             ok = bool(action.repair())
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             ok, err = False, f" (repair raised: {e})"
         if ok and action.verify is not None:
             try:
                 ok = bool(action.verify())
-            except Exception as e:
+            except (Exception, SystemExit) as e:
                 ok, err = False, f" (verify raised: {e})"
         with self._lock:
             self._in_attempt = False
             if ok:
                 self._stats["repairs_ok"] += 1
                 self._incident = None
-                self._consecutive_failed = 0
+                now = time.monotonic()
+                if self._last_success_at is None or \
+                        (now - self._last_success_at) >= self._stability_window:
+                    self._consecutive_failed = 0
+                self._last_success_at = now
                 st = self._machine.current
                 if st in (TunnelState.RECOVERING, TunnelState.DEGRADED):
                     self._machine.try_transition(
                         TunnelState.RUNNING,
                         f"recovery verified after '{action.name}'")
                 self._log(f"[+] Recovery verified: {action.name} fixed it.")
+                self._drain_pending()
                 return
             self._stats["repairs_failed"] += 1
             if incident.attempt >= self._max_attempts:
@@ -353,15 +443,47 @@ class RecoveryEngine:
                               "failed incidents - manual intervention "
                               "required. It re-arms on the next "
                               "successful start.")
+                self._drain_pending()
                 return
             wait = self.delay_for_attempt(incident.attempt + 1) \
                 * self._delay_scale
+            # Do NOT re-arm an incident the user has since paused or stopped,
+            # and do not re-arm during teardown: shutdown() promises "a
+            # recovery attempt must never fire while the route table is
+            # being torn down", and re-arming after pause() defeated it
+            # (the rung executed a full backoff later, after [Q]).
+            if self._paused or self._stopped or self._gave_up:
+                self._log("[i] Not re-arming the retry - recovery is paused, "
+                          "stopping, or has given up.")
+                return
             incident.due_at = time.monotonic() + wait
             self._incident = incident
             self._log(f"[i] {action.name} did not fix it{err} - retrying "
                       f"as attempt {incident.attempt + 1} in "
                       f"{self._fmt(wait)}.")
         self._wakeup.set()
+
+    def _drain_pending(self):
+        """Turn a report absorbed during an attempt into a real incident.
+
+        Must be called with the lock held, and it schedules the incident
+        directly (report_failure would try to re-take the lock)."""
+        pending = self._pending_report
+        if not pending:
+            return
+        self._pending_report = None
+        kind, detail, delay = pending
+        if self._stopped or self._paused or self._gave_up:
+            return
+        if kind not in self._ladders or self._incident is not None:
+            return
+        self._incident = _Incident(kind=kind, detail=detail)
+        self._stats["incidents"] += 1
+        first = delay if delay is not None else self._first_delay_for(kind)
+        self._incident.due_at = time.monotonic() + first * self._delay_scale
+        self._log(f"[!] Problem detected ({kind.value}"
+                  + (f": {detail}" if detail else "")
+                  + f") - recovery attempt 1 in {self._fmt(first)}.")
 
 
 

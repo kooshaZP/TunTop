@@ -15,7 +15,6 @@ Run via Run_Helper.ps1 for admin elevation.
 
 import argparse
 import atexit
-import base64
 import collections
 import concurrent.futures
 import ctypes
@@ -68,7 +67,13 @@ def app_dir() -> str:
         return _os.path.dirname(here)
     return here
 
-from tuntop.routing import (          # noqa: E402
+from tuntop.routing import (          # noqa: E402, F401
+    # The WHOLE surface, not just what this module happens to call today.
+    # These must be the objects from tuntop.routing itself - a local
+    # redefinition would shadow a shared fix and leave the dashboard on the
+    # old behaviour. tests/routing/test_routing_quoting.py asserts that
+    # identity for every name below, so an "unused import" cleanup here is
+    # a regression, not a tidy-up.
     _ps, _netsh, _teardown_wintun,
     _add_route_v4, _del_route_v4, _add_route_v6, _del_route_v6,
     _del_route_scoped, _tun_family_aliases, _route_rows,
@@ -83,15 +88,13 @@ from tuntop.network.egress_scripts import (  # noqa: E402  (single source)
 )
 from tuntop.psshell import ps_quote   # noqa: E402
 from tuntop.netdns import (           # noqa: E402
-    _host_from_url, _resolve, _resolve_cached, _resolve_detail,
+    _host_from_url, _resolve_cached, _resolve_detail,
     _dns_fallback_allowed, set_dns_log,
-    _dns_cache_clear, _dns_build_query, _dns_parse_answers,
-    _dns_query_udp, _dns_query_doh,
 )
 from tuntop.config import defaults as _cfgdef   # noqa: E402
 from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
     VPN_IFACE_RE, LAN_BYPASS_PREFIXES, SWEEP_CHUNK, SWEEP_MAX_WORKERS,
-    TUN, TUN4, TUN6, TUN2, TUN2_IP4, TUN2_IP6, TUNNEL_ALIASES,
+    TUN, TUN4, TUN2, TUN2_IP4, TUN2_IP6, TUNNEL_ALIASES,
 )
 from tuntop.network.routeops import sweeps as _rsweeps   # noqa: E402
 from tuntop.state import (            # noqa: E402
@@ -114,7 +117,6 @@ from tuntop.structured_log import (              # noqa: E402
 )
 from tuntop.health_report import (              # noqa: E402
     format_panel as _health_format_panel,
-    format_compact as _health_compact,
     counts as _health_counts, CRITICAL as _HEALTH_CRIT,
 )
 from tuntop.monitor.leak import (               # noqa: E402
@@ -125,12 +127,29 @@ from tuntop.monitor.leak import (               # noqa: E402
 )
 
 
+# A user-visible file the user is TOLD to attach to a bug report must not
+# land in a directory that is deleted on exit. In a onefile build __file__
+# lives inside the per-run _MEIPASS extraction dir, which PyInstaller wipes
+# when the process ends - so the crash handler printed
+# "Details below, and saved to: ...\_MEIxxxxxx\TunTop_crash.log" and [D] logged
+# "Diagnostics written: diagnostics_....txt" for files that did not exist a
+# moment later. Every crash report and every diagnostics export from the
+# released exe was silently lost. Next to TunTop.exe when frozen; the same
+# rule the control file, the profile store and the geoip default already use.
+def _user_dir() -> str:
+    """A directory that persists for this install: next to TunTop.exe when
+    frozen, else next to the package."""
+    if getattr(_sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(_sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 # Crash log written next to this script. main() catches anything that gets
 # past the per-frame draw() guard, writes the traceback here, prints it to
 # the console, and waits for a keypress instead of letting the window just
 # vanish (the classic "it crashes when I try to open it" symptom, which is
 # usually really "it crashed and closed before I could read why").
-CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TunTop_crash.log")
+CRASH_LOG = os.path.join(_user_dir(), "TunTop_crash.log")
 
 # Where a downloaded geoip database lands when none is configured ([W] key /
 # missing-file auto-download on start). Next to the package so it survives
@@ -182,6 +201,17 @@ def _snap_parse_done(geo_parse, code):
 # for cleanup) is undefined behaviour.  Stored at module scope so it is never
 # reclaimed while the dashboard runs.
 _CTRL_HANDLER_REF = None
+
+# sys.stdout is process-global, and the geo re-apply worker swaps it for a
+# sink so the helper's [GEO-*] progress markers reach the LOADING panel.
+# Serialise the whole swap window, or an overlapping worker's `finally` can
+# restore the OTHER worker's sink and leave that wrapper permanently
+# installed.
+_GEO_STDOUT_LOCK = threading.Lock()
+
+#: A do-nothing lock, for the few places that must tolerate a BTopTui built
+#: via __new__ (tests) rather than __init__.
+_NULL_LOCK = threading.Lock()
 
 # ─── Windows console input structures (mouse + keyboard, no extra deps) ──────
 # Used for click support. All of this is best-effort: if any of it fails to
@@ -1029,8 +1059,16 @@ def _dns_enforcement_check(dns_ip, is_v6=False):
     physical NIC (or a VPN), the resolver is reachable OUTSIDE the tunnel:
     either a deliberate bypass (geo routing writes those routes on
     purpose) or broken enforcement - the detail names the interface so
-    the user can tell policy from accident.
+    the     user can tell policy from accident.
+
+    `dns_ip` falsy = that family has NO resolver configured. That is a
+    neutral state, not a failure: the health panel must never report a leak
+    for a resolver the tunnel never had.
     """
+    if not dns_ip:
+        fam = "IPv6" if is_v6 else "IPv4"
+        return None, (f"no {fam} resolver is configured - nothing to enforce "
+                      f"(set one with [N])")
     ok, out = _ps(
         "$a = (Find-NetRoute -RemoteIPAddress "
         f"'{ps_quote(dns_ip)}' -ErrorAction SilentlyContinue | "
@@ -1041,6 +1079,14 @@ def _dns_enforcement_check(dns_ip, is_v6=False):
     if "NO-ROUTE" in out:
         return None, (f"{dns_ip}: Windows has no route to it at all right "
                       "now - enforcement state unknown")
+    # _ps returns "No result" with ok=True when PowerShell exits 0 having
+    # printed only a non-terminating stderr message, so neither marker is
+    # present. Indexing straight into the split raised IndexError, which
+    # run_checks turned into a red row reading "list index out of range"
+    # instead of the actual diagnosis.
+    if "SELECTED" not in out:
+        return None, (f"route probe for {dns_ip} returned no selection "
+                      f"({out}) - enforcement state unknown")
     iface = out.split("SELECTED", 1)[1].strip() or "?"
     if re.match(r"(?i)^wintun2?$", iface):
         fam = "IPv6" if is_v6 else "IPv4"
@@ -1075,8 +1121,8 @@ def _dns_configuration_check(dns4, dns6=None):
     if dns6:
         resolvers.append((dns6, True))
     if not resolvers:
-        return False, ("no DNS resolver is configured on Wintun - nothing to "
-                       "enforce as the DNS source")
+        return None, ("no DNS resolver is configured on Wintun - nothing to "
+                      "enforce as the DNS source (set one with [N])")
     parts = []
     all_wintun = True
     unknown = []
@@ -1095,9 +1141,9 @@ def _dns_configuration_check(dns4, dns6=None):
         return True, ("Wintun is the selected DNS source for the configured "
                       "resolver(s): " + "; ".join(parts))
     if unknown:
-        return False, ("DNS source selection could not be verified for: "
-                       + ", ".join(unknown)
-                       + " (no route to it right now) - " + "; ".join(parts))
+        return None, ("DNS source selection could not be verified for: "
+                      + ", ".join(unknown)
+                      + " (no route to it right now) - " + "; ".join(parts))
     return False, ("DNS is NOT pinned to Wintun as the selected source - " +
                    "; ".join(parts))
 
@@ -1244,14 +1290,14 @@ def _get_active_connections(limit=15):
     We now return every established connection and let _poll_connections()'
     order-preserving dedup map absorb the churn instead of sampling by an
     unstable -First cutoff."""
-    ps = rf"""
+    ps = r"""
 Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
-  Where-Object {{ $_.RemoteAddress -notlike '127.*' -and $_.RemoteAddress -ne '::1' -and $_.RemoteAddress -ne '0.0.0.0' }} |
+  Where-Object { $_.RemoteAddress -notlike '127.*' -and $_.RemoteAddress -ne '::1' -and $_.RemoteAddress -ne '0.0.0.0' } |
   Select-Object OwningProcess, RemoteAddress, RemotePort -Unique |
-  ForEach-Object {{
+  ForEach-Object {
     $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
-    [PSCustomObject]@{{ Proc = if ($p) {{ $p.ProcessName }} else {{ 'pid-' + $_.OwningProcess }}; Pid = $_.OwningProcess; Remote = $_.RemoteAddress; Port = $_.RemotePort }}
-  }} | ConvertTo-Json -Compress
+    [PSCustomObject]@{ Proc = if ($p) { $p.ProcessName } else { 'pid-' + $_.OwningProcess }; Pid = $_.OwningProcess; Remote = $_.RemoteAddress; Port = $_.RemotePort }
+  } | ConvertTo-Json -Compress
  """
     ok, out = _ps(ps, timeout=6)
     if not ok:
@@ -1275,26 +1321,26 @@ def _get_udp_connections():
     (no native PowerShell 5.1 cmdlet exposes QUIC; ETW is too heavy for the 5s
     poll). Returns a list of dicts with keys Proto, Local, Lport, Remote,
     Rport, Proc, Pid. Best-effort: returns [] on any failure."""
-    ps = rf"""
+    ps = r"""
 Get-NetUDPConnection -ErrorAction SilentlyContinue |
-  Where-Object {{
+  Where-Object {
     $_.RemoteAddress -notlike '127.*' -and
     $_.RemoteAddress -ne '::1' -and $_.RemoteAddress -ne '0.0.0.0' -and
     $_.RemoteAddress -ne '' -and $_.RemotePort -gt 0
-  }} |
+  } |
   Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, OwningProcess -Unique |
-  ForEach-Object {{
+  ForEach-Object {
     $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
-    [PSCustomObject]@{{
-      Proto  = if ($_.RemotePort -eq 443) {{ 'QUIC' }} else {{ 'UDP' }}
+    [PSCustomObject]@{
+      Proto  = if ($_.RemotePort -eq 443) { 'QUIC' } else { 'UDP' }
       Local  = $_.LocalAddress
       Lport  = $_.LocalPort
       Remote = $_.RemoteAddress
       Rport  = $_.RemotePort
-      Proc   = if ($p) {{ $p.ProcessName }} else {{ 'pid-' + $_.OwningProcess }}
+      Proc   = if ($p) { $p.ProcessName } else { 'pid-' + $_.OwningProcess }
       Pid    = $_.OwningProcess
-    }}
-  }} | ConvertTo-Json -Compress
+    }
+  } | ConvertTo-Json -Compress
 """
     ok, out = _ps(ps, timeout=6)
     if not ok:
@@ -1359,8 +1405,19 @@ def build_checks(ns):
     """Return list of (label, check_fn) - health-check suite."""
     p = ns.port
     servers = ns.server
-    dns = getattr(ns, "dns4", None) or _cfgdef.DNS4   # probe/display fallback
-    dns6 = getattr(ns, "dns6", None) or _cfgdef.DNS6  # probe/display fallback
+    # CONFIGURED resolvers vs DISPLAY defaults - do not conflate them.
+    # launch() forwards only what the user chose (`if self.ns.dns4: cmd +=
+    # ["--dns4", ...]`), so with `--dns4 1.1.1.1` alone ns.dns6 is None and
+    # the helper configures IPv4 DNS ONLY. Probing `or _cfgdef.DNS6` anyway
+    # meant Find-NetRoute selected the physical NIC for 2606:4700:4700::1111
+    # - a resolver the tunnel never uses - and two rows stayed permanently
+    # RED, one of them CRITICAL, so the top badge read UNHEALTHY forever with
+    # nothing the user could fix. Gate every DNS row on what is really set;
+    # keep the _cfgdef fallback for DISPLAY only.
+    dns_cfg = getattr(ns, "dns4", None) or None
+    dns6_cfg = getattr(ns, "dns6", None) or None
+    dns = dns_cfg or _cfgdef.DNS4       # probe/display fallback
+    dns6 = dns6_cfg or _cfgdef.DNS6     # probe/display fallback
     ep = getattr(ns, "endpoint_port", 443)
     # [V] vless-over-vpn mode: the per-server route checks below are MODE-AWARE.
     over = getattr(ns, "vless_over_vpn", False)
@@ -1401,7 +1458,7 @@ def build_checks(ns):
         # defaults (0.0.0.0/1) never capture. Detail names the chosen interface so
         # an accidental physical-NIC pick is visible instead of a silent pass.
         ("DNS configuration (Wintun is selected source)",
-         lambda: _dns_configuration_check(dns, dns6)),
+         lambda: _dns_configuration_check(dns_cfg, dns6_cfg)),
         # The row above proves the resolvers TunTop CONFIGURED ride the TUN.
         # This one proves nobody ELSE can answer: the catch-all NRPT rule the
         # helper installs while the tunnel is up (see _dns_guard_check). Its
@@ -1411,7 +1468,7 @@ def build_checks(ns):
         # rather than as a failed install.
         ("DNS leak protection (catch-all NRPT rule)",
          lambda: _dns_guard_check(
-             dns, dns6, enabled=bool(getattr(ns, "dns_guard", True)))),
+             dns_cfg, dns6_cfg, enabled=bool(getattr(ns, "dns_guard", True)))),
         q("MTU",
           "Get-NetIPInterface -AddressFamily IPv4 | ? {$_.NlMtu -ge 1280} | select -First 1 | % {'MTU ' + $_.NlMtu}"),
         # wintun may be absent (tunnel not yet up); never use -ErrorAction
@@ -1512,11 +1569,14 @@ def build_checks(ns):
         # silently emit plaintext UDP/53 out of the physical NIC. When the
         # chosen resolver is itself bypassed (geo/bypass routing), that is a
         # deliberate policy, not a leak - the details say so.
+        #
+        # One row per CONFIGURED family. A family the user never set has no
+        # resolver, so there is nothing to enforce - and probing the display
+        # default for it was the bug that pinned two rows red forever.
         ("DNS v4 enforcement (no path without TUN)",
-         lambda: _dns_enforcement_check(dns, False)),
+         lambda: _dns_enforcement_check(dns_cfg, False)),
         ("DNS v6 enforcement (no path without TUN)",
-         lambda: _dns_enforcement_check(
-             getattr(ns, "dns6", None) or _cfgdef.DNS6, True)),
+         lambda: _dns_enforcement_check(dns6_cfg, True)),
         q("v2rayN core process",
           "Get-Process -ErrorAction SilentlyContinue | ? {$_.ProcessName -match '^(xray|v2ray|sing-box|mihomo|clash)'} | select -First 1 | % {$_.ProcessName + ' PID ' + $_.Id}"),
     ]
@@ -2130,6 +2190,9 @@ class BTopTui:
         self._geo_lock = threading.Lock()
 
         self.log_lines = []
+        # Guards ITERATION of log_lines (appends are worker-thread writes;
+        # draw() and the scroll handlers are readers). See _log_entries().
+        self._log_lock = threading.Lock()
         self._log_snapshot = None
         self._log_scroll = 0        # lines scrolled back from the newest log entry
         self._checks_scroll = 0     # checks scrolled back from the newest row
@@ -2235,6 +2298,16 @@ class BTopTui:
         # reads the latest ns.bypass_ip, so a second one is skipped, not queued).
         self._bypass_restart_active = False
         self._restart_lock = threading.Lock()
+
+        # Same gate for the GEO re-apply ([R], [F] -> 1/2/3/5, and the
+        # VPN-arrival poll each spawn _reapply_geo_bypass_worker). Two
+        # workers racing both clear _live_geo_added and both bulk-delete
+        # the same prefixes, so each orphaned the routes the other had
+        # installed - country traffic blackholed, and on quit the cleanup
+        # sweep had no receipts left to delete, so thousands of geo routes
+        # survived in the system routing table.
+        self._geo_apply_active = False
+        self._geo_apply_lock = threading.Lock()
 
         # Teardown serialisation: [T] runs stop() on a worker; [Q], the
         # atexit handler and the SOCKS-port dialog run teardown paths too.
@@ -2695,13 +2768,22 @@ class BTopTui:
         return "log"
 
     def _log_entries(self):
+        """A SNAPSHOT of the log lines.
+
+        Copied under _log_lock: log_lines is appended to from the UI thread
+        AND from the geo re-apply / bypass installer / DNS-pick worker
+        threads, while draw() and the scroll handlers iterate it. A worker
+        appending mid-render made a draw cycle see a torn/duplicated tail.
+        (list.append itself is atomic; the ITERATION is what was unsafe.)"""
         if self._log_snapshot is not None:
             return self._log_snapshot
-        return self.log_lines
+        with getattr(self, "_log_lock", _NULL_LOCK):
+            return tuple(self.log_lines)
 
     def _pause_log(self):
-        if self._log_snapshot is None:
-            self._log_snapshot = tuple(self.log_lines)
+        with getattr(self, "_log_lock", _NULL_LOCK):
+            if self._log_snapshot is None:
+                self._log_snapshot = tuple(self.log_lines)
 
     def _resume_log(self):
         self._log_snapshot = None
@@ -4073,13 +4155,26 @@ class BTopTui:
         # Enabling VLESS-over-VPN needs a CONNECTED Windows VPN (the helper
         # refuses otherwise and keeps its old mode). Refuse HERE, so the
         # dashboard's ns and the running helper can never disagree.
+        #
+        # The refusal must also ROLL BACK the side effect the caller already
+        # applied: [V] sets no_vpn_bypass=False (so the VPN endpoint bypass
+        # exists) before calling us, because that bypass is what VLESS-over-VPN
+        # needs. Turning VLESS back off without restoring no_vpn_bypass left
+        # the dashboard believing the VPN-endpoint bypass was on while the
+        # running helper - which was never told - kept it off. The two
+        # disagreed for the rest of the session, with no visible symptom
+        # other than VPN traffic that stopped being tunneled correctly.
         if (getattr(self.ns, "vless_over_vpn", False)
                 and not _get_vpn_ipv4_default(
                     getattr(self.ns, "vpn_interface", None))):
             self.ns.vless_over_vpn = False
+            self.ns.no_vpn_bypass = True
             self.log_lines.append(
                 "[!] No connected Windows VPN default route - "
                 "VLESS-over-VPN stays OFF. Connect the VPN and press [V] again.")
+            self.log_lines.append(
+                "[i] VPN endpoint bypass left as it was (unchanged), so the "
+                "running tunnel and the settings still agree.")
             return
         try:
             self._write_control_file(extra={
@@ -4547,8 +4642,8 @@ class BTopTui:
         if cidrs:
             n_routes = f"  ~{len(cidrs)} country CIDRs"
         val = self._read_line(
-            f"1=Change geoip.dat location   2=Change code   3=Change egress   "
-            f"4=Remove geo bypass   5=Apply/Re-apply   Esc=cancel",
+            "1=Change geoip.dat location   2=Change code   3=Change egress   "
+            "4=Remove geo bypass   5=Apply/Re-apply   Esc=cancel",
             title=(f"GEO MANAGER  -  code {code} · egress {target} · "
                    f"file {'set' if geo else 'NOT set'}{n_routes}"),
             examples=[f"current geoip file: {geo or '-'}",
@@ -4572,6 +4667,8 @@ class BTopTui:
             if not new_code:
                 return
             self.ns.geoip_code = new_code.strip().lower()
+            # The memoised sweep CIDR set now describes the PREVIOUS country.
+            self._invalidate_geo_cache()
             self.log_lines.append(
                 f"[*] Geo bypass code set to '{self.ns.geoip_code}'.")
             code = self.ns.geoip_code
@@ -4592,6 +4689,7 @@ class BTopTui:
                     "(Tip: press [W] to download geoip.dat automatically.)")
                 return
             self.ns.geoip = new_path
+            self._invalidate_geo_cache()
             self.log_lines.append(
                 f"[*] Geoip file location set to: {new_path}. "
                 "Press 5 to apply it to the live routes.")
@@ -4636,6 +4734,7 @@ class BTopTui:
                     examples=["C:\\Program Files\\v2rayN\\bin\\geoip.dat"])
                 if path and os.path.isfile(path):
                     self.ns.geoip = path
+                    self._invalidate_geo_cache()
                     self.log_lines.append(f"[*] Geoip file set: {path}.")
                     self._reapply_geo_bypass()
                 elif path:
@@ -4660,14 +4759,26 @@ class BTopTui:
             f"({len(cidrs)} country CIDRs) live...")
 
         def _worker():
-            n = self._remove_geo_routes_for(cidrs)
-            if n:
-                self._blog(f"[+] Geo bypass '{code}' removed live "
-                           f"({n} routes deleted). Country traffic now "
-                           "follows the tunnel.")
-            else:
+            found, removed = self._remove_geo_routes_for(cidrs)
+            if not found:
                 self._blog(f"[i] No live routes matched geo:'{code}' - "
                            "already clean.")
+            elif removed >= found:
+                self._blog(f"[+] Geo bypass '{code}' removed live "
+                           f"({removed} routes deleted). Country traffic now "
+                           "follows the tunnel.")
+            else:
+                # Report the SHORTFALL, not the attempt count. netsh exits 0
+                # even when individual deletes fail, so "N routes deleted"
+                # was frequently a lie - the user was told a country's
+                # bypass was gone while it was still in the routing table,
+                # pointing that traffic at an egress that may no longer exist.
+                self._blog(
+                    f"[!] Geo bypass '{code}': deleted {removed} of {found} "
+                    f"routes - {found - removed} could not be removed and are "
+                    "still in the routing table (they are denied, in use, or "
+                    "were re-added by Windows). Country traffic may still "
+                    "follow the old bypass.")
             self._geo_reset_progress()
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -4729,8 +4840,19 @@ class BTopTui:
                 labels.append(f"{star} {n}  {meta}{tag}")
             return labels
 
-        names = [n for n in data.keys()
-                 if n not in (profiles.DEFAULT_KEY, profiles.UI_KEY)]
+        def _visible(data):
+            # Every rebuild of `names` MUST use the same filter as _labels().
+            # After a delete the old code only excluded DEFAULT_KEY, so `_ui`
+            # (the UI-preferences blob) reappeared in `names` but not in
+            # `labels` - the list was off by one row and `sel` could address
+            # `_ui`. Loading it calls apply_to_args(), which unconditionally
+            # sets ns.server = [] and clears every bypass list, so pressing
+            # [I] then deleting a profile and hitting Enter silently wiped the
+            # server list and tore the running tunnel down.
+            return [n for n in data.keys()
+                    if n not in (profiles.DEFAULT_KEY, profiles.UI_KEY)]
+
+        names = _visible(data)
         labels = _labels(data)
         pending_delete = None
         size = _get_window_size() or (80, 24)
@@ -4770,8 +4892,7 @@ class BTopTui:
                         self.log_lines.append(msg)
                         pending_delete = None
                         data, _ = profiles.load_store(pf)
-                        names = [n for n in data.keys()
-                                 if n != profiles.DEFAULT_KEY]
+                        names = _visible(data)
                         if not names:
                             self.log_lines.append(
                                 "[i] No profiles left - save one with [O].")
@@ -4810,7 +4931,21 @@ class BTopTui:
             self._last_frame = ""
             self._prev_lines = []
             self._full_repaint = True
+        # Re-validate against the same reserved-key filter _labels() uses.
+        # apply_to_args() sets ns.server unconditionally, so loading a
+        # non-profile entry (the reserved _ui preferences blob) would clear
+        # the server list AND tear the running tunnel down with nothing to
+        # bring it back. Cheap belt to the _visible() braces above.
+        if not names:
+            self.log_lines.append("[i] No profiles left - save one with [O].")
+            return
+        sel = max(0, min(sel, len(names) - 1))
         name = names[sel]
+        if name in (profiles.DEFAULT_KEY, profiles.UI_KEY) or \
+                not isinstance(data.get(name), dict):
+            self.log_lines.append(
+                f"[!] '{name}' is not a loadable profile - nothing changed.")
+            return
         snap = data[name]
         profiles.apply_to_args(self.ns, snap, normalise_host=_host_from_url)
         self.endpoint_v4, self.endpoint_v6 = [], []
@@ -4946,7 +5081,7 @@ class BTopTui:
         """Write diagnostics_<timestamp>.txt next to the script: config, state,
         last health scan, event log tail, live routes and adapters. Everything
         a bug report needs, minus screenshots."""
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+        path = os.path.join(_user_dir(),
                             time.strftime("diagnostics_%Y%m%d_%H%M%S.txt"))
 
         def _worker():
@@ -5350,10 +5485,34 @@ class BTopTui:
         self.log_lines.append(
             f"[*] Re-applying geoip bypass '{code}' live from {geo} "
             f"(via {target}) ...")
+        with getattr(self, "_geo_apply_lock", _NULL_LOCK):
+            if getattr(self, "_geo_apply_active", False):
+                # A re-apply is already in flight. A second one would clear
+                # the first's route ledger and delete its half-installed
+                # batches, orphaning every route either of them installed.
+                self.log_lines.append(
+                    "[i] A geo re-apply is already running - this press was "
+                    "ignored. Wait for it to finish, then press [R] again.")
+                return
+            self._geo_apply_active = True
         threading.Thread(target=self._reapply_geo_bypass_worker,
                          args=(geo, code, target), daemon=True).start()
 
     def _reapply_geo_bypass_worker(self, geo, code, target="direct"):
+        """Serialisation wrapper for the real worker.
+
+        _reapply_geo_bypass() takes the gate before spawning; this releases
+        it in a finally so the many early `return`s in the body below (no
+        geoip file, unparsable, no VPN route) can never leave the gate stuck
+        and the [R] key permanently dead.
+        """
+        try:
+            self._reapply_geo_bypass_worker_inner(geo, code, target)
+        finally:
+            with getattr(self, "_geo_apply_lock", _NULL_LOCK):
+                self._geo_apply_active = False
+
+    def _reapply_geo_bypass_worker_inner(self, geo, code, target="direct"):
         """Background worker for _reapply_geo_bypass(): does the actual parse +
         route install off the UI thread, logs via the thread-safe _blog(), and
         routes the helper's stdout (GEO markers + geoip diagnostics) through the
@@ -5535,20 +5694,25 @@ class BTopTui:
         if _eg6:
             for _ip in (self.endpoint_v6 or []):
                 reassert.append(("v6", f"{_ip}/128", _eg6[0], _eg6[1]))
-        _old_stdout = sys.stdout
-        sys.stdout = _GeoLogSink(self)
         _apply_err = None
         _installed = []
-        try:
-            # The installer RETURNS the rows it registered - the UI never
-            # reaches into (or rebinds) the helper's module globals.
-            _installed = helper.add_geoip_bypass(
-                code, cidrs, g_iface, g_gw, v6iface, v6gw,
-                protected=protected, reassert=reassert) or []
-        except Exception as e:
-            _apply_err = e
-        finally:
-            sys.stdout = _old_stdout
+        # sys.stdout is process-global. Hold the lock across the whole swap
+        # window, not just the two assignments: without it an overlapping
+        # worker's `finally` could restore THIS worker's sink and leave the
+        # other wrapper permanently installed.
+        with _GEO_STDOUT_LOCK:
+            _old_stdout = sys.stdout
+            sys.stdout = _GeoLogSink(self)
+            try:
+                # The installer RETURNS the rows it registered - the UI never
+                # reaches into (or rebinds) the helper's module globals.
+                _installed = helper.add_geoip_bypass(
+                    code, cidrs, g_iface, g_gw, v6iface, v6gw,
+                    protected=protected, reassert=reassert) or []
+            except Exception as e:
+                _apply_err = e
+            finally:
+                sys.stdout = _old_stdout
         if _apply_err is not None:
             self._blog(f"[!] geoip live apply failed: {_apply_err}")
             return
@@ -6031,8 +6195,22 @@ class BTopTui:
                     try:
                         ok, detail = fn()
                         detail = str(detail).replace("\n", " ")[:80]
-                        results.append((i, name, bool(ok), detail))
+                        # TRI-STATE, preserved. A check returns True, False,
+                        # or None - and None means "could not be determined"
+                        # (no route to probe, an inconclusive ping, a
+                        # resolver family that is not configured, a malformed
+                        # probe response). `bool(ok)` collapsed None into
+                        # False, so every unknown counted as a FAILURE: the
+                        # top badge read UNHEALTHY and the fail counter
+                        # climbed for checks that had proved nothing at all,
+                        # and the user was sent looking for a fault in their
+                        # own setup that did not exist.
+                        results.append((i, name,
+                                        None if ok is None else bool(ok),
+                                        detail))
                     except Exception as e:
+                        # A check that RAISED is a real failure - the probe
+                        # itself is broken, which is worth surfacing.
                         results.append((i, name, False, str(e)[:80]))
                     self.results = list(results)   # atomic publish per check
             finally:
@@ -6207,8 +6385,15 @@ class BTopTui:
         _arm_bg()       # keep the theme background armed across every _R
 
         state = self.state
-        passed = sum(1 for _, _, ok, _ in self.results if ok)
-        failed = len(self.results) - passed
+        # Tri-state counts. `failed = done - passed` counted every
+        # INCONCLUSIVE check as a failure, so a probe that could not answer
+        # (no route right now, an ICMP-filtered host, a DNS family the user
+        # never configured) inflated the fail count and the top badge - the
+        # user was told the tunnel was UNHEALTHY for checks that had proven
+        # nothing. Inconclusive rows are counted, shown and labelled as such.
+        passed = sum(1 for _, _, ok, _ in self.results if ok is True)
+        failed = sum(1 for _, _, ok, _ in self.results if ok is False)
+        unknown = sum(1 for _, _, ok, _ in self.results if ok is None)
         done = len(self.results)
         total = len(self.checks)
         pct = (done / total) * 100 if total else 0
@@ -6223,7 +6408,11 @@ class BTopTui:
         # the offsets can't run off the end (log lines vs health-check rows
         # are measured separately now that each panel scrolls independently).
         _log_hmax = 0
-        for e in self.log_lines:
+        # Snapshot under _log_lock: a worker thread appending to log_lines
+        # while draw() measures it could otherwise be observed mid-mutation.
+        with getattr(self, "_log_lock", _NULL_LOCK):
+            _log_snapshot_now = tuple(self.log_lines)
+        for e in _log_snapshot_now:
             _w = len(re.sub(r'\x1b\[[^m]*m', '', str(e)))
             if _w > _log_hmax:
                 _log_hmax = _w
@@ -6430,7 +6619,8 @@ class BTopTui:
             cards.append((
                 (RED if _hc else (GREEN if failed == 0 and done > 0 else YELLOW)),
                 "HEALTH", ((f"{passed} pass / {failed} fail"
-                            + (f" \u26a0{_hc} CRIT" if _hc else ""))
+                            + (f" / {unknown} n/a" if unknown else "")
+                            + (f" ⚠{_hc} CRIT" if _hc else ""))
                            if done > 0 else "-"),
                 pct / 100, done > 0))
         cards.append((CYAN, "TOTAL", f"{total_mb:6.1f} MiB", 0.0, False))
@@ -7023,7 +7213,24 @@ class BTopTui:
             self._click_map.append((len(L), 0, w, "5"))
             # The ACTIVE scroll panel gets a scroll marker in its title - one
             # glance shows which panel j/k, Left/Right and the wheel target.
-            checks_title = f"HEALTH CHECKS   \u2714 {passed} ok   \u2717 {failed} fail"
+            checks_title = f"HEALTH CHECKS   ✔ {passed} ok   ✗ {failed} fail"
+            if unknown:
+                # Say so explicitly: a grey "?" row with no count beside it
+                # reads as an oversight rather than "this probe had no
+                # answer, which is not the same as a fault".
+                checks_title += f"   ? {unknown} n/a"
+            # Plus a scroll-position indicator: the EVENT LOG title has one but
+            # this panel never did, so a user scrolled back through a long
+            # health list had NO indication that newer rows existed below.
+            # Failures are appended at the END as each check completes, so the
+            # row that matters was routinely off-screen with nothing on screen
+            # to say so.
+            if len(self.results) > page_size:
+                checks_title += (f"  ({start + 1}-"
+                                 f"{min(end, len(self.results))} of "
+                                 f"{len(self.results)})")
+            if self._checks_hscroll > 0:
+                checks_title += f"  [◄ scrolled {self._checks_hscroll}c]"
             if (self._mouse_hovered and self._active_panel == "checks"
                     and "checks" not in self._hidden):
                 checks_title += "   \u2195 scroll"
@@ -7055,13 +7262,23 @@ class BTopTui:
                 d_w = max(1, d_w)
 
                 for num, name, ok, detail in check_rows:
-                    if ok:
-                        mark = GREEN + "\u2714" + _R        # ✔ green check
+                    if ok is None:
+                        # INCONCLUSIVE - shown distinctly from both pass and
+                        # fail. A grey "?" with no red frame says "this probe
+                        # could not answer", which is what it means; painting
+                        # it as a red cross claimed a fault the check never
+                        # found.
+                        mark = DIM + "?" + _R
+                        name_col = DIM
+                        det_col = DIM
+                        border = P_LIGHT
+                    elif ok:
+                        mark = GREEN + "✔" + _R        # ✔ green check
                         name_col = GREEN + BRIGHT
                         det_col = DIM
                         border = P_LIGHT
                     else:
-                        mark = RED + "\u2717" + _R          # ✗ red cross
+                        mark = RED + "✗" + _R          # ✗ red cross
                         name_col = RED + BRIGHT
                         det_col = RED
                         border = RED                          # failed rows get a red frame
@@ -7329,7 +7546,6 @@ class BTopTui:
     # ── Main loop ────────────────────────────────────────────────────────
 
     def loop(self):
-        import msvcrt
         self._init_mouse()
         self.log_lines.append(
             f"[*] Terminal: {_detect_terminal_host()}  "
@@ -7737,8 +7953,26 @@ class BTopTui:
             # leaving the dashboard stuck at STARTING forever.
             self._start_ts = time.time()
             self._start_timeout = 90  # seconds
-            def _read():
+            # A generation token, so a reader left over from a PREVIOUS
+            # helper can never drive the state machine for the current one.
+            # [S] restarts the tunnel while a stop's reader may still be
+            # draining the old pipe; that reader's tail then saw
+            # "[+] TUNNEL ACTIVE" and "Press Ctrl+C to stop" from the OLD
+            # process and transitioned the NEW tunnel to RUNNING before a
+            # single route of it was installed. Worse, its exit path forced
+            # STOPPING -> STOPPED the moment it drained, so a healthy tunnel
+            # was shown as stopped while actually running.
+            self._helper_generation = getattr(
+                self, "_helper_generation", 0) + 1
+            generation = self._helper_generation
+
+            def _is_current(gen):
+                return getattr(self, "_helper_generation", 0) == gen
+
+            def _read(gen=generation):
                 for line in self.proc.stdout:
+                    if not _is_current(gen):
+                        break
                     try:
                         s = _console_safe(line.rstrip())
                     except Exception:
@@ -7908,6 +8142,12 @@ class BTopTui:
                 # the UI nor live-bypass logic can keep treating a dead
                 # tunnel as RUNNING. try_transition (not transition): the
                 # user's [Q] teardown may already have claimed STOPPING.
+                #
+                # Only for the CURRENT generation - a reader draining a
+                # superseded helper must not report a stop that never
+                # happened (see _is_current).
+                if not _is_current(gen):
+                    return
                 self.tunnel.try_transition(TunnelState.STOPPING,
                                            "helper process exited")
                 self.tunnel.try_transition(TunnelState.STOPPED,
@@ -7990,8 +8230,12 @@ class BTopTui:
                     ips.append(ip)
         if not ips:
             return
-        # Statement builder is the shared rule (routeops.sweeps).
-        stmts = _rsweeps.host_route_stmts(ips)
+        # Statement builder is the shared rule (routeops.sweeps). SCOPED to
+        # the tunnel adapter: an unscoped `Remove-NetRoute -DestinationPrefix
+        # '<dest>'` removes that prefix on EVERY interface, so this crashed
+        # helper's sweep also deleted a corporate VPN client's /32 for the
+        # same server - the "our routes disappear, the VPN's stay" report.
+        stmts = _rsweeps.host_route_stmts(ips, aliases=[TUN, TUN2])
         try:
             _ps("\n".join(stmts))
         except Exception:
@@ -8234,6 +8478,18 @@ class BTopTui:
                 added = 0
         return (deleted, added)
 
+    def _invalidate_geo_cache(self):
+        """Drop the memoised CIDR set. MUST be called whenever ns.geoip or
+        ns.geoip_code changes.
+
+        Only the [W] download path invalidated it. Changing the country with
+        [F] -> 2, or the file with [F] -> 1, left the OLD country's prefixes
+        cached, and three consumers acted on the stale set: [F] -> 4 "remove"
+        deleted the previous code's routes while announcing the new one; the
+        [Q] exit sweep swept the old prefixes and left the new country's
+        routes installed; and _leftover_geo_routes reported the wrong set."""
+        self._geo_sweep_cidrs_val = None
+
     def _geo_sweep_cidrs(self):
         """The full CIDR prefix set for --geoip-code (cached per process;
         tuntop.geoip's cross-run disk cache makes even the first decode
@@ -8289,7 +8545,6 @@ class BTopTui:
         traffic. Windows' own on-link routes (nh 0.0.0.0/On-link) and any
         other interface's routes are never touched. Returns how many were
         removed."""
-        import ipaddress
         try:
             def_gw = _get_ipv4_default()
             if not def_gw:
@@ -8437,26 +8692,58 @@ class BTopTui:
         """Batch-remove every live route whose DestinationPrefix is in `cidrs`
         (a geoip country's CIDR set), on ANY interface. Used before a live geo
         re-apply (remove-before-install) and reusable anywhere else. Never
-        raises; returns how many matching routes were found."""
+        raises; returns (found, removed).
+
+        `found` is a live-table count and `removed` is VERIFIED: the table is
+        re-dumped after the batch. Reporting `found` as "deleted" was a
+        straight-up untruth - netsh reports per-line failures in its output
+        and still exits 0, so a denied or in-use route stayed installed while
+        the UI announced the country's bypass as gone (and the user, having
+        been told it was clean, never checked).
+
+        CIDRs are compared as NETWORKS, not strings: parse_geoip renders IPv6
+        uncompressed while Get-NetRoute returns the canonical compressed form,
+        so a string compare missed every IPv6 geo route and those survived
+        every removal pass.
+        """
         if not cidrs:
-            return 0
+            return 0, 0
         try:
-            rows = []
-            for r in self._dump_route_table():
-                dp = str(r.get("DestinationPrefix")).replace("'", "")
-                if dp not in cidrs:
+            wanted = set()
+            for c in cidrs:
+                try:
+                    wanted.add(str(ipaddress.ip_network(str(c),
+                                                        strict=False)))
+                except ValueError:
                     continue
-                alias = str(r.get("InterfaceAlias", "") or "").replace("'", "")
-                nh = str(r.get("NextHop", "") or "").replace("'", "")
-                if nh in ("0.0.0.0", "::"):
-                    nh = ""
-                rows.append((dp, alias, nh))
-            if rows:
-                self._batch_delete_routes(rows)
-            return len(rows)
+            if not wanted:
+                return 0, 0
+
+            def _rows():
+                out = []
+                for r in self._dump_route_table():
+                    dp = str(r.get("DestinationPrefix")).replace("'", "")
+                    try:
+                        dp = str(ipaddress.ip_network(dp, strict=False))
+                    except ValueError:
+                        pass
+                    if dp not in wanted:
+                        continue
+                    alias = str(r.get("InterfaceAlias", "") or "").replace("'", "")
+                    nh = str(r.get("NextHop", "") or "").replace("'", "")
+                    if nh in ("0.0.0.0", "::"):
+                        nh = ""
+                    out.append((dp, alias, nh))
+                return out
+
+            rows = _rows()
+            if not rows:
+                return 0, 0
+            self._batch_delete_routes(rows)
+            return len(rows), len(_rows())
         except Exception as e:
             self._blog(f"[!] Could not pre-clean old geo routes: {e}")
-            return 0
+            return 0, 0
 
     def _exit_route_sweep(self):
         """Run all last-resort sweeps idempotently; never raises."""
@@ -8856,6 +9143,7 @@ class BTopTui:
         """[T] teardown on a worker thread (see the key handler). Runs the
         same stop() the internal callers use, but never touches the UI thread,
         so the dashboard keeps redrawing while routes are swept."""
+        restarted = False
         try:
             self.stop()
         except Exception as e:
@@ -8869,12 +9157,19 @@ class BTopTui:
                 self._start_after_stop = False
                 if self.proc is None or self.proc.poll() is not None:
                     self._blog("[*] Queued start: launching the tunnel...")
+                    restarted = True
                     try:
                         self._managed_start()
                     except Exception as e:
+                        restarted = False
                         self._blog(f"[!] Queued start failed: "
                                    f"{e.__class__.__name__}: {e}")
-        if not getattr(self, "_start_after_stop", False):
+        # Only claim the tunnel is down when it actually is. The flag is
+        # cleared in the block above, so the old trailing check always
+        # evaluated False... and then printed "Tunnel stopped" a moment
+        # AFTER launching the new helper - announcing a teardown of the
+        # tunnel that was starting, in the wrong order, on screen.
+        if not restarted:
             self._blog("[+] Tunnel stopped - traffic now leaves via the "
                        "physical NIC until you press [S] again.")
 

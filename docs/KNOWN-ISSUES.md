@@ -9,9 +9,20 @@ Statuses: **OPEN** (affects users) / **COSMETIC** (no functional impact) /
 | 2 | blocker | FIXED | helper | `tunnel/helper.py:1487` called `_clean_err()` which was never defined in the helper process — geo route-batch failures crashed instead of reporting. | — |
 | 3 | blocker | FIXED | profiles | `config/profiles.py:apply_to_args()` referenced undefined `_host_from_url` — loading a saved profile with bypass entries crashed. | — |
 | 4 | blocker | FIXED | helper | GeoIP parse helpers `_read_varint`/`_read_bytes` were missing from the extracted `geo/geoip.py`. | — |
-| 5 | cosmetic | OPEN | dashboard | Several unused imports/locals remain from the verbatim refactor (pyflakes clean except these). Intentionally left to keep the refactor diff minimal. | none needed |
+| 5 | cosmetic | FIXED | dashboard | Several unused imports/locals remained from the verbatim refactor. Cleaned in 1.0.41; the re-exported surfaces the dashboard and helper deliberately re-bind (`tuntop.routing`'s shared helpers, `VPN_IFACE_RE`, `NRPT_PS_ROOT`) are now `noqa: F401`-marked with the reason, so a sweep cannot silently delete them again. | none needed |
 | 6 | cosmetic | OPEN | compat | Tier facade modules (`tunnel/socks.py`, `network/vpn.py`, `monitor/leak.py`, `ui/widgets.py`, …) re-export via `import *` from the engine modules. Intentional compat layer; makes pyflakes unable to analyze them. | none needed |
-| 7 | minor | OPEN | helper | `global vpn_override_routes` / `global vpn_saved_routes` declared but never assigned in that scope (dead declarations at helper.py:1133-area). | none needed |
+| 7 | minor | FIXED | helper | `global vpn_override_routes` / `global vpn_saved_routes` declared but never assigned in that scope (dead declarations at helper.py:1133-area). Removed in 1.0.41. | none needed |
+| 8 | blocker | FIXED | geo/security | `geo/geoip.py` cached the decoded CIDR set as a **pickle** in a user-writable directory, read by the **elevated** helper under a predictable name — arbitrary code execution. Now JSON, shape-validated. A CIDR decoding to `/0` is also rejected (it was a default route). 1.0.41. | — |
+| 9 | blocker | FIXED | security | `network/procguard.py` matched the bare vendored `tun2socks-windows-amd64-v3.exe` name, which is the **upstream xjasonlyu release asset name** — every teardown/recovery/watchdog sweep could `taskkill /F /T` another application's proxy. The name is now only honoured from a TunTop-controlled directory. 1.0.41. | — |
+| 10 | blocker | FIXED | watchdog | `cleanup_watchdog.wait_for_exit` read `ctypes.GetLastError()` from a `ctypes.windll` handle that does not set `use_last_error` (and truncated a 64-bit `HANDLE` to `int`), so it could declare a **live** dashboard dead and tear down its tunnel. Fixed, and the dashboard wait is now bounded. 1.0.41. | — |
+| 11 | blocker | FIXED | core | Launching TunTop twice: the second instance read the first's crash marker, concluded "crash", and killed its tun2socks / removed its adapter / swept its routes. `marker_is_live()` now gates on the recorded PID; the watchdog re-checks before its first destructive step. 1.0.41. | — |
+| 12 | blocker | FIXED | helper | DoH was re-registered against the Wintun adapter's **own** address on a re-add, pointing the whole resolver list at itself (nothing resolved). 1.0.41. | — |
+| 13 | blocker | FIXED | routing | Geo CIDRs were compared as **strings**, and `parse_geoip` renders IPv6 uncompressed while `Get-NetRoute` returns the compressed form — every IPv6 geo route survived every sweep, keeping the bypass armed against a dead tunnel. Now compared as `ip_network`. 1.0.41. | — |
+| 14 | blocker | FIXED | routing | The LAN sweep accepted "a real next-hop that is not the current gateway" as its own, so it deleted corporate static routes / VPN split tunnels it never created. Now gateway-exact. 1.0.41. | — |
+| 15 | major | FIXED | routing | The crashed-helper host-route sweep emitted an **unscoped** `Remove-NetRoute -DestinationPrefix`, which deletes the prefix on every interface (including a VPN client's pinned `/32`). Now scoped to the tunnel adapters. 1.0.41. | — |
+| 16 | major | FIXED | recovery | A `BaseException` from a recovery rung left `_in_attempt = True` forever, silently killing auto-recovery; and a 1-second "verified success" reset the crash-loop counter, so a helper that kept dying produced an infinite restart loop with no backoff. 1.0.41. | — |
+| 17 | major | FIXED | dashboard | Two DNS health rows were permanently red (one CRITICAL, so the badge read UNHEALTHY) because they probed the *display default* resolver for a family the user never configured. Every DNS row is now gated on the configured resolvers. 1.0.41. | — |
+| 18 | major | FIXED | dashboard | Crash logs and the `[D]` diagnostics export were written into the onefile `_MEIPASS` extraction dir, which is deleted on exit — from the standalone exe, every crash report and diagnostics file was silently lost. Both now write next to `TunTop.exe`. 1.0.41. | — |
 
 ## Edge cases to watch (from the Phase 0 environment matrix)
 
@@ -47,3 +58,22 @@ update the matrix row instead of opening a duplicate issue.
   recover with backoff.
 - **Laptop with metered Wi-Fi**: geo `.dat` download (~10 MB) honors HTTP(S)
   proxies but has no "ask before downloading" prompt yet.
+- **Non-ASCII interface names (1.0.41)**: PowerShell 5.1 writes host output in
+  the console code page, which under `CREATE_NO_WINDOW` is the system OEM page
+  (cp936, cp1251, …) and is **not** fixed by the launchers' `chcp 65001` when
+  started from Task Scheduler or a double-click. Every probe used to decode that
+  as UTF-8, so an adapter named `WLAN 无线` came back as `WLAN ` and the egress
+  lookup returned a name `netsh` could not match — the bypass silently never
+  installed. All probes now set `[Console]::OutputEncoding = UTF8` themselves.
+  If you still see a mojibake alias in the `[2]` panel, it is a console
+  rendering issue, not a routing one.
+- **Hard kill (Task Manager / power loss)**: the detached watchdog repairs the
+  routing table, the geo routes and the DNS guard on the next launch. Since
+  1.0.41 it also refuses to run while a dashboard is still alive, and it
+  re-reads the session marker immediately before its first destructive step so
+  a relaunch inside the grace period is not torn down.
+- **Run from source AND from the exe**: the two use different persistent
+  directories (the package dir vs. the exe dir) for the control file, profile
+  store, geoip default, crash log and diagnostics. A `[N]` DNS change made
+  while running from source is not seen by an exe-launched helper (and vice
+  versa) — they are separate installs, deliberately.

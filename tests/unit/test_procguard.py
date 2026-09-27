@@ -9,8 +9,10 @@ cleanup/watchdog could terminate a foreign tun2socks.exe it never started.
 
 tuntop.network.procguard replaces all of those with identity checks:
 recorded PIDs, the exact configured --tun2socks path, or the distinctive
-vendored binary name. These tests pin the filter's decisions - including
-that a generic tun2socks.exe from another tool is NEVER selected.
+vendored binary name FROM a directory TunTop put it in. These tests pin the
+filter's decisions - including that a generic tun2socks.exe from another
+tool, and an upstream-named tun2socks-windows-amd64-v3.exe installed
+elsewhere, are NEVER selected.
 
 Run:  python -m unittest discover -s tests -t . -v
 """
@@ -48,6 +50,27 @@ class TestSelectOwn(unittest.TestCase):
         got = procguard.select_own(rows, tun2socks_path=None)
         self.assertEqual([r["pid"] for r in got], [12])
 
+    def test_vendored_name_outside_a_tuntop_dir_is_NOT_owned(self):
+        # The vendored name is the UPSTREAM xjasonlyu/tun2socks v2.7.0
+        # release asset name, so a user who installed tun2socks from its own
+        # release (or a tool vendoring the same build) has a process with
+        # this exact basename. Matching the name anywhere made every TunTop
+        # teardown / startup recovery / watchdog sweep taskkill that
+        # foreign proxy. The name only counts from a TunTop-controlled dir.
+        rows = [row(14, exe="C:\\Users\\x\\Downloads\\"
+                          "tun2socks-windows-amd64-v3.exe")]
+        self.assertEqual(procguard.select_own(rows, tun2socks_path=None), [])
+
+    def test_vendored_name_next_to_the_package_is_owned(self):
+        # A source checkout: the binary sits next to tuntop/network/.
+        import os
+        import tuntop.network as _pkg
+        rows = [row(15, exe=os.path.join(
+            os.path.dirname(os.path.dirname(_pkg.__file__)),
+            "tun2socks-windows-amd64-v3.exe"))]
+        self.assertEqual([r["pid"] for r in procguard.select_own(
+            rows, tun2socks_path=None)], [15])
+
     def test_generic_foreign_tun2socks_is_never_owned(self):
         # THE regression: another tool's plain tun2socks.exe. Not recorded,
         # not our path, not the vendored name -> must stay alive.
@@ -75,14 +98,25 @@ class TestSelectOwn(unittest.TestCase):
 
 class TestCountAndKill(unittest.TestCase):
     def test_count_own_uses_filter(self):
-        rows = [row(1, exe="C:\\t\\tun2socks-windows-amd64-v3.exe"),
+        # Our vendored binary sitting in a PyInstaller extraction dir is
+        # ours; the foreign one in D:\foreign is not.
+        rows = [row(1, exe="C:\\Users\\x\\AppData\\Local\\Temp\\_MEI1234\\"
+                          "tun2socks-windows-amd64-v3.exe"),
                 row(2, exe="D:\\foreign\\tun2socks.exe")]
         with mock.patch.object(procguard, "enumerate_tun2socks",
                                return_value=rows):
             self.assertEqual(procguard.count_own(), 1)
 
+    def test_count_ignores_upstream_binary_in_a_download_dir(self):
+        rows = [row(1, exe="C:\\Users\\x\\Downloads\\"
+                          "tun2socks-windows-amd64-v3.exe")]
+        with mock.patch.object(procguard, "enumerate_tun2socks",
+                               return_value=rows):
+            self.assertEqual(procguard.count_own(), 0)
+
     def test_kill_own_targets_only_owned(self):
-        rows = [row(1, exe="C:\\t\\tun2socks-windows-amd64-v3.exe"),
+        rows = [row(1, exe="C:\\Users\\x\\AppData\\Local\\Temp\\_MEI1234\\"
+                          "tun2socks-windows-amd64-v3.exe"),
                 row(2, exe="D:\\foreign\\tun2socks.exe")]
         calls = []
         with mock.patch.object(procguard, "enumerate_tun2socks",
