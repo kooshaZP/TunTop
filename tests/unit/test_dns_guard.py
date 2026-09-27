@@ -590,6 +590,153 @@ class TestForeignResolvers(unittest.TestCase):
         self.assertFalse(G.guard_in_force(runner=boom))
 
 
+class TestInstallRecordOwnership(unittest.TestCase):
+    """The rule's install record names the process that wrote it.
+
+    TunTop owns MACHINE-GLOBAL state, and the catch-all NRPT rule is the most
+    dangerous part of it: a second instance's teardown must not delete the pin
+    the first one is still relying on, or the machine silently goes back to
+    leaking while every TunTop health row stays green.
+    """
+
+    def _path(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(_rmtree, d)
+        return os.path.join(d, ".tuntop_dns_guard.json")
+
+    def test_record_names_this_process(self):
+        path = self._path()
+        self.assertTrue(G.save_state(["8.8.8.8"], path=path))
+        self.assertEqual(G.load_state(path=path)["owner_pid"], os.getpid())
+
+    def test_explicit_owner_is_honoured(self):
+        path = self._path()
+        G.save_state(["8.8.8.8"], path=path, owner_pid=4242)
+        self.assertEqual(G.load_state(path=path)["owner_pid"], 4242)
+
+    def test_our_own_record_is_never_foreign(self):
+        path = self._path()
+        G.save_state(["8.8.8.8"], path=path)
+        self.assertFalse(G.record_owner_alive(G.load_state(path=path)))
+
+    def test_a_live_foreign_process_owns_the_rule(self):
+        # This process is obviously alive, so it stands in for "another live
+        # instance" without needing a real second TunTop.
+        record = {"owner_pid": os.getpid()}
+        # ...which is US, so it is not foreign. Use a real, unrelated live
+        # process instead: our own parent is a different pid and is running.
+        self.assertFalse(G.record_owner_alive(record))
+        record = {"owner_pid": os.getppid()}
+        if os.getppid() > 0 and G._pid_alive(os.getppid()):
+            self.assertTrue(G.record_owner_alive(record))
+        else:
+            self.skipTest("parent process not inspectable")
+
+    def test_a_dead_owner_does_not_own_it(self):
+        # A pid that cannot be running: the record is a crash leftover.
+        self.assertFalse(G.record_owner_alive({"owner_pid": 999999999}))
+        self.assertFalse(G.record_owner_alive({"owner_pid": 0}))
+        self.assertFalse(G.record_owner_alive({"owner_pid": -1}))
+        self.assertFalse(G.record_owner_alive({"owner_pid": "nonsense"}))
+
+    def test_a_record_without_ownership_never_blocks(self):
+        """A record written before ownership was tracked must not strand a
+        catch-all pin nobody can now remove."""
+        self.assertFalse(G.record_owner_alive({"resolvers": ["8.8.8.8"]}))
+        self.assertFalse(G.record_owner_alive(None))
+        self.assertFalse(G.record_owner_alive("not a record"))
+
+    def test_ensure_removed_leaves_a_live_owners_rule_alone(self):
+        path = self._path()
+        ppid = os.getppid()
+        if not (ppid > 0 and G._pid_alive(ppid)):
+            self.skipTest("parent process not inspectable")
+        G.save_state(["8.8.8.8"], path=path, owner_pid=ppid)
+        calls = []
+        ok, msg = G.ensure_removed(
+            runner=_runner("DNS_GUARD_REMOVED", calls=calls), path=path)
+        self.assertTrue(ok)
+        self.assertIn("still running", msg)
+        # Nothing was shelled at all - the registry was never touched.
+        self.assertEqual(calls, [])
+        # ...and the record survives for its owner to clean up.
+        self.assertIsNotNone(G.load_state(path=path))
+
+    def test_force_removes_a_live_owners_rule(self):
+        """The recovery owners (startup recovery, the watchdog) must still be
+        able to clear a leftover - that is the whole point of the record."""
+        path = self._path()
+        ppid = os.getppid()
+        if not (ppid > 0 and G._pid_alive(ppid)):
+            self.skipTest("parent process not inspectable")
+        G.save_state(["8.8.8.8"], path=path, owner_pid=ppid)
+        calls = []
+        ok, _msg = G.ensure_removed(
+            runner=_runner("DNS_GUARD_REMOVED", calls=calls), path=path,
+            force=True)
+        self.assertTrue(ok)
+        self.assertIn("Remove-Item", calls[-1])
+        self.assertIsNone(G.load_state(path=path))
+
+    def test_recovery_owner_forces_removal(self):
+        """startup_recovery.remove_dns_guard is the crash-cleanup path."""
+        from tuntop.core import startup_recovery
+        with mock.patch("tuntop.network.dns_guard.ensure_removed",
+                        return_value=(True, "removed")) as m:
+            self.assertTrue(
+                startup_recovery.default_probes().remove_dns_guard())
+        self.assertTrue(m.call_args.kwargs.get("force"))
+
+    def test_pid_liveness_never_raises(self):
+        for bad in (None, "", "x", -5, 0, 2 ** 40, True):
+            self.assertIn(G._pid_alive(bad), (True, False))
+
+
+class TestSingleInstance(unittest.TestCase):
+    """TunTop mutates the wintun adapter, the route table and the DNS policy -
+    all machine-wide. Two instances are not two dashboards, they are two
+    writers racing over the same global state, and the DNS guard made the cost
+    concrete: closing one deleted the catch-all pin the other needed."""
+
+    def test_second_instance_is_refused(self):
+        from tuntop.ui import dashboard
+        with mock.patch.object(dashboard, "_acquire_single_instance",
+                               return_value=None) as acq:
+            src = open(dashboard.__file__, encoding="utf-8").read()
+        self.assertIn("_acquire_single_instance()", src)
+        self.assertIn("Another TunTop instance is already running", src)
+        acq.assert_not_called()
+
+    def test_lock_is_claimed_before_anything_mutates_state(self):
+        """Ordering matters: the admin check and the lock must come BEFORE
+        the binary download, the geoip download, the startup recovery and the
+        integrity check, so a refused instance changes nothing at all."""
+        from tuntop.ui import dashboard
+        src = open(dashboard.__file__, encoding="utf-8").read()
+        body = src.split("def main():", 1)[1]
+        lock = body.index("_instance_mutex = _acquire_single_instance()")
+        for later in ("_bootstrap_binaries(", "startup_recover",
+                      "verify_for_launch", "BTopTui(args)"):
+            self.assertLess(lock, body.index(later),
+                            f"the lock must be taken before {later}")
+
+    def test_an_unavailable_lock_never_blocks_the_launch(self):
+        """No ctypes / a locked-down kernel must not make TunTop unusable -
+        refusing to start because the lock could not be TAKEN is worse than
+        the race it prevents."""
+        from tuntop.ui import dashboard
+        with mock.patch.object(dashboard.ctypes, "windll", None):
+            self.assertIsNotNone(dashboard._acquire_single_instance())
+
+    def test_mutex_handle_is_held_for_the_process_lifetime(self):
+        from tuntop.ui import dashboard
+        handle = dashboard._acquire_single_instance()
+        if handle is None or not isinstance(handle, int):
+            self.skipTest("no usable kernel32 mutex in this environment")
+        # A genuine handle value, not the "could not decide" sentinel.
+        self.assertGreater(handle, 0)
+
+
 class TestHelperIntegration(unittest.TestCase):
     """The helper side: what the tunnel bring-up / live-DNS path actually
     calls, and that a disabled guard removes instead of installing.

@@ -241,6 +241,50 @@ class TestPauseAndGiveUp(unittest.TestCase):
         finally:
             eng.shutdown()
 
+    def test_non_crash_loop_kind_never_disables_the_engine(self):
+        """A closed local SOCKS5 port makes the "wait for the proxy" repair
+        fail until the user restarts their proxy client. That is an expected
+        exhaustion, not a crash loop, so it must not feed the streak: three
+        ordinary proxy outages used to disable auto-recovery for the rest of
+        the session."""
+        m = TunnelStateMachine(initial=TunnelState.DEGRADED)
+        lines = []
+        eng = make_engine(m, max_attempts=1, give_up_after=2, log=lines.append)
+        eng.register(FailureKind.PROXY,
+                     [RecoveryAction("wait for the proxy",
+                                     repair=lambda: False)],
+                     crash_loop=False)
+        try:
+            for i in range(5):
+                eng.report_failure(FailureKind.PROXY, f"proxy down {i}")
+                wait_for(lambda i=i: eng.stats()["give_ups"] == i + 1,
+                         what=f"proxy incident {i + 1} give-up")
+                time.sleep(0.05)
+                self.assertFalse(eng.gave_up,
+                                 f"engine disabled itself after proxy "
+                                 f"outage {i + 1}")
+            # The incident is closed after each give-up, so a fresh outage is
+            # still accepted - recovery never goes deaf.
+            self.assertEqual(eng.stats()["give_ups"], 5)
+            self.assertTrue(any("not a crash loop" in ln for ln in lines),
+                            "expected an explicit log line")
+        finally:
+            eng.shutdown()
+
+    def test_crash_loop_kind_still_counts_by_default(self):
+        m = TunnelStateMachine(initial=TunnelState.DEGRADED)
+        eng = make_engine(m, max_attempts=1, give_up_after=2)
+        eng.register(FailureKind.PROCESS, [RecoveryAction(
+            "restart", repair=lambda: False)])
+        try:
+            eng.report_failure(FailureKind.PROCESS, "crash 1")
+            wait_for(lambda: eng.stats()["give_ups"] == 1,
+                     what="first failed incident")
+            eng.report_failure(FailureKind.PROCESS, "crash 2")
+            wait_for(lambda: eng.gave_up, what="engine gave up")
+        finally:
+            eng.shutdown()
+
 
 class TestValidation(unittest.TestCase):
     def test_unregistered_kind_is_ignored_with_log(self):

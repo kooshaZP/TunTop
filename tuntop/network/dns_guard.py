@@ -354,7 +354,8 @@ def parse_detect(out) -> dict:
 
 # ── Install record (crash safety) ───────────────────────────────────────────
 
-def save_state(resolvers, exempt=(), path: Optional[str] = None) -> bool:
+def save_state(resolvers, exempt=(), path: Optional[str] = None,
+               owner_pid: Optional[int] = None) -> bool:
     """Record what was installed, so ANY later process can remove it."""
     target = path or state_path()
     payload = {
@@ -364,6 +365,7 @@ def save_state(resolvers, exempt=(), path: Optional[str] = None) -> bool:
         "exempt": [str(n) for n in (exempt or [])],
         "keys": [MATCH_KEY] + ([EXEMPT_LOCAL_KEY] if exempt else []),
         "since": time.time(),
+        "owner_pid": int(owner_pid if owner_pid is not None else os.getpid()),
     }
     try:
         # ATOMIC. open(target, "w") truncates to zero before the first write
@@ -513,12 +515,76 @@ def detect(runner: Optional[Callable] = None) -> tuple:
     return bool(ok), state
 
 
+def _pid_alive(pid: int) -> bool:
+    """True when `pid` is a RUNNING process. Unknown-means-dead on purpose:
+    a false "dead" only means the rule gets removed (what every recovery path
+    wants), while a false "alive" would strand a catch-all pin on a machine
+    that no longer has a tunnel."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            # ERROR_ACCESS_DENIED (5) means the process EXISTS but belongs to
+            # another user/elevation level - treat it as alive; anything else
+            # is "not running".
+            return k32.GetLastError() == 5
+        try:
+            code = ctypes.c_ulong(0)
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def record_owner_alive(record: Optional[dict]) -> bool:
+    """True when the install record names a live process that is NOT us.
+
+    That is the multi-instance hazard: a second TunTop's teardown must not
+    delete the catch-all pin the first one is still relying on, or the machine
+    silently goes back to leaking (with every health row still green)."""
+    if not isinstance(record, dict):
+        return False
+    pid = record.get("owner_pid")
+    if pid is None:
+        return False            # a record from before ownership was tracked
+    try:
+        if int(pid) == os.getpid():
+            return False
+    except (TypeError, ValueError):
+        return False
+    return _pid_alive(pid)
+
+
 def ensure_removed(runner: Optional[Callable] = None,
-                   path: Optional[str] = None) -> tuple:
+                   path: Optional[str] = None,
+                   force: bool = False) -> tuple:
     """Remove the guard only when there is something to remove (a record or a
     live rule), so a run with the guard disabled does not shell out for
-    nothing."""
-    if load_state(path=path) is None:
+    nothing.
+
+    `force` is for the recovery owners (startup recovery, the cleanup
+    watchdog): they run when no live instance should own the rule, and must be
+    able to clear a leftover from a crash. Without `force` a rule recorded by
+    another RUNNING process is left alone - see record_owner_alive()."""
+    record = load_state(path=path)
+    if not force and record_owner_alive(record):
+        return True, (f"left in place: owned by TunTop pid "
+                      f"{record.get('owner_pid')}, which is still running")
+    if record is None:
         ok, state = detect(runner=runner)
         if ok and not state.get("keys"):
             return True, "not installed"

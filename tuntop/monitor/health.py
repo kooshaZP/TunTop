@@ -21,6 +21,18 @@ _FIX_SUGGESTIONS: dict[str, str] = {
         "Ensure your proxy client's SOCKS5 inbound is enabled on the "
         "expected port. Press [P] to change the port."
     ),
+    "proxy socks5 is not listening": (
+        "The local SOCKS5 port is closed, so the TUN has no upstream and "
+        "nothing can pass through it. The tunnel, its adapter and its routes "
+        "are all fine and need no restart - just start your proxy client (or "
+        "un-pause it); the tunnel re-verifies itself within seconds."
+    ),
+    "proxy endpoint": (
+        "The proxy's own connection to its server is being captured by the "
+        "TUN, so it cannot reach it and every connection dies with it. "
+        "Another VPN/TUN client is probably owning that address: disconnect "
+        "it, or press [T] then [S] after it is gone."
+    ),
     "dns": (
         "DNS resolution failed. Press [N] to switch DNS servers, or check "
         "your network connection."
@@ -76,6 +88,11 @@ _SEVERITY: dict[str, str] = {
     "wintun adapter":        CRITICAL,
     "wintun ipv4":           CRITICAL,
     "v2rayn socks":          CRITICAL,
+    # A closed upstream port or a transport that loops back into the TUN
+    # means NOTHING can pass: the tunnel is installed and looks perfect,
+    # which is exactly when a user believes it is working. CRITICAL.
+    "proxy socks5":          CRITICAL,
+    "proxy endpoint":        CRITICAL,
     "tunnel leak":           CRITICAL,
     "vless server route":    CRITICAL,
     "proxy loop":            CRITICAL,

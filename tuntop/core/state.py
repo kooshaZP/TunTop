@@ -26,6 +26,9 @@ This module models the tunnel as an explicit, thread-safe state machine
     anything -> STOPPING -> STOPPED      (clean teardown)
     anything -> FAILED -> STARTING       (retry) | STOPPING | STOPPED
 
+  Irrecoverable-while-up (every health state may fail outright):
+    RUNNING / DEGRADED / RECOVERING -> FAILED
+
 Design rules:
 
 * Forward movement along the START SEQUENCE may skip phases (the dashboard
@@ -34,8 +37,14 @@ Design rules:
 * Leaving the start sequence sideways is only possible via FAILED or
   STOPPING - there is no legal path from INSTALLING_ROUTES back to
   RESOLVING, for example. Restarting means going through STOPPING/STOPPED.
+* Only VERIFYING may enter the operational states: a tunnel that was
+  never probed must never be reported as RUNNING/DEGRADED. Symmetrically,
+  RUNNING is not a safe harbour - an adapter that vanishes under a live
+  tunnel is FAILED, not RUNNING.
 * Every transition is recorded (bounded history) and announced to
   observers, so the UI/log/diagnostics all consume one event stream.
+  Refused transitions are COUNTED and the latest one kept: a dropped
+  request (wrong target, wrong source state) must never be invisible.
 
 Pure stdlib, zero pip dependencies, no Windows-specific calls - fully
 unit-testable on any OS (see tests/test_state.py).
@@ -85,9 +94,25 @@ class TunnelState(enum.Enum):
         """A start/stop phase is in flight (not a resting state)."""
         return self not in _OPERATIONAL and self not in _TERMINAL
 
+    @property
+    def is_start_sequence(self) -> bool:
+        """One of the ordered start phases (see _START_SEQ)."""
+        return self in _START_SEQ
+
+    @property
+    def is_health(self) -> bool:
+        """Part of the self-heal cycle (RUNNING / DEGRADED / RECOVERING).
+
+        These are the states where "the tunnel is supposed to be carrying
+        traffic" - so a failure reported while in one of them is a real
+        outage, while the same failure during a start phase is only a
+        phase that has not finished yet."""
+        return self in _HEALTH
+
 
 _OPERATIONAL = frozenset({TunnelState.RUNNING, TunnelState.DEGRADED})
 _TERMINAL = frozenset({TunnelState.STOPPED, TunnelState.FAILED})
+_HEALTH = _OPERATIONAL | {TunnelState.RECOVERING}
 
 # The ordered start sequence. Forward movement may skip phases (a phase the
 # dashboard never observes simply doesn't get a transition); backward movement
@@ -120,6 +145,13 @@ def _build_transitions() -> dict:
         TunnelState.DEGRADED,      # a health probe failed
         TunnelState.RECOVERING,    # self-heal kicked in directly
         TunnelState.STOPPING,
+        # Irrecoverable while nominally up. The helper's self-heal reports
+        # exactly this ("Wintun adapter is gone") and the dashboard answers
+        # with try_transition(FAILED) - but FAILED was NOT in RUNNING's edge
+        # set, so the transition was silently dropped and the UI kept
+        # reporting RUNNING for a tunnel with no adapter left. DEGRADED and
+        # RECOVERING already had this edge; RUNNING was the odd one out.
+        TunnelState.FAILED,
     }
     graph[TunnelState.DEGRADED] = {
         TunnelState.RUNNING,       # probe healthy again
@@ -209,6 +241,17 @@ class TunnelStateMachine:
         self._history = collections.deque(maxlen=history_size)
         self._observers: list = []
         self._obs_lock = threading.Lock()
+        # Rejection bookkeeping. try_transition() is the normal call for
+        # racing threads and it swallows TransitionError by design, which
+        # means a typo'd or graph-illegal target is indistinguishable from
+        # "another thread won the race" - the exact reason the dashboard's
+        # FAILED-on-adapter-loss transition went missing for so long. Every
+        # rejected attempt is counted and the most recent one is kept, so the
+        # diagnostics export can show "we asked for FAILED 3 times and were
+        # refused" instead of silence.
+        self._rejected = 0
+        self._last_rejection: Optional[tuple] = None
+        self._reject_observers: list = []
 
     # -- Reading state ----------------------------------------------------
 
@@ -281,6 +324,7 @@ class TunnelStateMachine:
         with self._lock:
             source = self._current
             if source is target and not force:
+                self._reject(source, target, "already in that state")
                 raise TransitionError(source, target, "already in that state")
             if source is target and force:
                 # A forced no-op move still records the reason (that is the
@@ -291,6 +335,7 @@ class TunnelStateMachine:
                 self._last_reason = reason or self._last_reason
                 return None
             if not force and target not in TRANSITIONS[source]:
+                self._reject(source, target, "transition not allowed")
                 raise TransitionError(source, target)
             event = StateTransition(source=source, target=target,
                                     reason=reason, timestamp=time.time())
@@ -315,6 +360,32 @@ class TunnelStateMachine:
             return self.transition(target, reason)
         except (TransitionError, TypeError):
             return None
+
+    def _reject(self, source: TunnelState, target: TunnelState,
+                why: str) -> None:
+        """Record a refused transition. Called with the machine lock held."""
+        self._rejected += 1
+        self._last_rejection = (source, target, why, time.time())
+
+    @property
+    def rejected(self) -> int:
+        """How many transitions have been refused since construction.
+
+        Expected, non-zero on hot paths: a racing thread that lost, or a
+        repeated announcement for a state already reached. A count that
+        climbs while the tunnel looks fine usually means a caller is asking
+        for a target the graph does not allow from the current state - see
+        `last_rejection`."""
+        with self._lock:
+            return self._rejected
+
+    @property
+    def last_rejection(self) -> Optional[tuple]:
+        """(source, target, why, timestamp) of the most recent refusal, or
+        None. Surfaced in the diagnostics export so a dropped transition is
+        diagnosable after the fact instead of invisible forever."""
+        with self._lock:
+            return self._last_rejection
 
     def reset(self, reason: str = "reset") -> Optional[StateTransition]:
         """Force back to STOPPED (diagnostics/safety hatch; announced).
@@ -358,11 +429,19 @@ class TunnelStateMachine:
     def snapshot(self) -> dict:
         """Plain-dict summary for the diagnostics export / bug reports."""
         with self._lock:
+            rej = self._last_rejection
             return {
                 "state": self._current.value,
                 "reason": self._last_reason,
                 "since": self._entered_at,
                 "time_in_state_s": round(self.time_in_state(), 3),
+                "rejected": self._rejected,
+                "last_rejection": None if rej is None else {
+                    "from": rej[0].value,
+                    "to": rej[1].value,
+                    "why": rej[2],
+                    "ts": rej[3],
+                },
                 "history": [
                     {"from": e.source.value, "to": e.target.value,
                      "reason": e.reason, "ts": e.timestamp}

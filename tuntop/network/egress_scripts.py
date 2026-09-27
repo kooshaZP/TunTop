@@ -197,10 +197,31 @@ $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorActio
 if ($null -eq $r) {
     # Full-tunnel VPN likely removed the physical default route.  Recover the
     # physical NIC's configured gateway (survives the route being deleted).
+    #
+    # CRITICAL (dual-stack): Win32_NetworkAdapterConfiguration.DefaultIPGateway
+    # is a STRING ARRAY holding the adapter's IPv4 *and* IPv6 gateways together.
+    # The old filter only rejected '0.0.0.0' and '::', so on a dual-stack NIC the
+    # first surviving element could be the IPv6 gateway - and this script's
+    # whole job is to answer for IPv4. A result like
+    #     NextHop = fe80::e43e:d3ff:fe7f:e3d, InterfaceAlias = Wi-Fi
+    # then poisoned everything downstream: the gateway-change monitor read it as
+    # a real new egress and re-pointed EVERY IPv4 route we own (LAN bypasses,
+    # endpoint /32s, geo) at an IPv6 next hop, so every add failed with
+    # "Invalid nexthop parameter ... should be a valid IPv4 address" and the
+    # tracked egress (_live_mode['phys']) was committed in that broken state -
+    # leaving the proxy endpoint bypass uninstallable and unrecoverable until
+    # the next genuine gateway change. That is the "the tunnel starts and the
+    # connection and the proxy both die" report.
+    #
+    # Every IPv4 literal contains NO colon; every IPv6 literal (including the
+    # IPv4-mapped forms) contains at least two. '-notmatch :' is therefore an
+    # exact family test here, and it needs no .NET parse.
     $r = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue |
         Where-Object { $_.DefaultIPGateway } |
         ForEach-Object {
-            $gw = @($_.DefaultIPGateway) | Where-Object { $_ -and $_ -ne '0.0.0.0' -and $_ -ne '::' } | Select-Object -First 1
+            $gw = @($_.DefaultIPGateway) | Where-Object {
+                $_ -and $_ -ne '0.0.0.0' -and $_ -notmatch ':'
+            } | Select-Object -First 1
             if ($gw) {
                 $na = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue
                 [PSCustomObject]@{

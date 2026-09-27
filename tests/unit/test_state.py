@@ -68,6 +68,34 @@ class TestTransitionGraph(unittest.TestCase):
         self.assertIn(TunnelState.STOPPING, TRANSITIONS[TunnelState.FAILED])
         self.assertIn(TunnelState.STOPPED, TRANSITIONS[TunnelState.FAILED])
 
+    def test_every_health_state_can_fail_outright(self):
+        # A live tunnel can die irrecoverably - the helper's self-heal reports
+        # exactly that ("Wintun adapter is gone") and the dashboard answers
+        # with try_transition(FAILED). RUNNING was missing this edge, so the
+        # request was silently dropped and the UI kept reporting RUNNING for a
+        # tunnel with no adapter left. DEGRADED/RECOVERING had it all along.
+        for state in (TunnelState.RUNNING, TunnelState.DEGRADED,
+                      TunnelState.RECOVERING):
+            self.assertIn(TunnelState.FAILED, TRANSITIONS[state])
+
+    def test_health_states_are_classified(self):
+        for state in (TunnelState.RUNNING, TunnelState.DEGRADED,
+                      TunnelState.RECOVERING):
+            self.assertTrue(state.is_health)
+        for state in (TunnelState.STOPPED, TunnelState.FAILED,
+                      TunnelState.VERIFYING, TunnelState.STOPPING):
+            self.assertFalse(state.is_health)
+
+    def test_start_sequence_membership(self):
+        for phase in (TunnelState.STARTING, TunnelState.RESOLVING,
+                      TunnelState.STARTING_TUN,
+                      TunnelState.STARTING_TUN2SOCKS,
+                      TunnelState.INSTALLING_ROUTES, TunnelState.VERIFYING):
+            self.assertTrue(phase.is_start_sequence, phase)
+        for state in (TunnelState.STOPPED, TunnelState.FAILED,
+                      TunnelState.RUNNING, TunnelState.STOPPING):
+            self.assertFalse(state.is_start_sequence, state)
+
 
 class TestStateCategories(unittest.TestCase):
     def test_categories(self):
@@ -119,6 +147,52 @@ class TestStateMachineBasics(unittest.TestCase):
         self.assertIs(cm.exception.source, TunnelState.STOPPED)
         self.assertIs(cm.exception.target, TunnelState.RUNNING)
         self.assertIs(m.current, TunnelState.STOPPED)
+
+    def test_running_can_fail_outright(self):
+        # The adapter-gone path: RUNNING -> FAILED must be reachable, or the
+        # dashboard's FAILED request is a silent no-op.
+        m = TunnelStateMachine(initial=TunnelState.RUNNING)
+        event = m.try_transition(TunnelState.FAILED,
+                                 "self-heal: Wintun adapter is gone")
+        self.assertIsNotNone(event)
+        self.assertIs(m.current, TunnelState.FAILED)
+        self.assertEqual(m.rejected, 0)
+
+    def test_rejected_transitions_are_counted_and_explained(self):
+        # try_transition swallows the error by design (racing threads must not
+        # raise), which used to make a wrong request indistinguishable from
+        # losing a race - the reason a dropped FAILED went unnoticed.
+        m = TunnelStateMachine()
+        self.assertIsNone(m.try_transition(TunnelState.RUNNING))
+        self.assertEqual(m.rejected, 1)
+        source, target, why, ts = m.last_rejection
+        self.assertIs(source, TunnelState.STOPPED)
+        self.assertIs(target, TunnelState.RUNNING)
+        self.assertIn("not allowed", why)
+        self.assertGreater(ts, 0)
+        # Repeated identical heartbeats ("tunnel OK" while already RUNNING)
+        # are counted too, and are distinguishable by their reason: RUNNING
+        # from STARTING has no edge at all, while RUNNING from RUNNING is a
+        # duplicate.
+        m.try_transition(TunnelState.STARTING)
+        m.try_transition(TunnelState.RUNNING)          # refused: no edge
+        self.assertIn("not allowed", m.last_rejection[2])
+        m.transition(TunnelState.VERIFYING)
+        m.transition(TunnelState.RUNNING)
+        m.try_transition(TunnelState.RUNNING, reason="monitor probe OK")
+        self.assertEqual(m.rejected, 3)
+        self.assertEqual(m.last_rejection[2], "already in that state")
+        # A forced no-op is NOT a rejection - nothing was refused.
+        before = m.rejected
+        m.transition(TunnelState.RUNNING, reason="reset", force=True)
+        self.assertEqual(m.rejected, before)
+
+    def test_type_errors_are_not_counted_as_rejections(self):
+        # A bad argument is a programming error, not a refused transition.
+        m = TunnelStateMachine()
+        self.assertIsNone(m.try_transition("RUNNING"))
+        self.assertEqual(m.rejected, 0)
+        self.assertIsNone(m.last_rejection)
 
     def test_same_state_transition_raises(self):
         m = TunnelStateMachine()
@@ -304,6 +378,26 @@ class TestDiagnostics(unittest.TestCase):
         self.assertEqual(snap["history"][0]["to"], "STARTING")
         import json
         json.dumps(snap)   # must stay JSON-safe for the diagnostics export
+
+    def test_snapshot_reports_refused_transitions(self):
+        # A dropped request must be visible in the diagnostics export, not
+        # only in a debugger - that is how a silent mis-wiring gets reported.
+        m = TunnelStateMachine()
+        m.try_transition(TunnelState.RUNNING)
+        snap = m.snapshot()
+        self.assertEqual(snap["rejected"], 1)
+        self.assertEqual(snap["last_rejection"]["from"], "STOPPED")
+        self.assertEqual(snap["last_rejection"]["to"], "RUNNING")
+        import json
+        json.dumps(snap)
+
+    def test_clean_run_has_no_rejections(self):
+        m = TunnelStateMachine()
+        walk(m, TunnelState.STARTING, TunnelState.VERIFYING,
+             TunnelState.RUNNING, TunnelState.STOPPING, TunnelState.STOPPED)
+        snap = m.snapshot()
+        self.assertEqual(snap["rejected"], 0)
+        self.assertIsNone(snap["last_rejection"])
 
     def test_repr_mentions_state(self):
         m = TunnelStateMachine()

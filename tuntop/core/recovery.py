@@ -122,15 +122,26 @@ class RecoveryEngine:
     # -- Configuration ----------------------------------------------------
 
     def register(self, kind: FailureKind, actions,
-                 first_delay: Optional[float] = None):
+                 first_delay: Optional[float] = None,
+                 crash_loop: bool = True):
         """Set the action ladder for a failure kind (replaces any previous
-        ladder for that kind). `first_delay` overrides the schedule's first
-        wait - used when an in-process self-heal deserves a chance to work
-        before the engine escalates to a heavier repair."""
+        ladder for that kind).
+
+        `first_delay` overrides the schedule's first wait - used when an
+        in-process self-heal deserves a chance to work before the engine
+        escalates to a heavier repair.
+
+        `crash_loop` says whether exhausting this kind's attempts counts
+        toward the crash-loop guard. Default True. It must be False for a
+        kind whose incidents are EXPECTED to exhaust: a closed local SOCKS5
+        port means the repair ("wait for the proxy") legitimately fails until
+        the user restarts their proxy client, and counting those made
+        crash-loop protection disable recovery after three ordinary proxy
+        outages - the exact opposite of what the guard is for."""
         if not actions:
             raise ValueError("action ladder must not be empty")
         with self._lock:
-            self._ladders[kind] = (tuple(actions), first_delay)
+            self._ladders[kind] = (tuple(actions), first_delay, bool(crash_loop))
 
     def start(self):
         """Start the background worker (idempotent)."""
@@ -296,10 +307,17 @@ class RecoveryEngine:
         self._wakeup.set()
 
     def _first_delay_for(self, kind: FailureKind) -> float:
-        _actions, first_delay = self._ladders[kind]
+        entry = self._ladders[kind]
+        first_delay = entry[1]
         if first_delay is not None:
             return first_delay
         return self.delay_for_attempt(1)
+
+    def _counts_for_crash_loop(self, kind: FailureKind) -> bool:
+        """Whether an exhausted incident of this kind feeds the crash-loop
+        guard (see register's `crash_loop`)."""
+        entry = self._ladders.get(kind)
+        return True if entry is None else entry[2]
 
     @staticmethod
     def _fmt(seconds: float) -> str:
@@ -377,7 +395,8 @@ class RecoveryEngine:
     def _run_attempt_inner(self, incident: _Incident):
         incident.attempt += 1
         with self._lock:
-            actions, _fd = self._ladders.get(incident.kind, ((), None))
+            entry = self._ladders.get(incident.kind)
+            actions = entry[0] if entry else ()
             if not actions:
                 self._in_attempt = False
                 return
@@ -422,7 +441,9 @@ class RecoveryEngine:
                 return
             self._stats["repairs_failed"] += 1
             if incident.attempt >= self._max_attempts:
-                self._consecutive_failed += 1
+                counts = self._counts_for_crash_loop(incident.kind)
+                if counts:
+                    self._consecutive_failed += 1
                 self._stats["give_ups"] += 1
                 self._incident = None
                 why = err or "repair did not verify"
@@ -436,13 +457,18 @@ class RecoveryEngine:
                     self._machine.try_transition(
                         TunnelState.DEGRADED,
                         f"recovery exhausted ({why})")
-                if self._consecutive_failed >= self._give_up_after:
+                if counts and self._consecutive_failed >= self._give_up_after:
                     self._gave_up = True
                     self._log("[!] Recovery DISABLED after "
                               f"{self._consecutive_failed} consecutive "
                               "failed incidents - manual intervention "
                               "required. It re-arms on the next "
                               "successful start.")
+                elif not counts:
+                    self._log("[i] This failure kind is not a crash loop, so "
+                              "the crash-loop counter is untouched: a new "
+                              "incident can be opened immediately. Recovery "
+                              "stays armed.")
                 self._drain_pending()
                 return
             wait = self.delay_for_attempt(incident.attempt + 1) \

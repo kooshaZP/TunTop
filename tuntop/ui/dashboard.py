@@ -103,6 +103,10 @@ from tuntop.state import (            # noqa: E402
 from tuntop.recovery import (         # noqa: E402
     FailureKind, RecoveryAction, RecoveryEngine,
 )
+# The helper's stdout vocabulary: the single place that maps a helper line to
+# a tunnel state and a recovery failure kind. The reader thread applies the
+# verdict; it no longer re-implements (and drifts from) the mapping.
+from tuntop.core.markers import classify as _classify_helper_marker  # noqa: E402
 from tuntop.routes_txn import RouteTransaction   # noqa: E402
 from tuntop.core.tunnel_manager import TunnelManager   # noqa: E402
 from tuntop.network import procguard            # noqa: E402
@@ -2086,10 +2090,37 @@ class BTopTui:
             "restart the tunnel helper", repair=self._recover_restart_tunnel,
             verify=lambda: bool(self.proc and self.proc.poll() is None))],
             first_delay=90)
+        # ── PROXY: the local SOCKS5 inbound is not answering ──────────────
+        # This ladder deliberately does NOT restart the helper. A restart
+        # cannot fix a closed port - start_tun2socks_pipe() exits when the
+        # connect is refused - so the old "restart on proxy failure" ladder
+        # turned a single upstream outage into a restart loop: each restart
+        # killed a perfectly good tunnel (adapter, routes, DNS all fine),
+        # the new helper died on the same refused connect, the PROCESS ladder
+        # opened its own incident, and the user's connection never came back.
+        # The tunnel heals by itself the moment the port answers (tun2socks
+        # dials a fresh upstream per connection), so the only useful action
+        # is to wait for it and let the next passing probe restore RUNNING.
         self.recovery.register(FailureKind.PROXY, [RecoveryAction(
-            "restart the tunnel helper", repair=self._recover_restart_tunnel,
+            "wait for the local SOCKS5 proxy to answer",
+            repair=self._recover_wait_for_proxy,
+            verify=self._local_socks_up)], first_delay=10, crash_loop=False)
+        # ROUTES / ADAPTER: state the helper owns and can rebuild, so a
+        # restart IS the correct repair - but only after the helper's own
+        # 15 s endpoint heal and its 90 s self-heal window have had a go.
+        # These two kinds used to be declared in FailureKind and never
+        # registered, so reporting one of them was answered with "no recovery
+        # action registered - ignored" and the failure was dropped on the
+        # floor: the self-heal "Wintun adapter is gone" line, precisely the
+        # case that needs a rebuild, was one of them.
+        self.recovery.register(FailureKind.ROUTES, [RecoveryAction(
+            "reinstall the TUN routes", repair=self._recover_restart_tunnel,
             verify=lambda: bool(self.proc and self.proc.poll() is None))],
-            first_delay=90)
+            first_delay=30)
+        self.recovery.register(FailureKind.ADAPTER, [RecoveryAction(
+            "recreate the Wintun adapter", repair=self._recover_restart_tunnel,
+            verify=lambda: bool(self.proc and self.proc.poll() is None))],
+            first_delay=5)
         # Opt-out: --no-auto-recover keeps the engine paused forever (the
         # state machine still tracks phases; nothing is auto-repaired).
         if getattr(self.ns, "no_auto_recover", False):
@@ -2563,6 +2594,52 @@ class BTopTui:
         except Exception:
             pass
 
+    def _local_socks_up(self):
+        """Is the local SOCKS5 inbound accepting connections right now?
+
+        The single authoritative liveness check for the proxy: a plain TCP
+        connect to 127.0.0.1:<port> with a short timeout, so a closed port
+        costs milliseconds instead of stalling the recovery worker. Used both
+        to classify a failure and to judge whether a repair worked.
+        """
+        import socket as _socket
+        try:
+            port = int(getattr(self.ns, "port", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if port <= 0:
+            return False
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.settimeout(0.75)
+        try:
+            s.connect(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+
+    def _recover_wait_for_proxy(self):
+        """PROXY ladder rung: wait for the local SOCKS5 port to answer.
+
+        Returns whether the port answered within the wait. The recovery
+        engine re-runs this on its backoff schedule, so a proxy that stays
+        down for hours costs a cheap socket poll every few seconds and never
+        a restart - the tunnel, its adapter and its routes are all still
+        correct and are left completely alone. When the port comes back the
+        helper's own monitor promotes the tunnel to RUNNING within seconds.
+        """
+        for _ in range(20):                 # up to ~10s, then re-arm
+            if self._local_socks_up():
+                self._blog("[+] Recovery: the local SOCKS5 proxy is "
+                           "answering again - the tunnel will re-verify on "
+                           "the helper's next probe.")
+                return True
+            if self._stopping.is_set() or self._shutting_down:
+                return False               # teardown in progress - do not wait
+            time.sleep(0.5)
+        return False
+
     def _recover_restart_tunnel(self):
         """Recovery-engine repair: full stop + start of the tunnel helper -
         the only dashboard-owned repair for a dead or unfixable helper.
@@ -2575,9 +2652,30 @@ class BTopTui:
         if self._shutting_down or self._cleanup_done:
             return False
         with self._restart_lock:
-            if self._bypass_restart_active:
-                return True      # a restart is already in flight
-            self._bypass_restart_active = True
+            already_restarting = self._bypass_restart_active
+            if not already_restarting:
+                self._bypass_restart_active = True
+        if already_restarting:
+            # A restart is already in flight. Returning True here told the
+            # recovery engine "repaired", and its verify then confirmed success
+            # against the OTHER restart's process - so the incident closed
+            # while the tunnel was still being rebuilt, and a genuinely failed
+            # restart was reported as "Recovery verified". Join the in-flight
+            # restart instead: both honest and idempotent.
+            #
+            # The wait MUST happen outside _restart_lock: the running restart
+            # clears _bypass_restart_active in a `finally` that takes the same
+            # lock, so sleeping while holding it would stall the very thread
+            # this is waiting for.
+            self._blog("[i] Recovery: a tunnel restart is already in "
+                       "progress - waiting for it instead of starting a "
+                       "second one.")
+            for _ in range(20):
+                with self._restart_lock:
+                    if not self._bypass_restart_active:
+                        break
+                time.sleep(0.5)
+            return bool(self.proc and self.proc.poll() is None)
         try:
             self._blog("[*] Recovery: restarting the tunnel...")
             try:
@@ -8015,111 +8113,44 @@ class BTopTui:
                         continue
                     # Start-sequence milestones: surface each phase to the
                     # user AND advance the tunnel state machine to match.
-                    if s.strip() == "[+] TUNNEL ACTIVE":
-                        self.tunnel.try_transition(
-                            TunnelState.VERIFYING,
-                            "routes installed - probing real traffic")
-                        self.logs.put("[*] Routes installed - verifying traffic "
-                                      "through the TUN...")
-                        self.logs.put(s)
-                        continue
-                    if "Press Ctrl+C to stop" in s:
-                        # Emitted by the helper only AFTER wait_for_tunnel_stable()
-                        # succeeded - this is the true "ready" moment.
-                        self.tunnel.try_transition(
-                            TunnelState.RUNNING,
-                            "start sequence complete - tunnel stable")
-                        self.logs.put("[+] START SEQUENCE COMPLETE - the TUN is "
-                                      "READY TO USE.")
-                        continue
-                    if s.strip() == "[*] Press Ctrl+C to stop.":
-                        continue   # replaced by the READY announcement above
                     if s.startswith("[*] Loading geoip file bypass"):
                         self.logs.put("[*] Loading geo bypass ranges (this can "
                                       "take a moment)...")
                         continue
-                    # Monitor failures/self-heal: reflect them on the state
-                    # machine immediately, so DEGRADED/RECOVERING show up in
-                    # the UI instead of the dashboard claiming RUNNING while
-                    # the tunnel silently struggles.
-                    if s.startswith("[MONITOR] tunnel check failed"):
-                        self.tunnel.try_transition(
-                            TunnelState.DEGRADED,
-                            s.split(":", 1)[-1].strip() or "monitor probe failed")
-                        # Also tell the recovery engine. It waits 90s (the
-                        # helper's own self-heal window) before escalating;
-                        # a self-heal success (-> RUNNING) closes the
-                        # incident instead.
-                        self.recovery.report_failure(
-                            FailureKind.DNS,
-                            s.split(":", 1)[-1].strip() or "monitor probe failed")
-                    if s.startswith("[*] Self-healing:"):
-                        self.tunnel.try_transition(
-                            TunnelState.RECOVERING,
-                            "self-heal: re-applying wintun config and routes")
-                        self.logs.put(s)
+                    # Everything that carries a state or recovery meaning is
+                    # decided in ONE place - tuntop.core.markers - so the
+                    # helper's line vocabulary, the state machine and the
+                    # recovery ladders can no longer drift apart. The reader
+                    # only applies the verdict.
+                    verdict = _classify_helper_marker(s, self.tunnel.current)
+                    if verdict is not None:
+                        if verdict.target is not None:
+                            self.tunnel.try_transition(
+                                verdict.target, verdict.effective_reason)
+                        if verdict.kind is not None:
+                            # A teardown in flight means every helper-side
+                            # death is EXPECTED, not an incident - the same
+                            # absorption _on_tunnel_state_change applies to
+                            # the stdout-EOF stop, applied here so a forwarder
+                            # death during [Q]/[T] cannot open a fake crash.
+                            if (self._stopping.is_set() or self._shutting_down
+                                    or self._cleanup_done):
+                                pass
+                            else:
+                                self.recovery.report_failure(
+                                    verdict.kind, verdict.detail_for(s))
+                        if verdict.kind is FailureKind.PROCESS:
+                            # Remember WHY the forwarder died so the stdout-EOF
+                            # path below (which fires a moment later, when the
+                            # helper itself exits) reports the real cause
+                            # instead of a bare "helper process exited".
+                            self._helper_exit_reason = verdict.effective_reason
+                        if verdict.log:
+                            if verdict.replace:
+                                self.logs.put(verdict.replace)
+                            if verdict.log_raw or not verdict.replace:
+                                self.logs.put(s)
                         continue
-                    if s.startswith("[+] Self-heal applied."):
-                        self.tunnel.try_transition(
-                            TunnelState.RUNNING, "self-heal applied")
-                        self.logs.put(s)
-                        continue
-                    if s.startswith("[!] Self-heal: Wintun adapter is gone"):
-                        # The tunnel adapter itself disappeared - self-heal
-                        # cannot proceed and the tunnel is dead. Escalate to
-                        # FAILED so the UI goes red, and tell the recovery
-                        # engine (PROCESS ladder: restart the helper which
-                        # re-creates the Wintun adapter).
-                        self.tunnel.try_transition(
-                            TunnelState.FAILED,
-                            "self-heal: Wintun adapter is gone")
-                        self.recovery.report_failure(
-                            FailureKind.PROCESS,
-                            "Wintun adapter is gone; cannot re-apply routes")
-                        self.logs.put(s)
-                        continue
-                    if s.startswith("[!] Self-heal failed:"):
-                        # Self-heal ran but hit an exception - the tunnel is
-                        # still up but not repaired. Drop back to DEGRADED so
-                        # the dashboard does not claim RUNNING; the recovery
-                        # engine already has the incident open from the original
-                        # [MONITOR] tunnel check failed and will escalate on
-                        # its 90s backoff window if this did not fix it.
-                        self.tunnel.try_transition(
-                            TunnelState.DEGRADED,
-                            s.split(":", 1)[-1].strip() or "self-heal failed")
-                        self.logs.put(s)
-                        continue
-                    # The helper's monitor prints "[MONITOR] tunnel OK: ..."
-                    # every 30s forever - pure noise in the log (it says nothing
-                    # new). Drop the success heartbeats; a DEGRADED tunnel that
-                    # probes OK again is silently restored to RUNNING above the
-                    # drop. FAILURES still pass through below, since those
-                    # actually need attention.
-                    if s.startswith("[MONITOR] tunnel OK"):
-                        self.tunnel.try_transition(
-                            TunnelState.RUNNING, "monitor probe OK")
-                        continue
-                    if s.startswith("[MONITOR] leak check OK") and \
-                            self.tunnel.current is TunnelState.DEGRADED:
-                        # The leak probe only runs after the regular probe
-                        # passed, so a passing leak check re-proves that ALL
-                        # egress (direct traffic included) rides the TUN -
-                        # it can safely clear a leak-caused DEGRADED state.
-                        self.tunnel.try_transition(
-                            TunnelState.RUNNING,
-                            "leak check OK - all egress via the tunnel")
-                        # fall through: still log the line (it is printed
-                        # only when the leak verdict CHANGES, never as spam)
-                    if s.startswith("[MONITOR] LEAK DETECTED"):
-                        # Direct egress != tunnel exit: traffic is escaping
-                        # the TUN. Mark DEGRADED so the UI shows it instead
-                        # of a green RUNNING badge, then log the details.
-                        self.tunnel.try_transition(
-                            TunnelState.DEGRADED,
-                            s.split(": ", 1)[-1].strip()
-                            or "traffic leaks outside the TUN")
-                        # fall through: the line itself is logged below
                     if s.startswith("[GATEWAY]"):
                         # The helper re-pointed its routes after a Wi-Fi/LAN
                         # change - dashboard-tracked live routes ([A] adds,
@@ -8148,10 +8179,15 @@ class BTopTui:
                 # happened (see _is_current).
                 if not _is_current(gen):
                     return
-                self.tunnel.try_transition(TunnelState.STOPPING,
-                                           "helper process exited")
-                self.tunnel.try_transition(TunnelState.STOPPED,
-                                           "helper process exited")
+                # The helper usually told us why on its way out (a tun2socks
+                # crash prints a marker the classifier turns into a PROCESS
+                # incident). Reuse that reason so the state history and the
+                # recovery log name the real cause instead of a bare exit.
+                exit_reason = (getattr(self, "_helper_exit_reason", "")
+                               or "helper process exited")
+                self.tunnel.try_transition(TunnelState.STOPPING, exit_reason)
+                self.tunnel.try_transition(TunnelState.STOPPED, exit_reason)
+                self._helper_exit_reason = ""
             threading.Thread(target=_read, daemon=True).start()
             # Watchdog: fires even when the helper produces zero output (hung
             # on a netsh/PowerShell call).  Checks every 5 s; if the helper
@@ -9551,6 +9587,45 @@ def _startup_update_check(args, timeout=_STARTUP_UPDATE_TIMEOUT,
     return th
 
 
+def _acquire_single_instance():
+    """Claim the machine-wide TunTop lock. Returns the mutex handle (keep it
+    alive for the process lifetime) or None when another instance holds it.
+
+    A named mutex in the LOCAL namespace, created by whoever gets there
+    first. `GetLastError() == ERROR_ALREADY_EXISTS` is the "someone else is
+    here" answer; the handle is then closed immediately so it is not kept
+    alive. Any failure (no ctypes, a locked-down kernel, a non-Windows box)
+    returns a sentinel instead of blocking the launch: refusing to start
+    because the lock could not be taken would be worse than the race it
+    prevents.
+    """
+    _UNLOCKED = object()
+    try:
+        k32 = ctypes.windll.kernel32
+    except Exception:
+        return _UNLOCKED
+    # CreateMutexW(NULL, True, name) - TRUE for initial ownership, so a
+    # process that dies still releases it (the handle dies with it).
+    try:
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                     ctypes.c_wchar_p)
+    except Exception:
+        return _UNLOCKED
+    ERROR_ALREADY_EXISTS = 183
+    try:
+        k32.SetLastError(0)
+        handle = k32.CreateMutexW(None, True, "Global\\TunTop-SingleInstance")
+        if not handle:
+            return _UNLOCKED
+        if k32.GetLastError() == ERROR_ALREADY_EXISTS:
+            k32.CloseHandle(ctypes.c_void_p(handle))
+            return None
+        return handle
+    except Exception:
+        return _UNLOCKED
+
+
 def main():
     # ── Frozen child-process dispatch (PyInstaller onefile) ──────────────
     # The tunnel helper and the cleanup watchdog run as SEPARATE processes,
@@ -9744,6 +9819,27 @@ def main():
 
     if not _admin():
             sys.exit("[!] Run this as Administrator (use Run_Helper.bat).")
+
+    # ── Single instance ──────────────────────────────────────────────────
+    # TunTop mutates MACHINE-GLOBAL state: the wintun adapter, thousands of
+    # routes, the wintun/resolver metric, and the catch-all NRPT DNS pin.
+    # A second instance is therefore not "a second dashboard" - it is a second
+    # writer racing the first one over all of it. The DNS guard made that
+    # concrete and expensive: every instance INSTALLS the catch-all rule on
+    # bring-up and REMOVES it on teardown, so closing ONE of several instances
+    # deleted the pin the others were relying on and the machine went back to
+    # leaking (with every TunTop health row still green). Refuse the second
+    # instance instead of letting it fight. The named mutex is released by the
+    # OS when the holder dies, so a hard-killed instance never blocks the next
+    # start - no stale lock file to clean up.
+    _instance_mutex = _acquire_single_instance()
+    if _instance_mutex is None:
+        sys.exit("[!] Another TunTop instance is already running.\n"
+                 "    TunTop owns machine-wide state (adapter, routes, DNS "
+                 "pin); two instances fight over it and the DNS leak guard of "
+                 "one is torn down by the other. Close the running one first "
+                 "(or use Task Manager if it is stuck), then start TunTop "
+                 "again.")
 
     # ── Bootstrap missing binaries (frozen exe) ────────────────────────
     # The exe embeds tun2socks + wintun (v1.0.3+), but a user may have

@@ -237,8 +237,14 @@ class TestCleanupOrder(_HelperStateCase):
         def _rm(item):
             order.append(("host", item))
 
+        # The added_routes / VPN-override removals now go through the BULK
+        # path too (one `netsh -f` process instead of one per route), so the
+        # mock cannot tell the batches apart by function name - classify by
+        # payload, which is what the ordering guarantee is actually about.
         def _bulk(routes):
-            order.append(("geo", list(routes)))
+            rows = list(routes)
+            kind = "geo" if any(r[1] == "5.0.0.0/8" for r in rows) else "bulk"
+            order.append((kind, rows))
 
         H.cleaned = False
         H.tun_proc = None
@@ -270,13 +276,58 @@ class TestCleanupOrder(_HelperStateCase):
                 pass
         kinds = [k for k, _ in order]
         self.assertIn("geo", kinds)
-        self.assertIn("host", kinds)
+        self.assertIn("bulk", kinds)
         # every host-route removal precedes the geo bulk delete
         first_geo = kinds.index("geo")
         self.assertTrue(all(i < first_geo
-                            for i, k in enumerate(kinds) if k == "host"),
+                            for i, k in enumerate(kinds) if k == "bulk"),
                         f"cleanup order was {order}")
         self.assertEqual(list(H.geoip_added), [])
+        self.assertEqual(list(H.added_routes), [])
+
+    def test_teardown_does_not_spawn_one_netsh_per_route(self):
+        """A netsh process per route made 'Stopping tunnel helper' tens of
+        seconds for a session owning ~30 rows. Everything we installed must go
+        through the batched path, in as FEW calls as possible."""
+        H.cleaned = False
+        H.tun_proc = None
+        H.tun2_proc = None
+        H.wintun_saved_metric = None
+        H.vpn_saved_routes[:] = []
+        H.vpn_override_routes[:] = []
+        # A realistic session: 6 TUN default/splits, ~10 LAN bypasses,
+        # the Wintun host routes, 2 VLESS /32s, 1 VPN endpoint /32.
+        rows = [(("v4", "0.0.0.0/0", "wintun", "192.168.123.1"))]
+        rows += [("v4", f"10.{i}.0.0/16", "Wi-Fi", "192.168.1.1")
+                 for i in range(10)]
+        rows += [("v4", "1.2.3.4/32", "Wi-Fi", "192.168.1.1"),
+                 ("v6", "2001:db8::/32", "Wi-Fi", "")]
+        H.added_routes[:] = rows
+        H.geoip_added[:] = []
+        bulk_calls = []
+        per_route = []
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        old_ctrl = H.CONTROL_FILE
+        H.CONTROL_FILE = path
+        try:
+            with mock.patch.object(H, "remove_route",
+                                   side_effect=lambda i: per_route.append(i)), \
+                 mock.patch.object(H, "_remove_routes_bulk",
+                                   side_effect=lambda r: bulk_calls.append(
+                                       list(r))), \
+                 mock.patch.object(H, "_raw_add_route"):
+                H.cleanup()
+        finally:
+            H.CONTROL_FILE = old_ctrl
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self.assertEqual(per_route, [],
+                         "teardown spawned a netsh process per route")
+        self.assertEqual(len(bulk_calls), 1, "expected ONE batched delete")
+        self.assertEqual(len(bulk_calls[0]), len(rows))
         self.assertEqual(list(H.added_routes), [])
 
 

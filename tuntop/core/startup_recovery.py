@@ -316,13 +316,18 @@ def default_probes() -> Probes:
             return False
 
     def remove_dns_guard():
-        """Delete every TunTop-* NRPT rule + the install record."""
+        """Delete every TunTop-* NRPT rule + the install record.
+
+        force=True: this is the RECOVERY owner. It runs at launch, when no
+        live instance should still be relying on the rule - a leftover from a
+        crash is exactly what it exists to clear, and the ownership guard
+        would otherwise keep a dead instance's pin alive on the machine."""
         try:
             from tuntop.network import dns_guard
         except Exception:
             return False
         try:
-            ok, _msg = dns_guard.ensure_removed()
+            ok, _msg = dns_guard.ensure_removed(force=True)
             return bool(ok)
         except Exception:
             return False

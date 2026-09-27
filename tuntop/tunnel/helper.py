@@ -457,7 +457,10 @@ def get_ipv6_default():
     form of an IPv6 default route on most physical adapters (the next-hop is
     resolved via neighbor discovery, so there is no gateway address).  An
     on-link NextHop is normalized to '' so callers (add_v6, the geo installer)
-    treat it as an on-link install with no gateway token.
+    treat it as an on-link install with no gateway token.  add_v6 now ALSO
+    normalizes on the way in, so a caller that passes a raw '::' cannot
+    hand netsh an invalid next hop (the IPv4 half of this - '0.0.0.0' - is
+    _norm_v4_gw/add_v4).
 
     Returns {"InterfaceAlias":..,"NextHop":..} or None.  IPv6 may legitimately
     be absent, so this must NOT sys.exit() the way get_ipv4_default() does.
@@ -535,6 +538,54 @@ def get_egress_for(ip, exclude_vpn=True):
     if exclude_vpn and _es.is_vpn_iface(iface):
         return None
     return iface, (gw or "0.0.0.0")
+
+
+def physical_egress(fallback=None):
+    """The best available PHYSICAL (non-VPN, non-TUN) IPv4 egress, or None.
+
+    `fallback` (normally `_live_mode['phys']`) is a cached value, and a
+    cache is only as good as its validation. get_ipv4_default()'s LAST-RESORT
+    clause deliberately returns "any non-wintun 0.0.0.0/0 route, may be the
+    VPN" - correct when all you need is *some* egress, but poison for a value
+    labelled "physical": every bypass route built from it (VPN endpoint /32s,
+    LAN bypasses, geo) would be pinned ONTO the VPN, i.e. the VPN's own
+    server reached through the VPN - a self-referential route that starves
+    the very transport it is meant to protect.
+
+    So the cached value is validated here, on every use, and anything that is
+    not a physical adapter is rejected. `fallback` is returned only after it
+    passes; None means "caller must handle it".
+    """
+    cand = fallback if fallback else _live_mode.get("phys")
+    if not cand or not cand[0]:
+        return None
+    iface, gw = str(cand[0]), str(cand[1] or "")
+    if _es.is_tun_iface(iface) or _es.is_vpn_iface(iface):
+        return None
+    if _wrong_family_gw(gw, 4):
+        return None
+    return (iface, _norm_v4_gw(gw))
+
+
+def _direct_bypass_egress(ip, fallback=None):
+    """Egress for a route that must NOT ride any tunnel or VPN: the proxy
+    (VLESS) server's own /32, a user-added bypass, or - the case this exists
+    for - a connected Windows VPN's server address.
+
+    Order: the real per-IP egress (respects split-tunnel VPNs) with VPN
+    excluded, then the validated physical egress, then nothing. The result is
+    re-validated, so neither a poisoned cache nor a resolver quirk can
+    produce a self-referential route. Returns None rather than a bad answer:
+    the caller reports it and leaves the route out, which is a visible,
+    recoverable state - much better than silently looping the transport.
+    """
+    eg = get_egress_for(ip, exclude_vpn=True)
+    if eg and eg[0]:
+        iface, gw = str(eg[0]), _norm_v4_gw(eg[1])
+        if (not _es.is_tun_iface(iface) and not _es.is_vpn_iface(iface)
+                and not _wrong_family_gw(gw, 4)):
+            return (iface, gw)
+    return physical_egress(fallback)
 
 
 def get_active_windows_vpn_servers():
@@ -897,9 +948,16 @@ def _read_bytes(buf, pos):
 from tuntop.geo.geoip import parse_geoip  # noqa: E402
 
 
-def test_local_socks(port):
+def test_local_socks(port, timeout=1.5):
+    """Is the LOCAL SOCKS5 inbound answering on 127.0.0.1:port?
+
+    `timeout` is a parameter because this is called from two very different
+    places: the startup gate (a slow, generous connect is fine - we are about
+    to fail the whole run) and the 1 Hz monitor loop (where a blocking connect
+    would stall tunnel health, gateway and endpoint healing alike). The
+    monitor passes a short timeout so a closed port costs milliseconds."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(1.5)
+    s.settimeout(timeout)
     try:
         s.connect(("127.0.0.1", port))
         return True
@@ -1221,7 +1279,18 @@ def _install_dns_guard(verbose=True):
     Never fatal by design: refusing to bring the tunnel up because a registry
     write was blocked would be worse than the leak - the failure is reported
     loudly instead (and the dashboard's DNS-leak-protection row keeps saying
-    so)."""
+    so).
+
+    NOTE: `global _dns_guard_state` is REQUIRED and was missing. The function
+    ASSIGNS that name (the "off"/"none" bookkeeping below), so Python compiled
+    it as a function-local throughout - and the READ in the --no-dns-guard
+    branch therefore raised `UnboundLocalError: cannot access local variable
+    '_dns_guard_state'`. That propagated out of self_heal_tunnel's call to this
+    function, aborting the REST of the self-heal (every Wintun address, the
+    default/split routes, the IPv6 stack and the LAN bypass re-apply), so a
+    cosmetic state-bookkeeping bug silently disabled self-healing entirely and
+    the tunnel escalated to a helper restart instead."""
+    global _dns_guard_state
     if not _ACTIVE_DNS_GUARD:
         # Disabled (--no-dns-guard, or turned off live): make sure a previous
         # run's rule cannot keep hijacking name resolution.
@@ -1333,6 +1402,42 @@ def _route_identity_present(rows, fam, iface, gateway, metric=None):
     return False
 
 
+def _norm_v4_gw(gw):
+    """Canonical form of an IPv4 next hop: on-link ('' ) for '0.0.0.0'/'::'.
+
+    Windows reports an on-link route as NextHop '0.0.0.0' (and '::' for
+    IPv6), but netsh must be given NO next-hop token at all for those - a
+    literal 0.0.0.0 is rejected with "The filename, directory name, or
+    volume label syntax is incorrect". Normalising here makes an existing
+    on-link route compare equal to an on-link install, which is what stops
+    the add/re-add/re-fail loop the 15 s endpoint heal used to be stuck in.
+    """
+    g = str(gw or "").strip()
+    if g in ("0.0.0.0", "::", "0", ""):
+        return ""
+    return g
+
+
+def _wrong_family_gw(gw, family):
+    """True when `gw` is a well-formed address of the WRONG family, or a
+    NextHop string that is plainly not an address of this family at all.
+
+    Defence in depth for the gateway-change monitor: on a dual-stack NIC an
+    IPv6 next hop once reached the IPv4 route installer, and every add failed
+    with netsh's opaque "Invalid nexthop parameter" / "filename ... syntax"
+    text while the tracked egress was committed in that broken state. A cheap
+    local check turns a whole-table failure into one clear refusal.
+
+    family is 4 or 6. An empty gateway is on-link and always allowed.
+    """
+    g = str(gw or "").strip()
+    if not g:
+        return False            # on-link: valid for both families
+    if family == 4:
+        return ":" in g         # any IPv6 literal (incl. mapped forms)
+    return ":" not in g         # any IPv4 literal
+
+
 def add_v4(dest, iface, gateway, metric=1):
     """
     Add an IPv4 route idempotently.
@@ -1354,7 +1459,27 @@ def add_v4(dest, iface, gateway, metric=1):
     Internet until the adapter is reconnected. The wintun default route is
     installed *alongside* the real one (lower metric wins), and the
     split-default /1 routes carry the traffic.
+
+    ON-LINK GATEWAYS (0.0.0.0). A PPP/PPTP Windows VPN reports NextHop
+    '0.0.0.0' - the normal "no gateway, resolve by neighbour discovery"
+    form, exactly like '::' for IPv6. netsh REJECTS a literal 0.0.0.0 next
+    hop ("The filename, directory name, or volume label syntax is
+    incorrect"), so passing it through made every on-VPN route add fail: the
+    VLESS transport pin in --vless-over-vpn mode, and the VPN endpoint bypass
+    /32, both died with it - leaving the proxy server with no bypass at all,
+    so its traffic fell into the TUN and looped (the "tunnel up, proxy down,
+    connection lost" symptom). It also made `r_gw == gateway` compare
+    '0.0.0.0' against '' and never match, so a correctly installed on-link
+    route was re-added and re-failed on every single call - the endless
+    "[HEAL] ... re-install FAILED - retrying next cycle".
+    add_v6 has normalised '::' -> '' and omitted the token since 1.0.30;
+    this is the missing IPv4 half.
     """
+    gateway = _norm_v4_gw(gateway)
+    if _wrong_family_gw(gateway, 4):
+        print(f"[!] IPv4 route failed: {dest} -> refusing a non-IPv4 next hop "
+              f"({gateway!r}); an IPv4 prefix cannot use one.")
+        return False
     existing = get_existing_v4_routes(dest)
     is_default = (dest == "0.0.0.0/0")
 
@@ -1364,9 +1489,9 @@ def add_v4(dest, iface, gateway, metric=1):
     found_correct = False
     for r in existing:
         r_iface = str(r.get("InterfaceAlias", ""))
-        r_gw = str(r.get("NextHop", ""))
+        r_gw = _norm_v4_gw(r.get("NextHop", ""))
         same_iface = r_iface.lower() == iface.lower()
-        same_gateway = r_gw == gateway
+        same_gateway = r_gw == (gateway or "")
 
         if same_iface and same_gateway:
             print(f"    [=] Route already exists and is correct: {dest} -> {iface} ({gateway})")
@@ -1381,7 +1506,11 @@ def add_v4(dest, iface, gateway, metric=1):
         stale_iface = r_iface
         stale_gateway = r_gw
         print(f"    [~] Replacing stale route: {dest} -> {stale_iface} ({stale_gateway})")
-        run(["netsh", "interface", "ipv4", "delete", "route", dest, stale_iface, stale_gateway])
+        del_cmd = ["netsh", "interface", "ipv4", "delete", "route", dest,
+                   stale_iface]
+        if stale_gateway:
+            del_cmd.append(stale_gateway)   # omit the token => on-link
+        run(del_cmd)
 
     if found_correct:
         # The route is already present, but older builds installed it
@@ -1390,12 +1519,17 @@ def add_v4(dest, iface, gateway, metric=1):
         # store=active below.  If this is the machine's real default route it
         # lives on a different interface and was never marked found_correct, so
         # we never touch it here.
-        run(["netsh", "interface", "ipv4", "delete", "route", dest, iface, gateway])
+        del_cmd = ["netsh", "interface", "ipv4", "delete", "route", dest, iface]
+        if gateway:
+            del_cmd.append(gateway)
+        run(del_cmd)
 
-    code, out, err = run([
-        "netsh", "interface", "ipv4", "add", "route",
-        dest, iface, gateway, f"metric={metric}", "store=active"
-    ])
+    cmd = ["netsh", "interface", "ipv4", "add", "route", dest, iface]
+    if gateway:
+        cmd.append(gateway)            # omit the token entirely => on-link
+    cmd.append(f"metric={metric}")
+    cmd.append("store=active")
+    code, out, err = run(cmd)
 
     if code:
         # A race or Windows duplicate-route response may happen between the
@@ -1439,6 +1573,11 @@ if ($null -eq $r) {{ exit 0 }}
 
 
 def add_v6(dest, iface, gateway=None, metric=1):
+    gateway = _norm_v4_gw(gateway)   # '::' / '' => on-link, no token
+    if _wrong_family_gw(gateway, 6):
+        print(f"[!] IPv6 route failed: {dest} -> refusing a non-IPv6 next hop "
+              f"({gateway!r}); an IPv6 prefix cannot use one.")
+        return False
     existing = get_existing_v6_routes(dest)
     is_default = (dest == "::/0")
 
@@ -1448,11 +1587,9 @@ def add_v6(dest, iface, gateway=None, metric=1):
     found_correct = False
     for r in existing:
         r_iface = str(r.get("InterfaceAlias", ""))
-        r_gw = str(r.get("NextHop", "") or "")
+        r_gw = _norm_v4_gw(r.get("NextHop", ""))
         # IPv6 on-link routes report NextHop '::' (unspecified) - normalize
         # to '' so it compares equal to an on-link install (gateway='').
-        if r_gw == "::":
-            r_gw = ""
         same_iface = r_iface.lower() == iface.lower()
         same_gateway = r_gw == (gateway or "")
         if same_iface and same_gateway:
@@ -1509,10 +1646,16 @@ def add_v6(dest, iface, gateway=None, metric=1):
 def remove_route(item):
     fam, dest, iface, gateway = item
     if fam == "v4":
-        run([
-            "netsh", "interface", "ipv4", "delete", "route",
-            dest, iface, gateway
-        ])
+        cmd = ["netsh", "interface", "ipv4", "delete", "route", dest, iface]
+        # Omit the next-hop token for an on-link route. The v4 branch used to
+        # append `gateway` unconditionally, so an entry recorded with the
+        # on-link spelling ('' - what _norm_v4_gw now produces, and what a
+        # PPP VPN's routes get) was deleted with an EMPTY argument, which
+        # netsh rejects - so those routes were never actually removed and
+        # survived every teardown. The v6 branch already did this.
+        if gateway and gateway != "0.0.0.0":
+            cmd.append(gateway)
+        run(cmd)
     else:
         cmd = ["netsh", "interface", "ipv6", "delete", "route", dest, iface]
         if gateway:
@@ -1808,8 +1951,17 @@ def _live_apply_vpn_bypass_routes(enable):
         added = []
         d6 = get_ipv6_default()
         for ip in v4n:
-            eg = get_egress_for(ip, exclude_vpn=True) or _live_mode["phys"]
-            if not eg or eg[0] is None:
+            # A VPN's OWN server address must be pinned to the physical
+            # adapter. `_direct_bypass_egress` enforces that and refuses to
+            # fall back onto the VPN itself - the log line
+            #   'add 185.64.178.62/32 on Shirazu-VPN via 0.0.0.0'
+            # is a bypass route pointing the VPN's server at the VPN, which
+            # is how the VPN transport dies (and takes the tunnel with it).
+            eg = _direct_bypass_egress(ip)
+            if not eg:
+                lines.append(f"[!] No physical egress for VPN endpoint {ip} "
+                             "- not installing its bypass (it must not ride "
+                             "the VPN itself).")
                 continue
             if add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
                 added.append(("v4", f"{ip}/32", eg[0], eg[1]))
@@ -1875,11 +2027,11 @@ def _live_switch_vless(over):
             # leave the transport on Wi-Fi while [V] says "via VPN".
             eg = _live_mode["over"]
         else:
-            eg = get_egress_for(ip, exclude_vpn=True) or _live_mode["phys"]
+            eg = _direct_bypass_egress(ip)
         if not eg or eg[0] is None:
             ok = False
-            lines.append(f"[!] No usable egress for VLESS endpoint {ip} - "
-                         "route left as-is.")
+            lines.append(f"[!] No usable physical egress for VLESS endpoint "
+                         f"{ip} - route left as-is.")
             continue
         # add_v4 replaces a same-prefix route installed via the OLD egress,
         # so the flip is a true re-point, not a silent no-op.
@@ -2000,7 +2152,7 @@ def _live_apply_servers(hosts, endpoints):
             # physical NIC - see _live_switch_vless / the startup install).
             eg = _live_mode.get("over") or get_egress_for(ip, exclude_vpn=False)
         else:
-            eg = get_egress_for(ip, exclude_vpn=True) or _live_mode["phys"]
+            eg = _direct_bypass_egress(ip)
         if not eg or not eg[0]:
             lines.append(f"[!] [U] no usable egress for {ip} - the "
                          "self-heal retries.")
@@ -2028,6 +2180,120 @@ def _live_apply_servers(hosts, endpoints):
     return lines
 
 
+def _bad_endpoint_rows(rows, over, over_iface=None):
+    """Which of the existing /32 route rows for a proxy endpoint are UNSAFE.
+
+    A row is bad when it is pinned to a tunnel adapter (the proxy's own
+    transport would be swallowed by a TUN and loop back to 127.0.0.1 - this
+    is the "TUN starts, then the proxy and the whole connection die" failure),
+    or when it contradicts the current transport mode: DIRECT mode must not
+    ride a VPN-pattern interface, and over-VPN mode must ride exactly the
+    validated VPN egress and nothing else.
+
+    Returns (bad_rows, healthy_exists). `healthy_exists` says whether at
+    least one row is safe - several rows for one /32 can coexist (a stale
+    high-metric one plus the good low-metric one), and only the bad ones must
+    be removed.
+
+    Single source of truth on purpose: the startup loop guard
+    (`verify_endpoints_off_tun`) and the periodic self-heal
+    (`_heal_endpoint_routes`) MUST agree on what "healthy" means, otherwise
+    the guard can green-light a route the heal then tears down (or worse, the
+    heal can re-install one the guard called broken, forever).
+    """
+    bad = []
+    healthy = False
+    for r in rows:
+        alias = str(r.get("InterfaceAlias", ""))
+        unsafe = _es.is_tun_iface(alias)
+        if not over and _es.is_vpn_iface(alias):
+            unsafe = True
+        if over and over_iface and alias.lower() != str(over_iface[0]).lower():
+            unsafe = True
+        if unsafe:
+            bad.append(r)
+        else:
+            healthy = True
+    return bad, healthy
+
+
+def _tracked_endpoint_ips():
+    """Every endpoint IP the tunnel must keep off its own TUN: the VLESS
+    server(s) and the Windows-VPN endpoint bypasses. Deduplicated,
+    order-preserving."""
+    out = []
+    for ip in (_live_mode.get("v4") or []):
+        if ip not in out:
+            out.append(ip)
+    for entry in (_live_mode.get("vpn_routes") or []):
+        ip = str(entry[1]).split("/")[0]
+        if ip not in out:
+            out.append(ip)
+    return out
+
+
+def verify_endpoints_off_tun(tag="startup"):
+    """Startup loop guard: prove the proxy transports still bypass the TUN
+    AFTER the default/split routes went in.
+
+    The bypass /32s are installed before the 0/0 and the /1 splits, which is
+    the right order - but "right order" is not a guarantee. A competing
+    adapter, a route-metric race, or a country-bypass sweep can still leave a
+    server /32 pointing at a tunnel, and the moment the default route is live
+    that server's traffic is captured: the proxy client can no longer reach
+    its own server, and because tun2socks has no upstream, every connection
+    the TUN carries dies with it. That is a full, silent blackout caused by
+    the tunnel coming up - the single worst failure this program has.
+
+    So the start sequence does not announce success on the strength of the
+    install alone. Returns (ok, problems): `ok` is False when any tracked
+    endpoint is missing or pinned to a tunnel, and the caller must say so out
+    loud instead of claiming the tunnel is ready. Idempotent, and a repair is
+    attempted once via the same healer the monitor uses.
+    """
+    over = bool(_live_mode["vless_over_vpn"])
+    over_eg = _live_mode.get("over") or None
+    problems = []
+    for ip in _tracked_endpoint_ips():
+        dest = f"{ip}/32"
+        rows = get_existing_v4_routes(dest)
+        bad, _healthy = _bad_endpoint_rows(rows, over, over_eg)
+        if rows and not bad:
+            continue                      # present and safe
+        if rows:
+            why = ("pinned to tunnel adapter "
+                   f"{bad[0].get('InterfaceAlias', '?')!r}")
+        else:
+            why = "no /32 bypass route in the table"
+        problems.append(f"{ip} ({why})")
+        # Repair in place rather than only reporting: a fixed transport now
+        # is worth far more than a warning the user cannot act on.
+        try:
+            for ln in _heal_endpoint_routes():
+                print(ln, flush=True)
+        except Exception as e:
+            print(f"[!] endpoint loop-guard repair failed: {e}", flush=True)
+            continue
+        # Re-read after the repair so the verdict reflects reality.
+        rows2 = get_existing_v4_routes(dest)
+        bad2, _healthy2 = _bad_endpoint_rows(rows2, over, over_eg)
+        if rows2 and not bad2:
+            problems.pop()      # repaired successfully - not a problem
+            print(f"[LOOPGUARD] {ip} bypass was {why}; repaired to "
+                  f"{rows2[0].get('InterfaceAlias', '?')}", flush=True)
+    if problems:
+        print(f"[!] [LOOPGUARD] {len(problems)} proxy endpoint(s) would loop "
+              f"back through the TUN: {'; '.join(problems)}. The proxy's own "
+              "connection to its server is being captured by the tunnel, so it "
+              "will look dead and every TUN connection with it. Fix the "
+              "network/other VPN client, or start the proxy on a physical "
+              "adapter, then press [T] then [S].", flush=True)
+    else:
+        print(f"[+] [LOOPGUARD] All proxy endpoints bypass the TUN "
+              f"({tag}).", flush=True)
+    return (not problems), problems
+
+
 def _heal_endpoint_routes():
     """Periodic self-heal for the tracked endpoint bypass routes. The /32s
     can vanish WITHOUT any local fault - seen live (1.0.30): a foreign TUN
@@ -2053,12 +2319,7 @@ def _heal_endpoint_routes():
     for ip in list(_live_mode["v4"]):
         dest = f"{ip}/32"
         rows = get_existing_v4_routes(dest)
-        bad = [r for r in rows
-               if _es.is_tun_iface(r.get("InterfaceAlias", ""))
-               or (not over and _es.is_vpn_iface(r.get("InterfaceAlias", "")))
-               or (over and over_eg
-                   and str(r.get("InterfaceAlias", "")).lower()
-                   != str(over_eg[0]).lower())]
+        bad, _healthy = _bad_endpoint_rows(rows, over, over_eg)
         if rows and not bad:
             continue                       # healthy - leave it alone
         for r in bad:
@@ -2093,12 +2354,7 @@ def _heal_endpoint_routes():
             d6 = get_ipv6_default()
             eg = (d6["InterfaceAlias"], d6["NextHop"]) if d6 else None
         rows = get_existing_v6_routes(dest)
-        bad = [r for r in rows
-               if _es.is_tun_iface(r.get("InterfaceAlias", ""))
-               or (not over and _es.is_vpn_iface(r.get("InterfaceAlias", "")))
-               or (over and eg
-                   and str(r.get("InterfaceAlias", "")).lower()
-                   != str(eg[0]).lower())]
+        bad, _healthy = _bad_endpoint_rows(rows, over, eg)
         if rows and not bad:
             continue
         for r in bad:
@@ -2214,6 +2470,12 @@ _HEAL_EVERY = 15
 # flapping so the VLESS /32s fall back to the physical egress while it is
 # down and re-point onto the VPN when it returns.
 _VPN_STATUS_EVERY = 10
+# Local SOCKS5 inbound liveness poll cadence. Deliberately much faster than
+# the traffic probe (mon_interval, 30 s): a TCP connect to a closed loopback
+# port costs microseconds, and the whole point is to notice the proxy coming
+# BACK quickly so the tunnel can be re-promoted to RUNNING instead of sitting
+# DEGRADED for up to half a minute after the user restarted their proxy.
+_SOCKS_CHECK_EVERY = 5
 
 #: Serialises the geo re-point so a slow bulk move can never overlap itself.
 _geo_repoint_lock = threading.Lock()
@@ -2408,6 +2670,32 @@ def _check_gateway_change():
         return
     cur = res.value
     iface, gw = str(cur[0]), str(cur[1])
+    # REFUSE a next hop that is not IPv4. The candidate comes from a
+    # PowerShell lookup, and one lookup bug must never be able to re-point
+    # every route we own: the re-point below moves the LAN bypasses, the
+    # endpoint /32s and the geo set, then COMMITS the new egress in
+    # _live_mode['phys'] - so a bad value poisons egress resolution for the
+    # rest of the session, not just this call. An IPv6 next hop here (which
+    # is exactly what a dual-stack CIM DefaultIPGateway lookup returned) made
+    # every single add fail with "Invalid nexthop parameter ... should be a
+    # valid IPv4 address" and left the proxy endpoint bypass uninstallable.
+    if _wrong_family_gw(gw, 4):
+        print(f"[!] Gateway check: the reported IPv4 default on {iface} has a "
+              f"non-IPv4 next hop ({gw!r}) - ignoring it rather than "
+              "re-pointing every route onto it.", flush=True)
+        return
+    # Same reasoning, one step up: a VPN or tunnel interface is not a change
+    # of PHYSICAL egress. get_ipv4_default()'s last-resort clause can answer
+    # with the VPN when a full-tunnel VPN replaced the physical default (e.g.
+    # mid-reconnect), and committing that would move the LAN bypasses, the
+    # proxy /32 and the geo set onto the VPN - including the VPN endpoint's
+    # own route, which then points the VPN server at the VPN. Ignore it and
+    # keep the last-known-good physical egress.
+    if _es.is_vpn_iface(iface) or _es.is_tun_iface(iface):
+        print(f"[!] Gateway check: the reported IPv4 default is on {iface} "
+              "(a VPN/tunnel adapter), not a physical egress change - keeping "
+              "the current physical gateway.", flush=True)
+        return
     if (iface.lower() == str(phys[0]).lower()
             and gw == str(phys[1] or "")):
         _gw_pending = None          # back on the known egress - drop candidate
@@ -3095,23 +3383,42 @@ def cleanup():
     _say("\n[*] Cleaning up routes...")
     # Remove the VPN-override routes we added to keep the tunnel the sole egress,
     # then restore the VPN's original injected routes we shadowed.
+    #
+    # BULK, not one netsh process per route (see _remove_routes_bulk). A VPN
+    # client injects a whole table, and this loop was a process spawn per row
+    # - the single largest contributor to a multi-second "Stopping tunnel
+    # helper" step.
     if vpn_override_routes:
         _say(f"[*] Removing {len(vpn_override_routes)} VPN-override routes...")
-        _step("remove VPN-override routes", lambda: [
-            remove_route(item)
-            for item in reversed(list(vpn_override_routes))])
+        _step("remove VPN-override routes",
+              lambda: _remove_routes_bulk(
+                  list(reversed(list(vpn_override_routes)))))
         vpn_override_routes.clear()
     if vpn_saved_routes:
         _say(f"[*] Restoring {len(vpn_saved_routes)} VPN routes...")
+        # Re-ADD, not delete: the batch helper only deletes, so these stay on
+        # the (already batched) _raw_add_route path.
         _step("restore shadowed VPN routes", lambda: [
             _raw_add_route(fam, dest, iface, gateway, metric)
             for fam, dest, iface, gateway, metric
             in reversed(vpn_saved_routes)])
         vpn_saved_routes.clear()
     # Remove every route this helper installed (endpoint /32+/128 bypasses,
-    # LAN bypasses, TUN default/split routes) - small, fast, CRITICAL.
-    _step("remove installed routes", lambda: [
-        remove_route(item) for item in reversed(list(added_routes))])
+    # LAN bypasses, TUN default/split routes) - CRITICAL, and now BULK.
+    #
+    # This was the teardown's worst offender: one `netsh` PROCESS per route,
+    # serially. A typical session owns 25-35 rows here (6 TUN default/split,
+    # ~10 LAN bypasses, the Wintun host routes, the VLESS /32s, the VPN
+    # endpoint /32s), and a netsh spawn costs hundreds of ms - tens of
+    # seconds of pure process-launch overhead before teardown even reached
+    # the geo sweep. _remove_routes_bulk runs the identical
+    # `interface <fam> delete route ...` lines through `netsh -f` in chunks
+    # of GEO_SUB_BATCH, so this is typically ONE process instead of thirty.
+    # It also swallows "already gone" errors, which is the desired end state
+    # here, and the dashboard's exit sweep still re-checks the live table.
+    _step("remove installed routes",
+          lambda: _remove_routes_bulk(
+              list(reversed(list(added_routes)))))
     added_routes.clear()
 
     _step("stop tun2socks", _stop_tun2socks)
@@ -3348,6 +3655,18 @@ _VERIFY_URLS = [
 
 _VERIFY_PRINT_LOCK = threading.Lock()
 
+#: Wall-clock ceiling for the WHOLE start-sequence verification
+#: (both rounds, including the DoH escalation). The tunnel is installed and
+#: carrying traffic before this runs - it is a health signal, not a readiness
+#: gate - so a bounded answer plus the monitor loop's re-probe is strictly
+#: better than an unbounded wait on a resolver that may not answer for
+#: minutes. Sizing: a healthy tunnel verifies in well under a second; a broken
+#: one previously cost 20-30s of visible "Verifying the tunnel is stable...".
+_VERIFY_BUDGET = 18.0
+#: Per-round ceiling. The first round races 4 endpoints; the DoH round gets
+#: whatever is left of the total budget.
+_VERIFY_ROUND_BUDGET = 8.0
+
 
 def _verify_worker(url, timeout, attempts, tag, shared):
     """Retry ONE verification URL until it succeeds or `attempts` run out.
@@ -3355,11 +3674,16 @@ def _verify_worker(url, timeout, attempts, tag, shared):
     endpoint can never delay the ones that work. First success anywhere wins.
 
     DNS-RESOLUTION failures (getaddrinfo/[Errno 11001] - plain UDP/53 through
-    the TUN not working, e.g. a SOCKS client whose UDP relay is broken) fail
-    INSTANTLY and do not heal by retrying, so they get at most 2 quick tries
-    with a 1s gap; the point is to reach the DoH escalation fast instead of
-    burning the full 5x2s budget on a resolver that cannot recover on its
-    own."""
+    the TUN not working, e.g. a SOCKS client whose UDP relay is broken) give up
+    after the FIRST try. They used to be retried twice with a 1s gap, which
+    cost a second full resolve sweep - and getaddrinfo has no timeout, so
+    against a configured-but-unreachable resolver (Windows walks every server
+    with its own multi-second timeout) that is several more seconds of the
+    start sequence burnt proving the resolver was still down, immediately
+    before the DoH escalation that actually fixes it. The point of the
+    failure is to trigger that escalation, so reach it in one step. Non-DNS
+    failures (resolved, but the fetch failed) still get the full retry budget,
+    since those can genuinely be transient."""
     dns_fails = 0
     for i in range(1, attempts + 1):
         ok, msg = _probe_tunnel_once(url, timeout=timeout)
@@ -3375,14 +3699,14 @@ def _verify_worker(url, timeout, attempts, tag, shared):
             print(f"    [{i}/{attempts}]{tag} {url}: {msg}", flush=True)
         if dns_fail:
             dns_fails += 1
-            if dns_fails >= 2:
+            if dns_fails >= 1:
                 return   # give up on this URL - let the DoH escalation take over
             time.sleep(1)
         else:
             time.sleep(2)
 
 
-def wait_for_tunnel_stable(timeout=5):
+def wait_for_tunnel_stable(timeout=5, budget=None):
     """Block until DNS + HTTP verification through the TUN succeeds.
 
     ALL _VERIFY_URLS are probed CONCURRENTLY (one worker thread each), so a
@@ -3391,25 +3715,69 @@ def wait_for_tunnel_stable(timeout=5):
     one by one. Each URL still retries up to 5 times with 2-second gaps.
     If every URL fails, auto-escalates to DoH DNS and retries the same way.
 
-    Returns True if the tunnel is verified, False if all attempts fail."""
+    Returns True if the tunnel is verified, False if all attempts fail.
+
+    SPEED: the whole thing is bounded by `budget` wall-clock seconds
+    (default _VERIFY_BUDGET). Two things used to make "Verifying the tunnel is
+    stable..." the longest step in the entire start sequence:
+
+      * socket.getaddrinfo has NO timeout parameter. With a resolver that is
+        configured but unreachable - which is exactly the state plain UDP/53
+        is in when it has to traverse a SOCKS5 tunnel - Windows walks every
+        configured server (here 8.8.8.8 AND an IPv6 resolver) with its own
+        multi-second timeouts, so one probe can burn 5-10s. `timeout` bounds
+        the HTTP fetch, NOT the resolve, so nothing bounded the round.
+      * `_run_round` waited on as_completed() with no deadline, so a single
+        wedged resolve held the whole start open for the full retry budget,
+        then paid it AGAIN for the DoH escalation round.
+
+    A round now returns the moment its deadline passes or any endpoint
+    verifies, and a failed start is not a dead tunnel: main() announces
+    DEGRADED and the monitor loop re-probes (~5s later) and promotes to
+    RUNNING on the first pass. So the budget trades a few seconds of a
+    "Verifying..." spinner for a tunnel the user can actually use.
+    """
     global _ACTIVE_DNS_MODE
     shared = {"ok": False, "msg": "", "last_err": ""}
+    deadline = time.monotonic() + (budget if budget is not None
+                                   else _VERIFY_BUDGET)
 
-    def _run_round(tag=""):
+    def _remaining():
+        return max(0.0, deadline - time.monotonic())
+
+    def _run_round(tag="", round_budget=None):
         shared["ok"] = False
         shared["msg"] = ""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(_VERIFY_URLS)) as ex:
+        stop_at = time.monotonic() + (round_budget if round_budget is not None
+                                      else _VERIFY_ROUND_BUDGET)
+        # NOT a `with ThreadPoolExecutor(...)` block. The context manager's
+        # __exit__ calls shutdown(wait=True), which blocks until every worker
+        # thread finishes - so a probe wedged inside an un-timed-out
+        # getaddrinfo would hold the start sequence open for its full
+        # duration and the round deadline below would buy nothing at all.
+        # (That is exactly what a first attempt at this fix did.) Abandoning
+        # the stuck resolve is the whole point; the thread finishes on its own
+        # and is reaped by the executor.
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(_VERIFY_URLS))
+        try:
             futs = [ex.submit(_verify_worker, url, timeout, 5, tag, shared)
                     for url in _VERIFY_URLS]
-            # Return as soon as ANY endpoint verifies the tunnel.
-            for fut in concurrent.futures.as_completed(futs):
+            # Return as soon as ANY endpoint verifies the tunnel OR the round's
+            # deadline passes - whichever comes first.
+            while True:
+                left = min(stop_at, deadline) - time.monotonic()
+                if left <= 0:
+                    break
+                done, _ = concurrent.futures.wait(futs, timeout=min(0.25, left))
                 if shared["ok"]:
-                    for f in futs:
-                        f.cancel()
                     with _VERIFY_PRINT_LOCK:
                         print(f"[+] Tunnel stable: {shared['msg']}", flush=True)
                     return True
-        return False
+                if done and all(f.done() for f in futs):
+                    break
+            return shared["ok"]
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
     if _run_round():
         return True
@@ -3420,7 +3788,7 @@ def wait_for_tunnel_stable(timeout=5):
           flush=True)
 
     # Auto-escalate to DoH if plain DNS appears broken.
-    if _ACTIVE_DNS_MODE == "auto":
+    if _ACTIVE_DNS_MODE == "auto" and _remaining() > 1.0:
         print("[*] Auto-switching wintun DNS to DoH (HTTPS) so name resolution "
               "rides over TCP/443...", flush=True)
         _ACTIVE_DNS_MODE = "doh"
@@ -3430,6 +3798,8 @@ def wait_for_tunnel_stable(timeout=5):
             print(f"[!] DoH switch failed: {e}", flush=True)
         # Flush the resolver cache so lookups stop hitting the broken plain-UDP
         # path and pick up the freshly registered DoH servers immediately.
+        # Folded into ONE PowerShell call with the cache clear: each psshell
+        # spawn costs hundreds of ms and this is on the critical path.
         try:
             run_ps("Clear-DnsClientCache -ErrorAction SilentlyContinue; "
                    "ipconfig /flushdns | Out-Null")
@@ -3458,7 +3828,22 @@ def self_heal_tunnel(dns4, dns6):
         # Self-heal implies the TUN routes are being re-asserted, so make sure
         # the DNS pin is still there too (a wipe of the NRPT rule is exactly
         # the kind of silent state loss this path exists to repair).
-        _install_dns_guard(verbose=False)
+        #
+        # INDIVIDUALLY GUARDED, and that is load-bearing rather than
+        # decorative. The docstring above promises "one failing add cannot
+        # abort the rest"; this call was NOT guarded, and a single cosmetic
+        # bug inside it (an UnboundLocalError on the _dns_guard_state
+        # bookkeeping) unwound out of the whole function - skipping every
+        # Wintun address, the default and split-default routes, the entire
+        # IPv6 stack and the LAN bypass re-apply. The self-heal did nothing at
+        # all, the tunnel stayed broken, and the only visible symptom was one
+        # "Self-heal failed" line naming a variable instead of the routes that
+        # were never re-applied. Contain every step that is not a route add.
+        try:
+            _install_dns_guard(verbose=False)
+        except (Exception, SystemExit) as e:
+            print(f"[!] Self-heal: DNS leak guard re-assert failed ({e}); "
+                  "continuing with the TUN routes.", flush=True)
         ensure_wintun_ipv4()
         add_v4("0.0.0.0/0", TUN, TUN4, metric=1)
         for prefix in ("0.0.0.0/1", "128.0.0.0/1"):
@@ -3982,7 +4367,14 @@ def main():
     if vpn_v4:
         print("[*] Installing Windows VPN IPv4 bypass routes...")
         for ip in vpn_v4:
-            eg = get_egress_for(ip) or (iface, gateway)
+            # Physical adapter, always - see _direct_bypass_egress. A VPN
+            # server reached via the VPN is a loop; the whole point of the
+            # bypass is to keep that server OUTSIDE the tunnel.
+            eg = _direct_bypass_egress(ip, (iface, gateway))
+            if not eg:
+                print(f"[!] No physical egress for VPN endpoint {ip}; not "
+                      "installing its bypass (it must not ride the VPN).")
+                continue
             if not add_v4(f"{ip}/32", eg[0], eg[1], metric=1):
                 print(f"[!] Could not install VPN bypass route for {ip}; continuing.")
             else:
@@ -4186,7 +4578,10 @@ def main():
         # behind it (watch the GEO panel fill up).
         code = (args.geoip_code or "").strip().lower()
         if not code:
-            print("[!] --geoip given without --geoip-code - no country bypass installed.")
+            # The main path has already validated the --geoip/--geoip-code pair
+            # BEFORE spawning this thread and printed the full advisory (it
+            # even names the flag to add). Printing it again here produced the
+            # identical warning twice in the log for one mistake.
             return
         print(f"[*] Loading geoip file bypass for code '{code}' from {args.geoip} ... (background)")
         try:
@@ -4416,7 +4811,22 @@ def main():
     _live_mode["v6"] = list(v6)
     _live_mode["vpn_v4"] = list(vpn_v4)
     _live_mode["vpn_v6"] = list(vpn_v6)
-    _live_mode["phys"] = (iface, gateway)
+    # Validate before caching. get_ipv4_default()'s last-resort clause can
+    # return "any non-wintun default route, may be the VPN" when a full-tunnel
+    # VPN has replaced the physical default. Storing THAT under 'phys' made
+    # every fallback below pin a bypass onto the VPN - including the VPN
+    # endpoint's own /32, which is how a live [Y]/[U] install tried to add
+    # '185.64.178.62/32 on Shirazu-VPN'. Store None instead: a missing cache
+    # makes _direct_bypass_egress say "no physical egress" (visible and safe)
+    # where a poisoned cache silently built broken routes. physical_egress()
+    # re-validates on every read regardless, so this is belt and braces.
+    _phys = physical_egress((iface, gateway))
+    if _phys is None:
+        print(f"[!] The reported IPv4 default ({iface} {gateway}) is not a "
+              "physical adapter - not caching it as the physical egress. "
+              "Bypass routes that need the physical adapter will be reported "
+              "rather than pinned onto a VPN or tunnel.", flush=True)
+    _live_mode["phys"] = _phys
     _live_mode["over"] = (vless_iface, vless_gateway)
     _live_mode["vpn_conn"] = vpn_conn_name_for_check
     _live_mode["vpn_routes"] = list(_live_vpn_routes)
@@ -4445,15 +4855,56 @@ def main():
         print("[+] Windows VPN endpoint(s): physical adapter bypass")
     print("[+] tun2socks --interface: OFF")
 
+    # LOOP GUARD. Everything above installed the proxy transports' /32
+    # bypasses BEFORE the default/split routes, which is the right order - but
+    # order is not proof. Now that 0/0 and the /1 splits are live, prove the
+    # server routes still bypass the TUN. If they do not, the proxy client's
+    # own connection to its server is being swallowed by the tunnel we just
+    # raised: it cannot reach the server, tun2socks has no upstream, and the
+    # user's connection is gone - with the dashboard still showing a
+    # perfectly healthy, fully installed tunnel. One PowerShell check now
+    # beats an unexplainable blackout.
+    endpoints_ok, endpoint_problems = (True, [])
+    try:
+        endpoints_ok, endpoint_problems = verify_endpoints_off_tun("startup")
+    except Exception as e:
+        print(f"[!] [LOOPGUARD] could not verify proxy endpoint routes: {e}",
+              flush=True)
+
     # Verify the tunnel is actually carrying traffic before declaring success.
     # This retries until the tunnel stabilizes (it can still be "warming up"
     # right after the tun2socks restart) and fixes the old
     # "Could not resolve https://api.ipify.org/" failure, which was just the
     # full URL (scheme + path) being fed to getaddrinfo instead of a hostname.
     print("[*] Verifying the tunnel is stable...", flush=True)
-    wait_for_tunnel_stable()
+    stable = wait_for_tunnel_stable()
 
-    print("[*] Press Ctrl+C to stop.", flush=True)
+    # The ready marker is the dashboard's ONLY cue for RUNNING, so it must not
+    # be printed for a tunnel that never verified. The old code discarded
+    # wait_for_tunnel_stable()'s verdict and announced readiness anyway, which
+    # is how "everything says RUNNING and nothing works" was possible at all.
+    # Announcing DEGRADED instead is both honest and recoverable: the first
+    # successful monitor probe promotes it to RUNNING on its own, with no
+    # restart and no user action.
+    if stable and endpoints_ok:
+        print("[*] Press Ctrl+C to stop.", flush=True)
+    else:
+        # Two DISTINCT markers, not one vague one: the dashboard maps each to
+        # a different repair ladder (endpoint-route loop -> re-assert the
+        # transport routes; unverified probe -> the egress/DNS ladder), so the
+        # first thing a reader sees names the actual fault.
+        if not endpoints_ok:
+            print(f"[!] TUNNEL DEGRADED - proxy endpoint routes loop: "
+                  f"{len(endpoint_problems)} endpoint(s) would be captured by "
+                  f"the TUN just installed ({'; '.join(endpoint_problems)}).",
+                  flush=True)
+        else:
+            print("[!] TUNNEL DEGRADED - traffic verification failed: the "
+                  "TUN and its routes are installed but no traffic probe "
+                  "succeeded through them.", flush=True)
+        print("[*] The tunnel stays installed and promotes ITSELF to RUNNING "
+              "as soon as a health probe passes - do not restart. Check the "
+              "EVENT LOG above for the reason.", flush=True)
     print(flush=True)
 
     last_vpn_status = None
@@ -4462,9 +4913,18 @@ def main():
     last_gw_check = 0.0   # gateway-change poll clock (see _check_gateway_change)
     last_heal_check = 0.0  # endpoint-bypass self-heal clock (see _HEAL_EVERY)
     last_vpn_check = 0.0  # VPN transport status clock (see _VPN_STATUS_EVERY)
+    last_socks_check = 0.0  # local SOCKS5 liveness clock (see _SOCKS_CHECK_EVERY)
     fails = 0
+    proxy_up = test_local_socks(args.port, timeout=0.5)
     mon_interval = max(5, args.monitor_interval)
     mon_retries = max(1, args.monitor_retries)
+    if not (stable and endpoints_ok):
+        # A start that did not verify must not then sit silent for a whole
+        # monitor interval before anyone looks at it again. Re-probe in ~5 s:
+        # fast enough that a tunnel which is merely warming up is promoted to
+        # RUNNING almost immediately, and a genuinely broken one is reported
+        # quickly instead of half a minute later.
+        last_probe = time.time() - mon_interval + 5
     try:
         while tun_proc.poll() is None:
             time.sleep(1)
@@ -4547,12 +5007,55 @@ def main():
                             except Exception as _e:
                                 print(f"[!] VPN reconnect re-point failed: {_e}",
                                       flush=True)
+            # ── Upstream liveness (fast, independent cadence) ────────────
+            # Is the local SOCKS5 inbound even listening? A proxy client that
+            # is closed, crashed, or (the common case) has lost its own
+            # connection to its server is the single most frequent cause of
+            # "the tunnel is up but nothing works", and it must NOT be
+            # reported as a DNS/route fault:
+            #   * route self-heal cannot fix a closed port - it only churns the
+            #     default route, and the user's connection with it;
+            #   * restarting the helper CANNOT fix it either, because
+            #     start_tun2socks_pipe exits when the port is refused - so
+            #     escalating to a restart turns one proxy outage into a tunnel
+            #     crash loop.
+            # The tunnel itself is fine and stays installed; it heals by itself
+            # the moment the port answers again, because tun2socks opens a
+            # fresh upstream connection per request. This runs on its own
+            # 5-second clock (not the 30 s probe interval) so the tunnel is
+            # declared healthy again promptly after the proxy comes back.
+            if not args.no_monitor and (now - last_socks_check) >= _SOCKS_CHECK_EVERY:
+                last_socks_check = now
+                socks_up = test_local_socks(args.port, timeout=0.5)
+                if socks_up != proxy_up:
+                    proxy_up = socks_up
+                    if socks_up:
+                        print(f"[MONITOR] proxy SOCKS5 is listening again on "
+                              f"127.0.0.1:{args.port} - re-verifying the tunnel "
+                              "now.", flush=True)
+                        last_probe = 0.0     # verify on the very next probe tick
+                        fails = 0
+                    else:
+                        print(f"[MONITOR] proxy SOCKS5 is NOT listening on "
+                              f"127.0.0.1:{args.port} - the TUN and its routes "
+                              "are installed and fine, but there is no upstream "
+                              "to forward to, so nothing can pass. Start your "
+                              "proxy client; the tunnel recovers by itself once "
+                              "the port answers (no restart needed).",
+                              flush=True)
+
             # Live monitor / debug loop: periodically verify the tunnel resolves
             # and carries traffic through the TUN. On repeated failure, self-heal
             # (re-apply Wintun DNS + default/split routes) instead of requiring a
             # manual restart. --no-monitor disables this entirely.
             if not args.no_monitor and (now - last_probe) >= mon_interval:
                 last_probe = now
+                if not proxy_up:
+                    # No upstream: a traffic probe can only produce a useless
+                    # failure, and the route self-heal below cannot help. Skip
+                    # both until the port is back (checked every 5 s above).
+                    last_leak = None
+                    continue
                 ok, msg = _probe_tunnel_multi(timeout=4)
                 if ok:
                     fails = 0
@@ -4607,6 +5110,18 @@ def main():
                         fails = 0
     except KeyboardInterrupt:
         pass
+
+    # The loop above ends the moment tun2socks exits - normally because a
+    # shutdown was requested, but also because tun2socks CRASHED. The old code
+    # fell out of the loop silently in both cases, so the dashboard saw only a
+    # generic "helper process exited" with no idea that the userspace forwarder
+    # - the thing that actually moves packets - was gone. main() returns next
+    # and cleanup() removes the routes, so the tunnel really is down; say so,
+    # with the exit code, before that happens.
+    if tun_proc is not None and tun_proc.poll() is not None:
+        print(f"[!] tun2socks exited unexpectedly (code {tun_proc.returncode}) "
+              "- the TUN had no userspace forwarder, so no traffic could pass "
+              "through it. Tearing the tunnel down.", flush=True)
 
 
 def do_live_bypass(args):
