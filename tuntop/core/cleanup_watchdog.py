@@ -469,6 +469,10 @@ def main(argv=None) -> int:
     try:
         import tuntop.network.routing as _routing  # noqa: F401
         import tuntop.network.dns as _dns  # noqa: F401  (socket/threading)
+        # The DNS leak guard (1.0.40) imports routing lazily inside its
+        # runner; preload the module itself so the post-death sweep cannot
+        # die on a zipimport of base_library.zip.
+        import tuntop.network.dns_guard as _dns_guard  # noqa: F401
         from tuntop.geoip import parse_geoip as _pg  # noqa: F401
         from tuntop.startup_recovery import scan as _scan  # noqa: F401
         from tuntop.startup_recovery import recover as _recover  # noqa: F401

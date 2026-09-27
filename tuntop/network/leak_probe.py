@@ -546,6 +546,36 @@ _DNS_TYPE_A = 1
 _DNS_TYPE_TXT = 16
 
 
+def _injected_true(predicate):
+    """True when an injected predicate says so. A missing predicate or one
+    that raises counts as "unknown" (False), so a broken probe can never
+    manufacture a leak verdict on its own."""
+    if not callable(predicate):
+        return False
+    try:
+        return bool(predicate())
+    except Exception:
+        return False
+
+
+def _guard_state(guard_in_force):
+    """Tri-state the guard probe: (True|False|None, why).
+
+    True  - a catch-all pin is confirmed in force
+    False - the probe RAN and says no pin is in force (a real finding)
+    None  - UNKNOWN: not injected, or the probe raised
+
+    The distinction matters: False is evidence of a leak, None is the absence
+    of evidence, and collapsing the two (as a plain bool() does) turns any
+    PowerShell hiccup into a confirmed leak verdict."""
+    if not callable(guard_in_force):
+        return None, "the catch-all NRPT state was not checked"
+    try:
+        return bool(guard_in_force()), ""
+    except Exception as e:
+        return None, f"the catch-all NRPT probe failed ({e})"
+
+
 def _dns_build_query(qname, qtype, qid=0x1F2E):
     """One standard UDP DNS query packet for `qname`/`qtype` (recursion
     desired, single question - everything the echo endpoints need)."""
@@ -728,7 +758,8 @@ def _forced_path_echo_ip(timeout):
 
 
 def run_dns_leak_probe(direct_ip=None, tunnel_ip=None, expected_dns=(),
-                       timeout=LEAK_TIMEOUT):
+                       timeout=LEAK_TIMEOUT, unguarded_resolvers=None,
+                       guard_in_force=None):
     """DNS half of the leak test. Returns (status, message, detail) with
     status in {"ok", "dns-leak", "unknown", "no-dns"} and detail =
     {"resolver": ..., "echo": ...}.
@@ -737,6 +768,21 @@ def run_dns_leak_probe(direct_ip=None, tunnel_ip=None, expected_dns=(),
     measured (pass them so the two tests share one picture); `expected_dns`
     lists the tunnel's configured DNS servers (a resolver identity matching
     one of these is proof-positive that system DNS rides the tunnel).
+
+    `unguarded_resolvers` / `guard_in_force` are INJECTED probes (callables)
+    for the leak this probe was blind to: Windows' Smart Multi-Homed Name
+    Resolution can ask EVERY adapter's resolver in parallel and take the
+    first answer, so a machine whose configured resolvers all ride the TUN
+    can still be answered by the ISP/router. `unguarded_resolvers()` returns
+    the non-tunnel adapters that still publish resolvers (["Wi-Fi=192.168.1.1"]),
+    `guard_in_force()` says whether a catch-all NRPT rule currently prevents
+    that fan-out. Both default to None = "not checked".
+
+    A guard probe that RAISES is UNKNOWN, not a negative: foreign resolvers
+    plus an unreadable guard state report "unknown", never "dns-leak". Only a
+    guard probe that actually ran and said "not in force" produces a leak
+    verdict. Any other probe failure is likewise treated as unknown, so this
+    probe never invents a leak verdict.
     """
     expected = [str(x).strip() for x in (expected_dns or ()) if x]
 
@@ -759,12 +805,54 @@ def run_dns_leak_probe(direct_ip=None, tunnel_ip=None, expected_dns=(),
             lambda: _forced_path_echo_ip(timeout), timeout + 5)
 
     detail = {"resolver": resolver, "echo": echo}
+
     parts = []
     if resolver:
         parts.append(f"system resolver = {resolver}")
     if echo:
         parts.append(f"UDP/53 path egress = {echo}")
     suffix = f" ({'; '.join(parts)})" if parts else ""
+
+    # ── Parallel-resolver check: the leak an egress probe cannot see ──────
+    # Even when every CONFIGURED resolver rides the TUN, Windows may ask a
+    # DHCP-assigned physical adapter's resolver at the same time (Smart
+    # Multi-Homed Name Resolution) and take whichever answer arrives first.
+    # TunTop's other probes cannot see that path - they only test the
+    # resolvers TunTop itself knows about - which is exactly how a machine
+    # could report "no DNS leak" here while dnsleaktest.com showed the ISP.
+    if callable(unguarded_resolvers):
+        gstate, gwhy = _guard_state(guard_in_force)
+        if gstate is not True:
+            try:
+                others = [str(x) for x in (unguarded_resolvers() or [])
+                          if str(x)]
+            except Exception:
+                others = []
+            detail["unguarded_resolvers"] = others
+            detail["guard_in_force"] = gstate
+            if others and gstate is False:
+                return "dns-leak", (
+                    "DNS LEAK: Windows can still query resolvers OUTSIDE the "
+                    f"tunnel on {', '.join(others[:4])} and no catch-all NRPT "
+                    "rule is in force - the DNS client may send every query "
+                    "out over all connected adapters in parallel (Smart "
+                    "Multi-Homed Name Resolution) and the ISP/router answer "
+                    f"can win, even though the tunnel's own resolvers work."
+                    f"{suffix}"), detail
+            if others and gstate is None:
+                # UNKNOWN, not a leak: the adapters exist but we could not
+                # establish whether a catch-all pin is stopping the fan-out.
+                # Reporting 'dns-leak' here would blame the tunnel for a
+                # failed probe - the exact failure mode this probe exists to
+                # avoid.
+                return "unknown", (
+                    "DNS leak UNKNOWN: adapters outside the tunnel still "
+                    f"publish resolvers ({', '.join(others[:4])}), but "
+                    f"{gwhy} - cannot tell whether the DNS client is "
+                    "pinned to the tunnel or may query them in parallel. "
+                    f"Re-run the test, or check the 'DNS leak protection' "
+                    f"health row.{suffix}"), detail
+
     resolver_is_expected = bool(
         resolver and expected and _expected_match(resolver))
 

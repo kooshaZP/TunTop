@@ -119,6 +119,15 @@ class Probes:
     kill_tun2socks: Callable[[], int]
     teardown_adapter: Callable[[], bool]
     sweep_host_routes: Callable[[list], int]
+    #: DNS leak guard (tuntop/network/dns_guard.py). Optional - a caller that
+    #: does not provide them simply never reports a leftover guard. They are
+    #: kept optional (rather than required) so existing probe fakes/tests keep
+    #: working unchanged. `dns_guard_present` must return exactly True to be
+    #: acted on: a leftover NRPT rule rewrites name resolution system-wide,
+    #: and guessing "probably installed" is not a good enough reason to touch
+    #: the registry.
+    dns_guard_present: Optional[Callable[[], bool]] = None
+    remove_dns_guard: Optional[Callable[[], bool]] = None
 
 
 def _wintun_route_count() -> int:
@@ -209,6 +218,37 @@ def default_probes() -> Probes:
                 n += 1
         return n
 
+    def dns_guard_present():
+        """True when a TunTop DNS-guard NRPT rule (or its install record)
+        survived a previous run. Never raises: an unreadable registry is
+        reported as "nothing found" so recovery never guesses."""
+        try:
+            from tuntop.network import dns_guard
+        except Exception:
+            return False
+        try:
+            if dns_guard.load_state() is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            ok, state = dns_guard.detect()
+            return bool(ok and state.get("keys"))
+        except Exception:
+            return False
+
+    def remove_dns_guard():
+        """Delete every TunTop-* NRPT rule + the install record."""
+        try:
+            from tuntop.network import dns_guard
+        except Exception:
+            return False
+        try:
+            ok, _msg = dns_guard.ensure_removed()
+            return bool(ok)
+        except Exception:
+            return False
+
     return Probes(
         tun2socks_count=_tun2socks_owned_count,
         wintun_route_count=_wintun_route_count,
@@ -216,6 +256,8 @@ def default_probes() -> Probes:
         kill_tun2socks=kill_tun2socks,
         teardown_adapter=teardown_adapter,
         sweep_host_routes=sweep_host_routes,
+        dns_guard_present=dns_guard_present,
+        remove_dns_guard=remove_dns_guard,
     )
 
 
@@ -230,11 +272,16 @@ class StartupFindings:
     orphan_tun2socks: int = 0           # running tun2socks processes
     wintun_routes: int = 0              # routes on the wintun adapter
     host_routes: list = field(default_factory=list)  # [("v4", "1.2.3.4/32")]
+    #: A TunTop DNS-guard NRPT rule is still installed (the previous run
+    #: never removed it): system-wide name resolution is still pinned to a
+    #: tunnel that no longer exists - remove it before anything else.
+    dns_guard: bool = False
 
     @property
     def dirty(self) -> bool:
         return bool(self.marker or self.orphan_tun2socks
-                    or self.wintun_routes or self.host_routes)
+                    or self.wintun_routes or self.host_routes
+                    or self.dns_guard)
 
     def summary_lines(self) -> list:
         """Human-readable 'what we found' lines for the startup log."""
@@ -251,6 +298,9 @@ class StartupFindings:
         if self.host_routes:
             lines.append(f"{len(self.host_routes)} stale per-host bypass "
                          "route(s)")
+        if self.dns_guard:
+            lines.append("a leftover DNS leak-guard rule (system name "
+                         "resolution is still pinned to the dead tunnel)")
         return lines
 
 
@@ -270,6 +320,15 @@ def scan(hosts=None, probes: Optional[Probes] = None,
         findings.wintun_routes = p.wintun_route_count() or 0
     except Exception:
         findings.wintun_routes = 0
+    # DNS leak-guard probe: a leftover NRPT rule keeps rewriting name
+    # resolution for EVERY process, so it is reported even when the routing
+    # state looks clean. Only an exact True counts (see Probes.dns_guard_present).
+    _guard_probe = getattr(p, "dns_guard_present", None)
+    if callable(_guard_probe):
+        try:
+            findings.dns_guard = _guard_probe() is True
+        except Exception:
+            findings.dns_guard = False
     if hosts:
         try:
             findings.host_routes = list(p.host_routes(hosts) or [])
@@ -292,6 +351,12 @@ def recover(findings: StartupFindings,
     actions = []
 
     tasks = []
+    if findings.dns_guard:
+        # FIRST: a leftover NRPT rule pins every process's name resolution to
+        # a tunnel that is being torn down - remove it before touching routes,
+        # otherwise DNS keeps failing (or, worse, keeps being answered by the
+        # wrong resolver) all through the sweep.
+        tasks.append(("remove leftover DNS guard", _do_dns_guard))
     if findings.orphan_tun2socks:
         tasks.append(("kill orphaned tun2socks", _do_kill))
     if findings.wintun_routes or findings.marker or findings.orphan_tun2socks:
@@ -319,6 +384,18 @@ def recover(findings: StartupFindings,
 def _do_kill(p: Probes, f: StartupFindings) -> str:
     n = p.kill_tun2socks()
     return f"stopped {n} process(es)"
+
+
+def _do_dns_guard(p: Probes, f: StartupFindings) -> str:
+    """Remove a leftover catch-all NRPT rule. A missing probe (a caller that
+    did not supply one) is reported instead of silently passing."""
+    fn = getattr(p, "remove_dns_guard", None)
+    if not callable(fn):
+        return "no DNS-guard probe available"
+    removed = fn()
+    if removed is True:
+        return "NRPT rule removed (name resolution is unpinned again)"
+    return "removal reported failure - the next launch retries"
 
 
 def _do_teardown(p: Probes, f: StartupFindings) -> str:

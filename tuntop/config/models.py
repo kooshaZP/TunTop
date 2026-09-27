@@ -11,7 +11,7 @@ from typing import Optional
 
 from tuntop.config.defaults import (
     DEFAULT_ENDPOINT_PORT, DEFAULT_SOCKS_PORT, DNS4, DEFAULT_DNS_POLICY,
-    DEFAULT_LOG_ADAPTER_ACTIVITY,
+    DEFAULT_LOG_ADAPTER_ACTIVITY, DEFAULT_DNS_GUARD, DEFAULT_DNS_GUARD_EXEMPT,
 )
 
 
@@ -38,6 +38,12 @@ class Profile:
     no_vpn_bypass: bool = False
     vpn_interface: Optional[str] = None
     log_adapter_activity: bool = DEFAULT_LOG_ADAPTER_ACTIVITY
+    dns_guard: bool = DEFAULT_DNS_GUARD          # catch-all NRPT DNS pin
+    # Extra exemptions beyond the always-on mDNS one. The field default comes
+    # from DEFAULT_DNS_GUARD_EXEMPT (copied, not shared: a mutable default
+    # must never be handed out by reference).
+    dns_guard_exempt: list = field(
+        default_factory=lambda: list(DEFAULT_DNS_GUARD_EXEMPT))
     secret_ref: Optional[str] = None   # key into the protected secret store
 
     @classmethod
@@ -68,4 +74,6 @@ class Profile:
             "no_vpn_bypass": self.no_vpn_bypass,
             "vpn_interface": self.vpn_interface,
             "log_adapter_activity": self.log_adapter_activity,
+            "dns_guard": self.dns_guard,
+            "dns_guard_exempt": list(self.dns_guard_exempt),
         }

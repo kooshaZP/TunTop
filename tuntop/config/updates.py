@@ -15,6 +15,7 @@ import json
 import os
 import re
 import urllib.request
+from typing import Optional
 
 __all__ = [
     "UpdateError", "StagedUpdate", "check_latest", "download_release",
@@ -65,9 +66,16 @@ def _bigger_then_strip(data: bytes, limit: int) -> bytes:
     return data
 
 
-def _fetch(url: str, limit: int) -> bytes:
+def _fetch(url: str, limit: int, timeout: Optional[int] = None) -> bytes:
+    """GET `url`, capped at `limit` bytes.
+
+    `timeout` overrides the module default so a CALLER can bound the wait:
+    the startup check runs inline, before the dashboard opens, and a
+    20-second network stall there would look like a hung app (it passes a
+    short one; the background download keeps the full default)."""
     req = urllib.request.Request(url, headers=_UA)
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+    with urllib.request.urlopen(
+            req, timeout=_TIMEOUT if timeout is None else timeout) as resp:
         if getattr(resp, "status", 200) != 200:
             raise UpdateError(f"HTTP {resp.status} for {url}")
         return _bigger_then_strip(resp.read(limit + 1), limit)
@@ -94,12 +102,16 @@ def _asset_url(tag: str, name: str) -> str:
     return (_ASSET_BASE + tag + "/" + name)
 
 
-def check_latest(current_version: str) -> dict:
+def check_latest(current_version: str,
+                 timeout: Optional[int] = None) -> dict:
     """Query the latest stable release. Returns a dict with keys:
     version, exe_url, checksum_url. Raises UpdateError on anything
-    unexpected (draft/prerelease, malformed tag, wrong asset set)."""
+    unexpected (draft/prerelease, malformed tag, wrong asset set).
+
+    `timeout` bounds the network wait (see _fetch) - the inline startup check
+    passes a short one so a stalled feed cannot hold up the launch."""
     current = _parse_version(current_version)
-    raw = _fetch(_API_URL, 1024 * 1024)
+    raw = _fetch(_API_URL, 1024 * 1024, timeout=timeout)
     try:
         rel = json.loads(raw.decode("utf-8"))
     except Exception as e:
@@ -160,7 +172,8 @@ def _verify_pe_header(blob: bytes) -> None:
         raise UpdateError("downloaded exe is not x64")
 
 
-def download_release(info: dict, directory: str) -> StagedUpdate:
+def download_release(info: dict, directory: str,
+                     timeout: Optional[int] = None) -> StagedUpdate:
     """Download TunTop.exe + checksums.txt, verify the SHA-256 and the PE
     header, then stage the exe as TunTop-<version>.exe inside `directory`
     (atomically, never overwriting a different file)."""
@@ -168,9 +181,10 @@ def download_release(info: dict, directory: str) -> StagedUpdate:
     target = os.path.join(directory, f"TunTop-{version}.exe")
     fd, tmp = tempfile_name(directory)
     try:
-        blob = _fetch(info["exe_url"], _MAX_EXE_BYTES)
+        blob = _fetch(info["exe_url"], _MAX_EXE_BYTES, timeout=timeout)
         _verify_pe_header(blob)
-        sums = _parse_checksums(_fetch(info["checksum_url"], _MAX_CHECKSUM_BYTES))
+        sums = _parse_checksums(_fetch(info["checksum_url"], _MAX_CHECKSUM_BYTES,
+                                       timeout=timeout))
         expected = sums.get(_EXE_NAME)
         if not expected:
             raise UpdateError("checksums.txt has no entry for TunTop.exe")
@@ -220,12 +234,13 @@ def tempfile_name(directory: str):
     return tempfile.mkstemp(prefix="tuntop_upd_", suffix=".part", dir=directory)
 
 
-def prepare_update(current_version: str, directory: str) -> StagedUpdate | None:
+def prepare_update(current_version: str, directory: str,
+                   timeout: Optional[int] = None) -> StagedUpdate | None:
     """End-to-end: check the latest release, download + verify + stage it.
     Returns None when already up to date or the check is inconclusive
     (offline); raises UpdateError for verification failures."""
     try:
-        info = check_latest(current_version)
+        info = check_latest(current_version, timeout=timeout)
     except UpdateError as e:
         if "unsupported release tag" in str(e) or "draft/prerelease" in str(e):
             return None
@@ -235,4 +250,4 @@ def prepare_update(current_version: str, directory: str) -> StagedUpdate | None:
     if not info["update_available"]:
         return None
     os.makedirs(directory, exist_ok=True)
-    return download_release(info, directory)
+    return download_release(info, directory, timeout=timeout)

@@ -29,9 +29,15 @@ class TestPollControlFileModeKeys(unittest.TestCase):
         os.close(fd)
         self.path = path
         self._saved = (helper.CONTROL_FILE, helper._control_mtime,
-                       copy.deepcopy(helper._live_mode))
+                       copy.deepcopy(helper._live_mode),
+                       helper._install_dns_guard)
         helper.CONTROL_FILE = path
         helper._control_mtime = 0.0
+        # The DNS guard (tuntop/network/dns_guard.py) writes HKLM\...\
+        # DnsPolicyConfig. An offline test must never reach the real registry:
+        # on an ELEVATED test machine a real install would pin the whole
+        # machine's name resolution to a tunnel that does not exist.
+        helper._install_dns_guard = lambda *a, **k: True
         helper._live_mode.update({
             "args": SimpleNamespace(vless_over_vpn=False,
                                     no_vpn_bypass=False, vpn_server=None),
@@ -41,7 +47,8 @@ class TestPollControlFileModeKeys(unittest.TestCase):
 
     def tearDown(self):
         h = self.helper
-        (h.CONTROL_FILE, h._control_mtime, h._live_mode) = self._saved
+        (h.CONTROL_FILE, h._control_mtime, h._live_mode,
+         h._install_dns_guard) = self._saved
         os.unlink(self.path)
 
     def _write(self, payload):
@@ -116,13 +123,17 @@ class TestPollControlFileServers(unittest.TestCase):
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         self.path = path
-        self._saved = (helper.CONTROL_FILE, helper._control_mtime)
+        self._saved = (helper.CONTROL_FILE, helper._control_mtime,
+                       helper._install_dns_guard)
         helper.CONTROL_FILE = path
         helper._control_mtime = 0.0
+        # Never reach the real NRPT registry from an offline test (see
+        # TestPollControlFileModeKeys).
+        helper._install_dns_guard = lambda *a, **k: True
 
     def tearDown(self):
         (h) = self.helper
-        (h.CONTROL_FILE, h._control_mtime) = self._saved
+        (h.CONTROL_FILE, h._control_mtime, h._install_dns_guard) = self._saved
         os.unlink(self.path)
 
     def _write(self, payload):
@@ -355,9 +366,13 @@ class TestVpnArrivalReapply(unittest.TestCase):
         os.close(fd)
         self.path = path
         self._saved = (helper.CONTROL_FILE, helper._control_mtime,
-                       copy.deepcopy(helper._live_mode))
+                       copy.deepcopy(helper._live_mode),
+                       helper._install_dns_guard)
         helper.CONTROL_FILE = path
         helper._control_mtime = 0.0
+        # Never reach the real NRPT registry from an offline test (see
+        # TestPollControlFileModeKeys).
+        helper._install_dns_guard = lambda *a, **k: True
         helper._live_mode.update({
             "args": SimpleNamespace(vless_over_vpn=False,
                                     no_vpn_bypass=False, vpn_server=None),
@@ -367,7 +382,8 @@ class TestVpnArrivalReapply(unittest.TestCase):
 
     def tearDown(self):
         h = self.helper
-        (h.CONTROL_FILE, h._control_mtime, h._live_mode) = self._saved
+        (h.CONTROL_FILE, h._control_mtime, h._live_mode,
+         h._install_dns_guard) = self._saved
         os.unlink(self.path)
 
     def _write(self, payload):

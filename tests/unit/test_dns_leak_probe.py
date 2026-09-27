@@ -182,6 +182,121 @@ class TestVerdictMatrix(unittest.TestCase):
         self.assertEqual(status, "dns-leak")
 
 
+class TestParallelResolverLeak(unittest.TestCase):
+    """The leak the TUN-only probes are structurally blind to: Windows' Smart
+    Multi-Homed Name Resolution sends EVERY query out over all connected
+    adapters and takes the first answer, so a DHCP-assigned physical resolver
+    can answer while the tunnel's own resolvers work perfectly. That is
+    exactly the "TunTop says no leak, dnsleaktest.com shows my ISP" case."""
+
+    def _run(self, others, guard, resolver="8.8.8.8", echo=None):
+        with mock.patch.object(L, "_system_resolver_ip",
+                               return_value=resolver), \
+             mock.patch.object(L, "_forced_path_echo_ip", return_value=echo):
+            return L.run_dns_leak_probe(
+                direct_ip="81.2.3.9", tunnel_ip="104.16.1.1",
+                expected_dns=["8.8.8.8"],
+                unguarded_resolvers=lambda: list(others),
+                guard_in_force=lambda: guard)
+
+    def test_physical_resolver_without_a_guard_is_a_leak(self):
+        status, msg, det = self._run(["Wi-Fi=192.168.1.1"], False)
+        self.assertEqual(status, "dns-leak")
+        self.assertIn("DNS LEAK", msg)
+        self.assertIn("Wi-Fi=192.168.1.1", msg)
+        self.assertEqual(det["unguarded_resolvers"], ["Wi-Fi=192.168.1.1"])
+
+    def test_guard_in_force_clears_it(self):
+        status, _msg, det = self._run(["Wi-Fi=192.168.1.1"], True)
+        self.assertEqual(status, "ok")
+        # With the rule in force the adapter probe is not even needed.
+        self.assertNotIn("unguarded_resolvers", det)
+
+    def test_no_other_resolvers_is_clean(self):
+        status, _msg, _det = self._run([], False)
+        self.assertEqual(status, "ok")
+
+    def test_untested_by_default(self):
+        """Callers that pass no probes get the old behaviour - the verdict
+        must not change for them."""
+        with mock.patch.object(L, "_system_resolver_ip",
+                               return_value="8.8.8.8"), \
+             mock.patch.object(L, "_forced_path_echo_ip", return_value=None):
+            status, _msg, det = L.run_dns_leak_probe(
+                direct_ip="81.2.3.9", tunnel_ip="104.16.1.1",
+                expected_dns=["8.8.8.8"])
+        self.assertEqual(status, "ok")
+        self.assertNotIn("unguarded_resolvers", det)
+
+    def test_a_broken_probe_cannot_invent_a_leak(self):
+        def boom():
+            raise OSError("powershell missing")
+        with mock.patch.object(L, "_system_resolver_ip",
+                               return_value="8.8.8.8"), \
+             mock.patch.object(L, "_forced_path_echo_ip", return_value=None):
+            status, _msg, _det = L.run_dns_leak_probe(
+                direct_ip="81.2.3.9", tunnel_ip="104.16.1.1",
+                expected_dns=["8.8.8.8"],
+                unguarded_resolvers=boom, guard_in_force=lambda: False)
+        self.assertEqual(status, "ok")
+
+    def test_a_broken_guard_probe_is_unknown_never_a_leak(self):
+        """A guard probe that RAISES is the absence of evidence, not evidence
+        of a leak. This used to be asserted as 'dns-leak', which meant any
+        PowerShell hiccup on the machine produced a confirmed-leak verdict
+        against a tunnel that was doing nothing wrong."""
+        def boom():
+            raise OSError("powershell missing")
+        with mock.patch.object(L, "_system_resolver_ip",
+                               return_value="8.8.8.8"), \
+             mock.patch.object(L, "_forced_path_echo_ip", return_value=None):
+            status, msg, det = L.run_dns_leak_probe(
+                direct_ip="81.2.3.9", tunnel_ip="104.16.1.1",
+                expected_dns=["8.8.8.8"],
+                unguarded_resolvers=lambda: ["Wi-Fi=192.168.1.1"],
+                guard_in_force=boom)
+        # Neither "protected" nor "leaking" - the adapters are named, the
+        # reason the state is unknown is stated, and detail carries the tri-state.
+        self.assertEqual(status, "unknown")
+        self.assertNotIn("DNS LEAK", msg)
+        self.assertIn("UNKNOWN", msg)
+        self.assertIn("Wi-Fi=192.168.1.1", msg)
+        self.assertIsNone(det["guard_in_force"])
+        self.assertEqual(det["unguarded_resolvers"], ["Wi-Fi=192.168.1.1"])
+
+    def test_a_guard_probe_that_ran_and_said_no_IS_a_leak(self):
+        """The other half of the tri-state: a probe that actually ran and
+        reported no pin in force is real evidence, and must still fail."""
+        with mock.patch.object(L, "_system_resolver_ip",
+                               return_value="8.8.8.8"), \
+             mock.patch.object(L, "_forced_path_echo_ip", return_value=None):
+            status, msg, det = L.run_dns_leak_probe(
+                direct_ip="81.2.3.9", tunnel_ip="104.16.1.1",
+                expected_dns=["8.8.8.8"],
+                unguarded_resolvers=lambda: ["Wi-Fi=192.168.1.1"],
+                guard_in_force=lambda: False)
+        self.assertEqual(status, "dns-leak")
+        self.assertIs(det["guard_in_force"], False)
+
+    def test_no_guard_probe_at_all_is_unknown_not_a_leak(self):
+        """Injected adapters but no guard probe: the fan-out cannot be
+        ruled out, and cannot be asserted either."""
+        with mock.patch.object(L, "_system_resolver_ip",
+                               return_value="8.8.8.8"), \
+             mock.patch.object(L, "_forced_path_echo_ip", return_value=None):
+            status, msg, det = L.run_dns_leak_probe(
+                direct_ip="81.2.3.9", tunnel_ip="104.16.1.1",
+                expected_dns=["8.8.8.8"],
+                unguarded_resolvers=lambda: ["Wi-Fi=192.168.1.1"])
+        self.assertEqual(status, "unknown")
+        self.assertIn("not checked", msg)
+        self.assertIsNone(det["guard_in_force"])
+
+    def test_leak_evidence_still_wins(self):
+        status, _msg, _det = self._run([], False, echo="81.2.3.4")
+        self.assertEqual(status, "dns-leak")
+
+
 class TestSingleImplementation(unittest.TestCase):
     def test_monitor_reexports_dns_probe(self):
         self.assertIs(ML.run_dns_leak_probe, L.run_dns_leak_probe)

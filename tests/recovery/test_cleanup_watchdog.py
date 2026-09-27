@@ -181,6 +181,36 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
                                      probes=p)
         self.assertIsNotNone(read_marker(path))  # marker KEPT
 
+    def test_leftover_dns_guard_is_removed(self):
+        """A hard-killed run can leave the catch-all NRPT rule installed. It
+        rewrites name resolution for EVERY process on the machine, so the
+        detached watchdog - the only thing still alive after the dashboard is
+        killed - has to take it down with the routes."""
+        path = make_marker(pid=999)
+        p, state = self._make_probes()
+        p.dns_guard_present = MagicMock(return_value=True)
+        p.remove_dns_guard = MagicMock(return_value=True)
+        with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
+                   return_value=0):
+            sweep_after_unclean_exit(999, hosts=(), marker_path=path,
+                                     probes=p)
+        p.remove_dns_guard.assert_called_once()
+
+    def test_no_guard_means_no_guard_removal(self):
+        path = make_marker(pid=999)
+        p, state = self._make_probes()
+        p.dns_guard_present = MagicMock(return_value=False)
+        p.remove_dns_guard = MagicMock(return_value=True)
+        with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
+                   return_value=0):
+            sweep_after_unclean_exit(999, hosts=(), marker_path=path,
+                                     probes=p)
+        p.remove_dns_guard.assert_not_called()
+
     def test_helper_killed_before_sweep(self):
         """The watchdog must kill the helper BEFORE scanning/sweeping."""
         call_order = []

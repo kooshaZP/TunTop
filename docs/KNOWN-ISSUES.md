@@ -27,6 +27,21 @@ update the matrix row instead of opening a duplicate issue.
   expect a clean DEGRADED state with a readable reason, not a hang.
 - **DNS failures**: DoH fallback exists; total DNS loss should show
   RESOLVING → FAILED with a retry, never a silent stuck STARTING.
+- **DNS leak guard (1.0.40)**: the catch-all NRPT rule makes system name
+  resolution depend on the tunnel, which is fail-closed by design. Three
+  consequences to expect: (a) an internal/LAN-only name that only the
+  router resolver answers will NXDOMAIN while the tunnel is up - add
+  `--dns-guard-exempt <domain>` (`.local` is always exempt) or
+  `--no-dns-guard`; (b) a hard kill (Task Manager, power loss) can leave the
+  rule behind, so DNS would stay pinned to a dead tunnel - startup recovery
+  and the cleanup watchdog both remove it, and the next launch says so in
+  its log. If a removal cannot actually complete (PowerShell unavailable, key
+  removal denied), it is now reported as a **failure** and the install record
+  is **kept**, so the next launch retries; it is never reported as a clean
+  "removed" with the rule still in place. If DNS breaks after quitting TunTop,
+  run TunTop once more and report it; (c) deliberately running
+  `--no-dns-guard` shows `[C]` as "DISABLED by choice" (a pass), not as a
+  failed guard - a real failure and a deliberate opt-out are distinguishable.
 - **Sleep/wake**: adapters can vanish and routes can be flushed by Windows.
   The next health poll must classify this as ADAPTER/ROUTES failure and
   recover with backoff.

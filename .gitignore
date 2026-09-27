@@ -15,6 +15,7 @@ crash_*.txt
 *.log
 .last_run.json
 .tuntop_control.json
+.tuntop_dns_guard.json
 
 # --- caches ---------------------------------------------------------------
 __pycache__/

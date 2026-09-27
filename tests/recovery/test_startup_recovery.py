@@ -16,9 +16,11 @@ from tuntop.startup_recovery import (
 )
 
 
-def make_probes(orphans=0, wintun_routes=0, host_routes=(), fail=None):
+def make_probes(orphans=0, wintun_routes=0, host_routes=(), fail=None,
+                dns_guard=False, guard_removes=True):
     """Fake probes with call recording. `fail` = set of probe names that
-    raise, to verify scan/recover survive broken probes."""
+    raise, to verify scan/recover survive broken probes. `dns_guard` fakes a
+    leftover NRPT rule from a hard-killed run."""
     calls = []
 
     def guard(name, fn):
@@ -29,7 +31,8 @@ def make_probes(orphans=0, wintun_routes=0, host_routes=(), fail=None):
             return fn(*a, **kw)
         return run
 
-    state = {"killed": None, "torn_down": False, "swept": None}
+    state = {"killed": None, "torn_down": False, "swept": None,
+             "guard_removed": None}
 
     p = Probes(
         tun2socks_count=guard("tun2socks_count", lambda: orphans),
@@ -43,6 +46,11 @@ def make_probes(orphans=0, wintun_routes=0, host_routes=(), fail=None):
         sweep_host_routes=guard("sweep",
                                 lambda routes: state.update(swept=routes)
                                 or len(routes)),
+        dns_guard_present=guard("dns_guard_present", lambda: dns_guard),
+        remove_dns_guard=guard("remove_dns_guard",
+                               lambda: state.update(
+                                   guard_removed=guard_removes)
+                               or guard_removes),
     )
     return p, calls, state
 
@@ -189,6 +197,73 @@ class TestRecover(unittest.TestCase):
                 probes=p,
                 progress=lambda done, total, label: seen.append((done, total)))
         self.assertEqual(seen, [(0, 2), (1, 2)])
+
+
+class TestDnsGuardRecovery(unittest.TestCase):
+    """A leftover catch-all NRPT rule from a hard-killed run keeps rewriting
+    name resolution for EVERY process on the machine, pinning it to a tunnel
+    that no longer exists. The next launch must remove it - and must do so
+    FIRST, before spending time on routes."""
+
+    def test_leftover_guard_alone_is_dirty(self):
+        p, _, _ = make_probes(dns_guard=True)
+        f = scan(probes=p, marker_path=os.path.join(tempfile.mkdtemp(),
+                                                    "none.json"))
+        self.assertTrue(f.dns_guard)
+        self.assertTrue(f.dirty)
+        self.assertIn("DNS leak-guard", " ".join(f.summary_lines()))
+
+    def test_no_guard_is_not_dirty(self):
+        p, _, _ = make_probes()
+        f = scan(probes=p, marker_path=os.path.join(tempfile.mkdtemp(),
+                                                    "none.json"))
+        self.assertFalse(f.dns_guard)
+        self.assertFalse(f.dirty)
+
+    def test_guard_is_removed_before_the_route_work(self):
+        p, calls, state = make_probes(dns_guard=True, wintun_routes=4)
+        actions = recover(StartupFindings(dns_guard=True, wintun_routes=4),
+                          probes=p)
+        self.assertTrue(state["guard_removed"])
+        self.assertIn("NRPT rule removed", actions[0])
+        names = [c[0] for c in calls]
+        self.assertLess(names.index("remove_dns_guard"),
+                        names.index("teardown"))
+
+    def test_failing_removal_is_reported_not_raised(self):
+        p, _, state = make_probes(dns_guard=True, guard_removes=False)
+        actions = recover(StartupFindings(dns_guard=True), probes=p)
+        self.assertFalse(state["guard_removed"])
+        self.assertTrue(any("reported failure" in a for a in actions))
+
+    def test_broken_probe_degrades_to_nothing_found(self):
+        """Guessing 'probably installed' would mean deleting a rule on
+        evidence we do not have - an unreadable registry must report clean."""
+        p, _, _ = make_probes(fail={"dns_guard_present"})
+        f = scan(probes=p, marker_path=os.path.join(tempfile.mkdtemp(),
+                                                    "none.json"))
+        self.assertFalse(f.dns_guard)
+
+    def test_probe_without_a_remover_is_reported(self):
+        p, _, _ = make_probes(dns_guard=True)
+        p.remove_dns_guard = None
+        actions = recover(StartupFindings(dns_guard=True), probes=p)
+        self.assertTrue(any("no DNS-guard probe" in a for a in actions))
+
+    def test_scan_without_a_guard_probe_is_skipped(self):
+        """Probes without the optional attribute keep working unchanged."""
+        p, _, _ = make_probes()
+        p.dns_guard_present = None
+        f = scan(probes=p, marker_path=os.path.join(tempfile.mkdtemp(),
+                                                    "none.json"))
+        self.assertFalse(f.dns_guard)
+
+    def test_startup_recover_removes_a_leftover_guard(self):
+        path = os.path.join(tempfile.mkdtemp(), "marker.json")
+        p, _, state = make_probes(dns_guard=True)
+        actions = startup_recover(probes=p, marker_path=path)
+        self.assertTrue(state["guard_removed"])
+        self.assertTrue(any("NRPT" in a for a in actions))
 
 
 class TestOneCallConvenience(unittest.TestCase):

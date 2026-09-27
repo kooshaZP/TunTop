@@ -24,11 +24,25 @@ v2rayN, Xray, sing-box, Clash Meta — any proxy client with a local SOCKS5 inbo
 ## Features
 
 - IPv4 and IPv6 full-tunnel routing via Wintun + tun2socks
-- DNS resolution fallback (UDP/53 + DoH) with active leak detection —
-  and an optional `--dns-policy strict` that refuses to resolve outside
-  a live tunnel instead of falling back. Wintun is preferred as the
-  OS DNS source (lowered interface metric) so a physical adapter's
-  on-link resolver can't win; `[L]` proves nothing escapes.
+- **Real DNS-leak protection.** While a tunnel is up TunTop installs a
+  catch-all Name Resolution Policy Table (NRPT) rule pinning every name to
+  the tunnel resolvers, so Windows' Smart Multi-Homed Name Resolution can
+  no longer ask a DHCP-assigned physical adapter's resolver in parallel and
+  let the ISP answer (`.local` stays exempt for mDNS printers/NAS).
+  Removed by every exit path — stop, close, Ctrl-C, crash; a removal that
+  cannot complete is reported as a failure and retried next launch rather than
+  quietly forgotten. Opt out with
+  `--no-dns-guard` (the `[C]` row then reads "DISABLED by choice", not a
+  failure); keep a LAN-only domain resolvable with
+  `--dns-guard-exempt <domain>`. Checked by the `[C]` row "DNS leak
+  protection (catch-all NRPT rule)" and by `[L]` — which reports a confirmed
+  `DNS leak` only when it can establish no catch-all rule is in force, and
+  `unknown` (naming the adapters and why) when the guard state can't be read.
+- DNS resolution fallback (UDP/53 + DoH) — and an optional
+  `--dns-policy strict` that refuses to resolve outside a live tunnel
+  instead of falling back. Wintun is also preferred as the OS DNS source
+  (lowered interface metric) so a physical adapter's on-link resolver
+  can't win; `[L]` proves nothing escapes.
 - Optional adapter-activity logging (`--log-adapter-activity`) — UDP/QUIC
   connections, ICMP counter deltas and Wintun throughput deltas land in the
   structured event log (off by default; saved in your profile)
@@ -279,6 +293,7 @@ tuntop/
   network/                 <- routing / DNS / VPN (Windows edge)
     routing.py             <- netsh/PowerShell route engine
     dns.py                 <- DNS resolver with cache
+    dns_guard.py           <- catch-all NRPT DNS pin (leak protection)
     vpn.py                 <- VPN detection / coexistence
   tunnel/                  <- Wintun + tun2socks (Windows edge)
     helper.py              <- tunnel builder + self-heal monitor

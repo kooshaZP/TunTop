@@ -12,6 +12,7 @@ Instead, email the maintainer directly or use GitHub's private vulnerability rep
 
 - TunTop runs as Administrator and modifies the Windows routing table. Any bug that could allow unintended route changes, traffic interception, or privilege escalation is a security issue.
 - The binary integrity check (`tuntop/integrity.py`) verifies vendored `tun2socks.exe` and `wintun.dll` against pinned SHA-256 hashes. Bypassing or weakening this check is a security concern.
+- The DNS leak guard (`tuntop/network/dns_guard.py`) writes a catch-all NRPT rule into `HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig` while a tunnel is up. Two properties matter: it must only ever touch `TunTop-*` keys (a foreign rule — a corporate VPN's, DirectAccess's — must never be deleted), and it must be removed on every exit path, because a surviving rule keeps rewriting name resolution for every process on the machine. Failing either is a security issue; `--no-dns-guard` exists for users who opt out deliberately.
 - Profile files (`MyTunTopProfile.json`) intentionally contain no secrets — only server addresses, ports, and settings. If sensitive data ever ends up in profiles, that is a bug.
 
 ## Scope

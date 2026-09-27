@@ -37,23 +37,58 @@ helper now falls back to Wi-Fi (and re-rides the VPN) automatically when
 the VPN flaps.
 
 ### Is my DNS leaking?
-TunTop actively DETECTS leaks: the monitor loop continuously compares the
-direct and tunnel exit IPs and logs `[MONITOR] leak check ...`, and `[L]`
-runs the test on demand. TunTop also makes Wintun the OS-selected DNS source:
-at bring-up it lowers Wintun's `InterfaceMetric` (below the VPN's and the
-physical adapter's), so Windows picks Wintun — not a DHCP-assigned physical
-NIC — when building its DNS server-selection order for the configured
-resolvers. The `[C]` health row "DNS configuration (Wintun is selected
-source)" proves that selection (it fails if Windows would reach a resolver
-through any other interface).
+Two different things can leak, and TunTop now handles both.
 
-For resolution itself, TunTop's fallback stack (UDP/53 and DoH) prioritizes
-availability over privacy: if the system resolver fails while the tunnel is
-up, those fallback queries can leave over the physical NIC. That is deliberate
-(a dead lookup helps nobody) - run with `--dns-policy strict` if you want the
-opposite trade: while a tunnel is live, resolution that cannot stay inside the
-tunnel is simply reported as failed instead of escaping. `[L]` is the backstop
-proof that no DNS escaped the tunnel even in the fallback modes.
+**1. Windows asking somebody else (the real one).** Making Wintun the preferred
+DNS source is an *ordering*, not an exclusion: Windows enables Smart Multi-Homed
+Name Resolution (SMHNR) by default, so the DNS client sends each query out over
+**every** connected interface that publishes resolvers and takes the first
+answer. A DHCP-assigned router resolver (`192.168.1.1`) is on-link, so the
+tunnel's split-default routes never capture it — the router/ISP answer can win.
+Browser leak tests see exactly that; TunTop's older probes could not, because
+they only tested the resolvers TunTop itself knows about.
+
+So while a tunnel is up TunTop installs a **catch-all Name Resolution Policy
+Table (NRPT) rule** that claims the root namespace and pins every name to the
+tunnel resolvers (`TunTop-Match` under
+`HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig`).
+That stops the fan-out whether or not SMHNR is on. A `.local` exemption ships
+with it so mDNS printers/NAS keep working.
+
+- Check it any time: the `[C]` row **"DNS leak protection (catch-all NRPT
+  rule)"**. It passes only when the rule exists *and* Windows' own effective
+  NRPT policy carries it, and on failure it names the adapters still publishing
+  resolvers (`Wi-Fi=192.168.1.1`, …). The adjacent "DNS configuration (Wintun is
+  selected source)" row proves the *configured* resolvers ride the TUN.
+- `[L]`'s DNS test also catches this case, naming the adapters. It only reports
+  a confirmed **DNS leak** when it can actually establish that no catch-all rule
+  is in force; if the guard state cannot be read (PowerShell missing, probe
+  failed) it reports **DNS leak UNKNOWN** and says why, rather than blaming a
+  healthy tunnel. Only adapters that are currently **Up** count — a stale
+  resolver on an unplugged NIC is not a leak source, because Windows never
+  queries a disconnected adapter.
+- The rule is removed by **every** exit path: a normal stop, the `[X]`/close
+  button, Ctrl-C, a crash (the next launch and the detached cleanup watchdog
+  both remove it before anything else). If a removal cannot complete, it is
+  reported as a *failure* and the install record is kept, so the next launch
+  retries instead of a stale pin being quietly forgotten.
+- It lives only as long as the tunnel. If you quit TunTop and your DNS breaks,
+  a rule survived - start TunTop again (startup recovery removes it) and report
+  it.
+- Escape hatches: `--no-dns-guard` turns the pin off (and removes any leftover
+  rule) - the `[C]` row then reads "DISABLED by choice" rather than a red
+  failure, so opting out is never mistaken for a broken guard;
+  `--dns-guard-exempt home.example` keeps a domain resolvable by the LAN
+  resolver while the guard is up (repeatable, and `.local` is always exempt).
+
+**2. TunTop's own fallback stack.** For resolution itself, the fallback stack
+(UDP/53 and DoH) prioritizes availability over privacy: if the system resolver
+fails while the tunnel is up, those fallback queries can leave over the physical
+NIC. That is deliberate (a dead lookup helps nobody) - run with
+`--dns-policy strict` if you want the opposite trade: while a tunnel is live,
+resolution that cannot stay inside the tunnel is simply reported as failed
+instead of escaping. `[L]` is the backstop proof that no DNS escaped the tunnel
+even in the fallback modes.
 
 ### Health scan shows failing probes
 Press `[D]` to export diagnostics — it captures your config, routes, logs, and the last scan. Attach it to a GitHub issue for fastest help.

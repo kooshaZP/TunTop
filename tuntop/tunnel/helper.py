@@ -79,6 +79,7 @@ from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
     WINTUN4_NET, WINTUN6_NET,
 )
 from tuntop.network import egress_scripts as _es
+from tuntop.network import dns_guard as _dns_guard  # noqa: E402  (DNS leak guard)
 from tuntop.network.routeops import RouteLedger, RouteResult, sweeps as _rsweeps  # noqa: E402
 from tuntop.tunnel.exec import (  # noqa: E402  (moved Phase 4: state-free primitives)
     run, ps_json, run_ps, _clean_err, _NO_WINDOW,
@@ -132,6 +133,18 @@ _ACTIVE_DNS_MODE = "plain"
 #: control channel and any future self-heal resolver must honor it.
 _ACTIVE_DNS_POLICY = "availability"
 _ACTIVE_DOH_TEMPLATE = None
+# ── DNS leak guard state ────────────────────────────────────────────────────
+# While the tunnel is up, a catch-all NRPT rule pins the Windows DNS client
+# to the resolvers above (see tuntop/network/dns_guard.py). On by default:
+# without it Windows queries every adapter's resolver in parallel (Smart
+# Multi-Homed Name Resolution) and a DHCP-assigned physical resolver answers
+# first - the "the app's test says no leak but dnsleaktest.com shows my ISP"
+# bug. `_ACTIVE_DNS_GUARD` mirrors --dns-guard/--no-dns-guard;
+# `_ACTIVE_DNS_GUARD_EXEMPT` mirrors the repeatable --dns-guard-exempt.
+_ACTIVE_DNS_GUARD = True
+_ACTIVE_DNS_GUARD_EXEMPT = []
+#: Last guard state reported, so the monitor's re-assert only logs changes.
+_dns_guard_state = None
 
 added_routes = RouteLedger("helper")
 geoip_added = RouteLedger("geo")   # country-range bypass routes from --geoip (potentially thousands)
@@ -264,6 +277,10 @@ def poll_control_file():
     if dns_changed:
         try:
             configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
+            # Re-pin the catch-all NRPT rule to the NEW resolver(s): leaving
+            # the old pin in place would keep sending every query to the
+            # previous server while wintun's adapter list says otherwise.
+            _install_dns_guard()
         except Exception as e:
             print(f"[!] Live DNS re-apply failed: {e}", flush=True)
     return True
@@ -1045,7 +1062,6 @@ def configure_tun(dns4=None, dns6=None):
     the hardcoded DNS4/DNS6 defaults - the old `dns6 = dns6 or DNS6` fallback
     made a v4-only DNS choice impossible."""
     mode = _ACTIVE_DNS_MODE
-    template = _ACTIVE_DOH_TEMPLATE or _doh_template_for(dns4)
 
     _set_wintun_addresses_plain(dns4, dns6)
 
@@ -1056,20 +1072,45 @@ def configure_tun(dns4=None, dns6=None):
     else:
         print("[*] NetBIOS disable on wintun skipped/unavailable (non-fatal).")
 
-    if mode == "doh" and dns4 and template:
-        # Only the DNS families the user actually chose land on the adapter.
-        if _register_doh_server(dns4, template) \
-                and _set_wintun_dns_servers([s for s in (dns4, dns6) if s]):
-            print(f"[*] Wintun DNS set to DoH: {dns4} -> {template} (TCP/443)")
-        else:
-            print(f"[!] DoH enable failed for {dns4}; falling back to plain UDP DNS.")
-        # Put the IPv6 resolver on DoH too when we know its template - with
-        # the old code DNS6 stayed on raw UDP/53 even in DoH mode, and on
-        # SOCKS setups whose UDP relay is broken ("client handshake: EOF")
-        # every v6 lookup died inside the TUN.
+    if mode == "doh":
+        # BUG FIX (1.0.40): this block used to be gated on `dns4 and
+        # template`, so a v6-ONLY DNS choice (--dns6 <ip> alone, the supported
+        # "IPv6 DNS only" selection) never registered DoH for anything and
+        # silently stayed on raw UDP/53 - which is exactly the path that dies
+        # inside a TUN whose SOCKS proxy has no UDP relay. Register EVERY
+        # family the user chose that has a known template, then set the
+        # adapter's server list once (Set-DnsClientServerAddress REPLACES the
+        # whole list, so the two registrations must be followed by ONE set).
+        registered = []
+        failed = []
+        t4 = _ACTIVE_DOH_TEMPLATE or _doh_template_for(dns4)
+        if dns4:
+            if t4 and _register_doh_server(dns4, t4):
+                registered.append((dns4, t4))
+            else:
+                failed.append(dns4)
         t6 = _ACTIVE_DOH_TEMPLATE or _doh_template_for(dns6)
-        if dns6 and t6 and _register_doh_server(dns6, t6):
-            print(f"[*] Wintun DNS6 set to DoH: {dns6} -> {t6} (TCP/443)")
+        if dns6:
+            if t6 and _register_doh_server(dns6, t6):
+                registered.append((dns6, t6))
+            else:
+                failed.append(dns6)
+        chosen = [s for s in (dns4, dns6) if s]
+        if registered and _set_wintun_dns_servers(chosen):
+            for ip, tmpl in registered:
+                print(f"[*] Wintun DNS set to DoH: {ip} -> {tmpl} (TCP/443)")
+        elif chosen:
+            print(f"[!] DoH enable failed for {', '.join(chosen)}; falling back "
+                  "to plain UDP DNS (the addresses set above stay as-is).")
+        # Per-family failures are reported separately: the success line above
+        # only names the families that DID register, so without this a v4
+        # registration that failed next to a v6 one that succeeded was
+        # silently downgraded to raw UDP/53 - the exact path that dies inside
+        # a TUN whose SOCKS proxy has no UDP relay.
+        if failed:
+            print(f"[!] DoH registration FAILED for {', '.join(failed)} - "
+                  f"those resolver(s) stay on raw UDP/53 and may fail to "
+                  f"resolve through the tunnel.", flush=True)
     elif mode == "auto":
         # Start plain; the monitor/verify loop escalates to DoH if plain DNS
         # through the TUN proves unreliable.
@@ -1086,6 +1127,128 @@ def configure_tun(dns4=None, dns6=None):
     # converge on identical precedence. Re-applied by wait_for_tunnel_stable's
     # DoH re-call and by self_heal_tunnel() (both go through configure_tun()).
     _set_wintun_interface_metric(2)
+
+
+# ── DNS leak guard (catch-all NRPT rule) ────────────────────────────────────
+# Keeps the Windows DNS client from querying a physical adapter's resolver in
+# parallel with the tunnel's (Smart Multi-Homed Name Resolution) - the real
+# "dnsleaktest.com shows my ISP while TunTop's own test says no leak" bug.
+# Installed once the TUN routes are live (see main), re-asserted by
+# self_heal_tunnel / the monitor loop / a live [N] DNS change, and removed by
+# EVERY teardown path (cleanup() here; plus the watchdog, startup recovery and
+# the dashboard's stop/quit sweeps for hard kills).
+# See tuntop/network/dns_guard.py.
+
+def _dns_guard_exempt():
+    """Namespaces Windows must keep resolving while the guard is up: the
+    always-on mDNS (.local) exemption plus the user's --dns-guard-exempt
+    entries (a home/corporate domain only a LAN resolver can answer)."""
+    out = []
+    for name in (list(_dns_guard.DEFAULT_EXEMPT_NAMESPACES)
+                 + list(_ACTIVE_DNS_GUARD_EXEMPT or [])):
+        n = str(name).strip().lower()
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def _dns_guard_report(ok, msg, verbose):
+    """Print the guard's state, but only when it CHANGED (the monitor
+    re-assert calls this on every healthy cycle)."""
+    global _dns_guard_state
+    state = "on" if ok else "failed"
+    if verbose or state != _dns_guard_state:
+        if ok:
+            print(f"[*] DNS leak guard: Windows DNS pinned to {msg} - the "
+                  "catch-all NRPT rule stops Windows querying a physical "
+                  "adapter's resolver in parallel.", flush=True)
+        else:
+            print(f"[!] DNS leak guard NOT active: {msg} - Windows may still "
+                  "ask a physical adapter's resolver in parallel (a real "
+                  "leak).", flush=True)
+    _dns_guard_state = state
+
+
+def _install_dns_guard(verbose=True):
+    """Install/refresh the catch-all NRPT rule pinning DNS to the tunnel
+    resolvers. Returns True when the guard is in place.
+
+    Never fatal by design: refusing to bring the tunnel up because a registry
+    write was blocked would be worse than the leak - the failure is reported
+    loudly instead (and the dashboard's DNS-leak-protection row keeps saying
+    so)."""
+    if not _ACTIVE_DNS_GUARD:
+        # Disabled (--no-dns-guard, or turned off live): make sure a previous
+        # run's rule cannot keep hijacking name resolution.
+        try:
+            ok, msg = _dns_guard.ensure_removed()
+        except Exception as e:
+            ok, msg = False, str(e)
+        if verbose or _dns_guard_state != "off":
+            if ok:
+                print("[*] DNS leak guard: disabled (--no-dns-guard) - Windows "
+                      "may query a physical adapter's resolver in parallel.",
+                      flush=True)
+            else:
+                print(f"[!] DNS leak guard: could not remove the previous rule:"
+                      f" {msg}", flush=True)
+        _dns_guard_state = "off"
+        return False
+    resolvers = _dns_guard.guard_resolvers(_ACTIVE_DNS4, _ACTIVE_DNS6)
+    if not resolvers:
+        # No resolver to pin: a rule with an empty server list would black
+        # hole resolution, so keep DNS unguarded and say so.
+        try:
+            _dns_guard.ensure_removed()
+        except Exception:
+            pass
+        if verbose or _dns_guard_state not in ("none", "off"):
+            print("[i] DNS leak guard: skipped - no DNS resolver is "
+                  "configured for the Wintun adapter.", flush=True)
+        _dns_guard_state = "none"
+        return False
+    try:
+        ok, msg = _dns_guard.ensure_installed(_ACTIVE_DNS4, _ACTIVE_DNS6,
+                                              _dns_guard_exempt())
+    except Exception as e:
+        ok, msg = False, str(e)
+    _dns_guard_report(bool(ok), msg, verbose)
+    return bool(ok)
+
+
+def _dns_guard_reassert():
+    """Cheap periodic check for the monitor loop: the catch-all rule can be
+    wiped mid-session (a VPN client's own NRPT rule, a Group Policy refresh,
+    another tool's cleanup) and the leak silently comes back. Only shells out
+    for the fix when the guard is actually missing."""
+    if not _ACTIVE_DNS_GUARD:
+        return
+    try:
+        ok, state = _dns_guard.detect()
+    except Exception:
+        return
+    if ok and state.get("ok"):
+        _dns_guard_report(True, state.get("servers") or "the tunnel resolvers",
+                          False)
+        return
+    _install_dns_guard(verbose=False)
+
+
+def _remove_dns_guard(verbose=True):
+    """Remove the catch-all rule and its record (teardown). Idempotent and
+    safe when the guard was never installed. Returns True when nothing of
+    ours is left on the system."""
+    global _dns_guard_state
+    try:
+        ok, msg = _dns_guard.ensure_removed()
+    except Exception as e:
+        ok, msg = False, str(e)
+    if not ok and verbose:
+        print(f"[!] DNS leak guard removal failed: {msg} - a stale NRPT rule "
+              "may keep DNS pinned until the next TunTop start (which "
+              "removes it during startup recovery).", flush=True)
+    _dns_guard_state = None
+    return bool(ok)
 
 
 def get_existing_v4_routes(dest):
@@ -2803,6 +2966,10 @@ def cleanup():
     # Restore the physical (geo) interface metric we may have lowered to beat a
     # self-healing Windows VPN, before touching any other state.
     restore_physical_metric()
+    # Drop the DNS leak guard right away: it rewrites system-wide name
+    # resolution, so it must not outlive the tunnel even if the OS kills this
+    # process during the longer route sweeps below.
+    _remove_dns_guard()
 
     # ORDER MATTERS (this was the Alt+F4 hole): cleanup() runs inside the
     # console-close window, and the OS may kill us mid-way when it expires.
@@ -3128,6 +3295,10 @@ def self_heal_tunnel(dns4, dns6):
             print("[!] Self-heal: Wintun adapter is gone; cannot re-apply routes.")
             return
         configure_tun(dns4, dns6)
+        # Self-heal implies the TUN routes are being re-asserted, so make sure
+        # the DNS pin is still there too (a wipe of the NRPT rule is exactly
+        # the kind of silent state loss this path exists to repair).
+        _install_dns_guard(verbose=False)
         ensure_wintun_ipv4()
         add_v4("0.0.0.0/0", TUN, TUN4, metric=1)
         for prefix in ("0.0.0.0/1", "128.0.0.0/1"):
@@ -3264,6 +3435,23 @@ def main():
     ap.add_argument("--doh-template", default=None, metavar="URL",
                     help="Override the DoH template URL (e.g. https://dns.google/dns-query). "
                          "Auto-selected from the DNS IP when omitted.")
+    ap.add_argument("--dns-guard", action="store_true", dest="dns_guard",
+                    default=True,
+                    help="(Default) Install a catch-all NRPT rule for as long "
+                         "as the tunnel is up, pinning the Windows DNS client "
+                         "to the Wintun resolvers so a DHCP-assigned physical "
+                         "resolver can never be queried in parallel (the real "
+                         "DNS leak). A .local (mDNS) exemption is installed "
+                         "alongside it; every teardown path removes the rule.")
+    ap.add_argument("--no-dns-guard", action="store_false", dest="dns_guard",
+                    help="Do not pin the OS DNS client (leave Windows free to "
+                         "query every adapter's resolver in parallel - the "
+                         "legacy behavior, leaks on multi-homed machines).")
+    ap.add_argument("--dns-guard-exempt", action="append", default=[],
+                    metavar="DOMAIN",
+                    help="Extra domain that must stay resolvable by the LAN/"
+                         "router resolver while the DNS guard is up (repeatable; "
+                         ".local is always exempt).")
     ap.add_argument("--bypass-ip", action="append", default=[], metavar="HOST_OR_IP",
                     help="Additional IP(s) or hostname(s) to bypass the TUN (repeatable)")
     ap.add_argument("--proxy2-port", type=int, default=None, metavar="PORT",
@@ -3332,6 +3520,7 @@ def main():
     # uses them instead of falling back to the hardcoded DNS4/DNS6 defaults.
     global _ACTIVE_DNS4, _ACTIVE_DNS6, _ACTIVE_DNS_MODE, _ACTIVE_DOH_TEMPLATE
     global _ACTIVE_DNS_POLICY
+    global _ACTIVE_DNS_GUARD, _ACTIVE_DNS_GUARD_EXEMPT
     global _control_mtime
     global vpn_override_iface
     _ACTIVE_DNS_POLICY = args.dns_policy
@@ -3346,6 +3535,15 @@ def main():
         print("[*] DNS: none set")
     _ACTIVE_DNS_MODE = args.dns_mode
     _ACTIVE_DOH_TEMPLATE = args.doh_template
+    # DNS leak guard (--dns-guard / --no-dns-guard, --dns-guard-exempt): the
+    # catch-all NRPT pin installed once the TUN routes are live.
+    _ACTIVE_DNS_GUARD = bool(getattr(args, "dns_guard", True))
+    _ACTIVE_DNS_GUARD_EXEMPT = [str(x).strip().lower()
+                                for x in (getattr(args, "dns_guard_exempt", [])
+                                          or []) if str(x).strip()]
+    if not _ACTIVE_DNS_GUARD:
+        print("[*] DNS leak guard: disabled by --no-dns-guard (Windows may "
+              "query a physical adapter's resolver in parallel).")
     # Baseline the live-reconfig channel (see _baseline_control_file): only
     # control-file writes made while THIS run is up may change the DNS - a
     # leftover file from an earlier session must never override the launch
@@ -3966,6 +4164,14 @@ def main():
     # public default/split routes during install ordering.
     _add_lan_bypass(iface, gateway)
 
+    # ── DNS leak guard (catch-all NRPT rule) ────────────────────────────────
+    # Placed HERE, after the default/split routes are live and before the
+    # tunnel is declared active: installing it from configure_tun would be
+    # too early (that runs before these routes exist, and a catch-all rule
+    # active while the endpoint / proxy2 / VPN resolutions of this same
+    # startup still need the physical resolver would fail them).
+    _install_dns_guard()
+
     # Arm the live [V]/[Y] channel with THIS run's route state (see
     # _live_mode): the monitor loop's poll_control_file can then re-point
     # these very endpoints when the dashboard toggles a mode at runtime -
@@ -4118,6 +4324,12 @@ def main():
                 if ok:
                     fails = 0
                     print(f"[MONITOR] tunnel OK: {msg}", flush=True)
+                    # Cheap guard re-assert: NRPT rules can be wiped
+                    # mid-session (another VPN client's policy, a Group Policy
+                    # refresh, a third-party cleanup) - without this check the
+                    # DNS leak would silently come back while the tunnel still
+                    # looks healthy. Only shells out when the rule is missing.
+                    _dns_guard_reassert()
                     # Leak check - part of the regular monitor: prove that
                     # ALL egress (direct traffic included) still rides the
                     # TUN, not just the verification probe's own HTTP. Only

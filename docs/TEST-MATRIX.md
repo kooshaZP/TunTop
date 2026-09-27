@@ -34,6 +34,17 @@ release (see the release checklist in `docs/MILESTONE-v1.0.md`);
 | 18 | Bypass add/remove while tunnel is UP | Live edit works without restart; routes land on the right interface | AUTO (test_bypass_install_flow) + MANUAL | passing (auto) |
 | 19 | Binary tampered / truncated (`tun2socks.exe`, `wintun.dll`) | SHA-256 mismatch → refuse to launch, clear message | AUTO (test_integrity) | passing |
 | 20 | geoip.dat corrupted / truncated | Parse falls back to pure-Python decoder or fails loudly; no half-installed routes | AUTO (geoip parse tests) | passing |
+| 21 | DNS leak: multi-homed machine (Wi-Fi has a DHCP resolver) while the tunnel is up | Catch-all NRPT rule pins every name to the tunnel resolvers; `Get-DnsClientNrptPolicy -Effective` shows the root namespace; dnsleaktest.com shows only the tunnel resolver; `[C]` DNS-leak-protection row PASS | AUTO (test_dns_guard) + MANUAL | passing (auto) |
+| 22 | DNS leak guard left behind by a hard kill | Next launch removes it BEFORE any route work and logs it; DNS works again with no tunnel | AUTO (test_startup_recovery, test_cleanup_watchdog) + MANUAL | passing (auto) |
+| 23 | Guard removed mid-session (Group Policy refresh / another VPN client) | Monitor re-asserts it on the next healthy cycle, no restart needed | AUTO (test_dns_guard helper integration) + MANUAL | passing (auto) |
+| 24 | LAN-only name (printer/NAS) while the guard is up | `.local` (and any `--dns-guard-exempt` domain) still resolves; everything else pinned | MANUAL | pending |
+| 25 | PowerShell unavailable / times out during guard removal | Removal reported as a FAILURE (never a false "removed"), and the install record is kept so the next launch retries; a stale pin is never silently orphaned | AUTO (test_dns_guard failed-runner cases) + MANUAL | passing (auto) |
+| 26 | Registry key removal denied (ACL / in use) | The removal script re-enumerates after the sweep and reports the survivors instead of assuming success | AUTO (test_dns_guard verification) + MANUAL | passing (auto) |
+| 27 | Disconnected adapter with a stale static resolver | Not reported as a leak source (SMHNR only fans out over adapters that are Up), so no false "dns-leak" | AUTO (test_dns_guard script text) + MANUAL | passing (auto) |
+| 28 | `[L]` DNS test while the guard state cannot be read (probe raises) | Verdict is `unknown` naming the adapters and the reason — never a confirmed `dns-leak` against a healthy tunnel | AUTO (test_dns_leak_probe tri-state) | passing (auto) |
+| 29 | Only the `.local` exemption rule survives (catch-all wiped) | Guard reports NOT in force (the exemption claims no namespace); a foreign managed catch-all does not make ours look installed | AUTO (test_dns_guard match-count) | passing (auto) |
+| 30 | `--no-dns-guard` chosen deliberately | `[C]` row reads "DISABLED by choice" (pass), not a red failure indistinguishable from a broken install | AUTO (test_dns_guard opt-out row) + MANUAL | passing (auto) |
+| 31 | DoH registration succeeds for one family and fails for the other | The failed resolver is named explicitly; it is never silently downgraded to raw UDP/53 behind the sibling's success line | AUTO (test_dns_choice partial DoH) | passing (auto) |
 
 ## How to walk a MANUAL row
 

@@ -54,6 +54,45 @@ class TestSnapshotFromArgs(unittest.TestCase):
         self.assertEqual(snap["server"], [])
 
 
+class TestDnsGuardPlumbing(unittest.TestCase):
+    """The DNS leak guard setting must survive a profile save/load cycle: a
+    saved setup that silently re-enabled (or silently dropped) the catch-all
+    NRPT pin would change the machine's DNS behaviour without the user ever
+    asking for it."""
+
+    def test_default_is_on(self):
+        snap = snapshot_from_args(_FakeArgs())
+        self.assertTrue(snap["dns_guard"])
+        self.assertEqual(snap["dns_guard_exempt"], [])
+
+    def test_opt_out_and_exemptions_round_trip(self):
+        ns = _FakeArgs()
+        snap = snapshot_from_args(ns)
+        snap["dns_guard"] = False
+        snap["dns_guard_exempt"] = ["Home.Example", "lan.example"]
+        apply_to_args(ns, snap)
+        self.assertFalse(ns.dns_guard)
+        # Normalised (lower-cased, whitespace-free) - the same rule every
+        # other host list follows, so a pasted URL can never reach the rule.
+        self.assertEqual(ns.dns_guard_exempt, ["home.example", "lan.example"])
+
+    def test_missing_key_falls_back_to_the_default(self):
+        ns = _FakeArgs()
+        apply_to_args(ns, {"server": ["1.1.1.1"], "port": 1})
+        self.assertTrue(ns.dns_guard)
+        self.assertEqual(ns.dns_guard_exempt, [])
+
+    def test_exemptions_are_normalised_through_the_host_normaliser(self):
+        ns = _FakeArgs()
+        apply_to_args(ns, {"server": ["1.1.1.1"], "port": 1,
+                           "dns_guard_exempt": ["https://Home.Example:8080/x",
+                                                "  ", "LAN.example"]},
+                      normalise_host=lambda h: h.split("//")[-1].split(":")[0])
+        # A pasted URL/port is reduced to its host before it can become an
+        # NRPT namespace, and everything ends up lower-cased.
+        self.assertEqual(ns.dns_guard_exempt, ["home.example", "lan.example"])
+
+
 class TestLoadStore(unittest.TestCase):
     def test_missing(self):
         data, err = load_store("/nonexistent/path.json")

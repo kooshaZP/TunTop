@@ -20,6 +20,7 @@ import os
 from tuntop.config.defaults import (
     DEFAULT_ENDPOINT_PORT, DEFAULT_SOCKS_PORT, DNS4,
     DEFAULT_DNS_POLICY, DNS_POLICIES, DEFAULT_LOG_ADAPTER_ACTIVITY,
+    DEFAULT_DNS_GUARD, DEFAULT_DNS_GUARD_EXEMPT,
 )
 
 
@@ -56,6 +57,9 @@ def snapshot_from_args(ns) -> dict:
         "vpn_interface": getattr(ns, "vpn_interface", None),
         "log_adapter_activity": bool(getattr(ns, "log_adapter_activity",
                                              DEFAULT_LOG_ADAPTER_ACTIVITY)),
+        "dns_guard": bool(getattr(ns, "dns_guard", DEFAULT_DNS_GUARD)),
+        "dns_guard_exempt": list(getattr(ns, "dns_guard_exempt", None)
+                                 or DEFAULT_DNS_GUARD_EXEMPT),
     }
 
 
@@ -251,6 +255,15 @@ def apply_to_args(ns, snap: dict, normalise_host=None) -> list:
     ns.no_vpn_bypass = bool(snap.get("no_vpn_bypass"))
     ns.log_adapter_activity = bool(snap.get("log_adapter_activity",
                                             DEFAULT_LOG_ADAPTER_ACTIVITY))
+    ns.dns_guard = bool(snap.get("dns_guard", DEFAULT_DNS_GUARD))
+    # Exemptions are domain names: normalise through the same host
+    # normaliser the bypass entries use when one is available, so a pasted
+    # URL/port can never reach the NRPT rule.
+    _ex = [str(x).strip().lower() for x in (snap.get("dns_guard_exempt")
+                                            or []) if str(x).strip()]
+    if normalise_host:
+        _ex = [h for h in (normalise_host(x) for x in _ex) if h]
+    ns.dns_guard_exempt = _ex
     return applied
 
 

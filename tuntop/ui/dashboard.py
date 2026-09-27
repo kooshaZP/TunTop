@@ -91,7 +91,7 @@ from tuntop.netdns import (           # noqa: E402
 from tuntop.config import defaults as _cfgdef   # noqa: E402
 from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
     VPN_IFACE_RE, LAN_BYPASS_PREFIXES, SWEEP_CHUNK, SWEEP_MAX_WORKERS,
-    TUN, TUN4, TUN6, TUN2, TUN2_IP4, TUN2_IP6,
+    TUN, TUN4, TUN6, TUN2, TUN2_IP4, TUN2_IP6, TUNNEL_ALIASES,
 )
 from tuntop.network.routeops import sweeps as _rsweeps   # noqa: E402
 from tuntop.state import (            # noqa: E402
@@ -103,6 +103,7 @@ from tuntop.recovery import (         # noqa: E402
 from tuntop.routes_txn import RouteTransaction   # noqa: E402
 from tuntop.core.tunnel_manager import TunnelManager   # noqa: E402
 from tuntop.network import procguard            # noqa: E402
+from tuntop.network import dns_guard as _dns_guard   # noqa: E402  (DNS leak guard)
 from tuntop import startup_recovery              # noqa: E402
 from tuntop import integrity                     # noqa: E402
 from tuntop import ui_text                       # noqa: E402
@@ -1078,19 +1079,140 @@ def _dns_configuration_check(dns4, dns6=None):
                        "enforce as the DNS source")
     parts = []
     all_wintun = True
+    unknown = []
     for ip, is_v6 in resolvers:
         ok, msg = _dns_enforcement_check(ip, is_v6)
-        # _dns_enforcement_check returns None for "no route / probe failed" and
-        # True|False for the actual selection. Anything non-True breaks the
-        # combined assertion.
-        if not ok:
+        # _dns_enforcement_check returns None for "no route / probe failed"
+        # (UNKNOWN) and True|False for the actual selection. Unknown is NOT
+        # reported as "not pinned": the detail says which resolver could not
+        # be verified, so a broken probe is never presented as a leak.
+        if ok is None:
+            unknown.append(ip)
+        elif not ok:
             all_wintun = False
         parts.append(msg)
-    if all_wintun:
+    if all_wintun and not unknown:
         return True, ("Wintun is the selected DNS source for the configured "
                       "resolver(s): " + "; ".join(parts))
+    if unknown:
+        return False, ("DNS source selection could not be verified for: "
+                       + ", ".join(unknown)
+                       + " (no route to it right now) - " + "; ".join(parts))
     return False, ("DNS is NOT pinned to Wintun as the selected source - " +
                    "; ".join(parts))
+
+
+def _wintun_up():
+    """True when the tunnel adapter exists and is Up (tunnel live).
+
+    Exact match on the marker the script prints, never a substring test: the
+    PowerShell edge can carry unrelated text, and a loose 'UP' in it would
+    read as a live tunnel. The adapter name comes from the shared TUN
+    constant, so a renamed tunnel cannot make this disagree with every other
+    probe (and flip half the DNS-guard verdict).
+    """
+    ok, out = _ps("$a = Get-NetAdapter -Name '" + ps_quote(TUN) +
+                 "' -ErrorAction SilentlyContinue; if ($a -and "
+                 "$a.Status -eq 'Up') { 'UP' } else { 'DOWN' }")
+    if not ok:
+        return False
+    for line in str(out or "").splitlines():
+        if line.strip() == "UP":
+            return True
+    return False
+
+
+def _unguarded_adapters_note():
+    """Detail suffix naming the NON-tunnel adapters that still publish
+    resolvers - the servers a leak test can see Windows querying in parallel.
+    Empty when there are none or the probe could not tell."""
+    try:
+        # runner=_ps: every health row goes through the DASHBOARD's PowerShell
+        # edge, so a test that stubs _ps stubs this too (no real shell, no
+        # registry read from the offline suite). TUNNEL_ALIASES is the shared
+        # list, so a renamed TUN is still excluded from "foreign".
+        others = _dns_guard.foreign_resolvers(runner=_ps,
+                                              aliases=TUNNEL_ALIASES)
+    except Exception:
+        return ""
+    if not others:
+        return ""
+    more = f" (+{len(others) - 4} more)" if len(others) > 4 else ""
+    return ("; adapters still publishing resolvers: "
+            + ", ".join(others[:4]) + more)
+
+
+def _dns_guard_check(dns4=None, dns6=None, enabled=True):
+    """Health check: is the DNS leak GUARD in force?
+
+    The rows around this one prove the CONFIGURED resolvers ride the TUN.
+    This row answers the question a browser-based leak test actually asks:
+    can Windows ask anybody ELSE? While a tunnel is up the helper installs a
+    catch-all NRPT rule pinning every name to the tunnel resolvers, and that
+    rule is the only thing stopping Smart Multi-Homed Name Resolution from
+    fanning each query out to a DHCP-assigned physical resolver in parallel
+    (the leak TunTop's TUN-only checks used to miss). PASS requires the rule
+    to exist AND Windows' own effective NRPT policy to carry it - the
+    registry key alone proves nothing, since Windows can drop a malformed
+    rule silently.
+
+    The rule's lifetime is the TUN's, so the tunnel state decides the rest:
+    a rule with NO tunnel is a STALE rule pinning every process on the
+    machine to a dead proxy (a failure, and the one a hard kill leaves
+    behind), and no rule with no tunnel is simply correct.
+
+    `enabled` is the user's own --no-dns-guard choice. Without it a
+    deliberate opt-out is indistinguishable from a failed install, so a user
+    who turned the feature OFF would sit in front of a permanently red row
+    they cannot fix and cannot tell apart from a fault.
+    """
+    resolvers = _dns_guard.guard_resolvers(dns4, dns6)
+    if not enabled:
+        return True, ("DNS leak protection is DISABLED by choice "
+                      "(--no-dns-guard) - Windows may query a physical "
+                      "adapter's resolver in parallel"
+                      + _unguarded_adapters_note())
+    tunnel_up = _wintun_up()
+    try:
+        probe_ok, state = _dns_guard.detect(runner=_ps)
+    except Exception as e:
+        return False, f"DNS leak-protection probe failed: {e}"
+    if not probe_ok:
+        return False, ("DNS leak-protection state could not be read"
+                       + (f" ({state.get('error')})" if state.get("error")
+                          else ""))
+    in_force = bool(state.get("ok"))
+    if in_force and tunnel_up:
+        return True, ("catch-all NRPT rule pins all name resolution to "
+                      f"{state.get('servers') or ', '.join(resolvers)} - "
+                      "Windows cannot query a physical adapter's resolver in "
+                      "parallel" + _unguarded_adapters_note())
+    if in_force and not tunnel_up:
+        return False, ("a STALE DNS-guard rule is still installed with no "
+                       "tunnel up - every program on this machine is "
+                       "resolving names through a dead proxy. Stop and start "
+                       "TunTop, or remove it: "
+                       "Remove-Item -Recurse -Force "
+                       "'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache"
+                       "\\Parameters\\DnsPolicyConfig\\TunTop-Match'"
+                       + _unguarded_adapters_note())
+    if not state.get("keys"):
+        if not tunnel_up:
+            # The guard exists only while a tunnel is up, so "no rule" is the
+            # CORRECT state when the tunnel is down.
+            return True, ("no DNS-guard rule - correct while the tunnel is "
+                          "down (the rule is installed only while a tunnel "
+                          "is up)")
+        why = ("no resolver is configured on the tunnel, so the guard is "
+               "skipped by design" if not resolvers else
+               "the guard is enabled here but no rule was installed (the "
+               "install failed, or the helper was started with --no-dns-guard)")
+        return False, (f"NO DNS-guard rule: {why} - Windows may query a "
+                       "physical adapter's resolver in parallel"
+                       + _unguarded_adapters_note())
+    return False, ("the DNS-guard NRPT rule exists but Windows' effective "
+                   "policy does not carry the catch-all namespace - the pin "
+                   "is NOT in force" + _unguarded_adapters_note())
 
 
 def _leak_check(port, timeout=None):
@@ -1280,6 +1402,16 @@ def build_checks(ns):
         # an accidental physical-NIC pick is visible instead of a silent pass.
         ("DNS configuration (Wintun is selected source)",
          lambda: _dns_configuration_check(dns, dns6)),
+        # The row above proves the resolvers TunTop CONFIGURED ride the TUN.
+        # This one proves nobody ELSE can answer: the catch-all NRPT rule the
+        # helper installs while the tunnel is up (see _dns_guard_check). Its
+        # detail names the adapters still publishing resolvers, so the leak a
+        # browser-based test shows is visible here too. The user's own
+        # --no-dns-guard choice travels in, so opting out reads as a choice
+        # rather than as a failed install.
+        ("DNS leak protection (catch-all NRPT rule)",
+         lambda: _dns_guard_check(
+             dns, dns6, enabled=bool(getattr(ns, "dns_guard", True)))),
         q("MTU",
           "Get-NetIPInterface -AddressFamily IPv4 | ? {$_.NlMtu -ge 1280} | select -First 1 | % {'MTU ' + $_.NlMtu}"),
         # wintun may be absent (tunnel not yet up); never use -ErrorAction
@@ -3465,41 +3597,6 @@ class BTopTui:
         th.start()
         return th
 
-    def _start_update_check(self):
-        """One background GitHub-release update check per session (frozen
-        exe only; BTOP_NO_UPDATE=1 or --no-update-check opts out). Stages a
-        VERIFIED TunTop-<version>.exe next to the running one - never
-        launches or overwrites anything."""
-        if not getattr(_sys, "frozen", False):
-            return None
-        if os.environ.get("BTOP_NO_UPDATE"):
-            return None
-        if getattr(self.ns, "no_update_check", False):
-            return None
-        if getattr(self, "_update_thread", None) and self._update_thread.is_alive():
-            return self._update_thread
-        self._update_thread = threading.Thread(
-            target=self._update_check_worker, daemon=True)
-        self._update_thread.start()
-        return self._update_thread
-
-    def _update_check_worker(self):
-        from tuntop.config import updates as _updates
-        import tuntop as _pkg
-        try:
-            exe_dir = _os.path.dirname(_os.path.abspath(_sys.executable))
-            staged = _updates.prepare_update(_pkg.__version__, exe_dir)
-        except Exception as e:
-            self.logs.put(f"[i] Update check skipped: {e}")
-            return
-        if staged:
-            self.logs.put(
-                f"[+] Update {staged.version} downloaded and verified (SHA-256): "
-                f"{staged.path} - close TunTop and run that exe to apply it.")
-        else:
-            self.logs.put("[i] Update check done - no newer release "
-                          "(up to date, or offline).")
-
     def _bypass_resolver_worker(self):
         """Background loop: keep every bypass entry resolved and routed. Runs
         until the dashboard exits. All DNS/route work happens here so the UI
@@ -4775,7 +4872,20 @@ class BTopTui:
                         direct_ip=d.get("ip"), tunnel_ip=t.get("ip"),
                         expected_dns=[getattr(self.ns, "dns4", None),
                                       getattr(self.ns, "dns6", None)],
-                        timeout=_LEAK_TIMEOUT)
+                        timeout=_LEAK_TIMEOUT,
+                        # Two injected probes for the leak the egress legs
+                        # above CANNOT see: Windows fanning a query out to a
+                        # physical adapter's resolver in parallel (SMHNR)
+                        # while the tunnel's own resolvers work fine. Without
+                        # them this test could say "no DNS leak" on exactly
+                        # the machine a browser-based leak test flags.
+                        # runner=_ps keeps them on the dashboard's own
+                        # PowerShell edge (stubbable, no shell in tests).
+                        unguarded_resolvers=lambda: (
+                            _dns_guard.foreign_resolvers(
+                                runner=_ps, aliases=TUNNEL_ALIASES)),
+                        guard_in_force=lambda: (
+                            _dns_guard.guard_in_force(runner=_ps)))
                     dpfx = ("[+]" if dns_status == "ok" else
                             "[!]" if dns_status == "dns-leak" else "[i]")
                     self._blog(f"{dpfx} DNS leak test: {dns_msg}")
@@ -4790,6 +4900,47 @@ class BTopTui:
         threading.Thread(target=_worker, daemon=True).start()
 
     # ── Diagnostics export ([D]) ────────────────────────────────────────────
+
+    def _dns_guard_diagnostics(self):
+        """Everything a "my DNS still leaks" report needs: the setting, the
+        install record, whether the rule is EFFECTIVE in Windows' own NRPT
+        policy, and which non-tunnel adapters are still publishing resolvers
+        (the servers SMHNR could fan a query out to). Best-effort - a failed
+        probe says so instead of looking like a clean system."""
+        lines = [f"setting: dns_guard="
+                 f"{bool(getattr(self.ns, 'dns_guard', True))} "
+                 f"exempt={list(getattr(self.ns, 'dns_guard_exempt', None) or [])}",
+                 f"wintun up: {_wintun_up()}"]
+        try:
+            record = _dns_guard.load_state()
+        except Exception as e:
+            record = None
+            lines.append(f"install record: unreadable ({e})")
+        if record is None:
+            lines.append("install record: none (no guard recorded as installed)")
+        else:
+            lines.append(f"install record: resolvers={record.get('resolvers')} "
+                         f"exempt={record.get('exempt')} "
+                         f"since={record.get('since')}")
+        try:
+            probe_ok, state = _dns_guard.detect(runner=_ps)
+        except Exception as e:
+            probe_ok, state = False, {"error": str(e)}
+        if probe_ok:
+            lines.append(f"rules: {state.get('keys')} key(s), "
+                         f"effective={state.get('effective')}, "
+                         f"servers={state.get('servers')!r}")
+        else:
+            lines.append(f"NRPT probe failed: {state.get('error')}")
+        try:
+            others = _dns_guard.foreign_resolvers(runner=_ps,
+                                                  aliases=TUNNEL_ALIASES)
+        except Exception as e:
+            others = []
+            lines.append(f"adapter-resolver probe failed: {e}")
+        lines.append("adapters still publishing resolvers: "
+                     + (", ".join(others) if others else "(none)"))
+        return "\n".join("  " + ln for ln in lines)
 
     def _export_diagnostics(self):
         """Write diagnostics_<timestamp>.txt next to the script: config, state,
@@ -4831,6 +4982,11 @@ class BTopTui:
                 "Get-NetAdapter | Select-Object Name,Status,LinkSpeed | "
                 "Format-Table -AutoSize | Out-String")
             secs.append(("ADAPTERS", out if ok else "  (query failed)"))
+            # DNS leak guard (1.0.40): the effective NRPT policy, the rules we
+            # installed, and the install record. A "my DNS still leaks"
+            # report is unanswerable without these - the leak is a property of
+            # the OS resolver's policy, not of anything visible in the routes.
+            secs.append(("DNS GUARD (NRPT)", self._dns_guard_diagnostics()))
             try:
                 with open(path, "w", encoding="utf-8") as f:
                     for title, body in secs:
@@ -7226,11 +7382,11 @@ class BTopTui:
         # the /32 - /128 bypass routes as soon as they resolve. Off the UI thread
         # so a slow or dead resolver can never freeze a frame or a keypress.
         self._ensure_bypass_resolver()
-        # GitHub release auto-update check (1.0.33): background, once per
-        # session, frozen exe only. A newer verified TunTop-<version>.exe is
-        # STAGED next to the running one (never executed, never overwritten) -
-        # the log line tells the user where it is; starting it is manual.
-        self._start_update_check()
+        # NOTE: the update check is NOT started here (1.0.40) - it runs once
+        # in main()'s initial startup block, right after the binary-integrity
+        # lines, so its verdict is visible before the dashboard opens. Its
+        # background staging reports through _UPDATE_SINK, which is attached
+        # to this log panel right after BTopTui is constructed.
 
         try:
             while self.running:
@@ -7477,6 +7633,13 @@ class BTopTui:
             cmd.append("--no-vpn-bypass")
         if getattr(self.ns, "dns_policy", "availability") != "availability":
             cmd += ["--dns-policy", self.ns.dns_policy]
+        # DNS leak guard: on by default in the helper, so only the opt-OUT and
+        # the exemptions need to travel.
+        if not getattr(self.ns, "dns_guard", True):
+            cmd.append("--no-dns-guard")
+        for _dom in (getattr(self.ns, "dns_guard_exempt", None) or []):
+            if str(_dom).strip():
+                cmd += ["--dns-guard-exempt", str(_dom).strip()]
         if getattr(self.ns, "vless_over_vpn", False):
             cmd.append("--proxy-over-vpn")
         if getattr(self.ns, "vpn_interface", None):
@@ -8158,6 +8321,23 @@ class BTopTui:
         except Exception:
             return 0
 
+    def _sweep_dns_guard(self):
+        """Drop the DNS leak-guard NRPT rule (see tuntop/network/dns_guard.py).
+
+        The helper removes its own rule in cleanup(), so on a clean stop this
+        finds nothing to do. It matters on the paths where the helper never
+        got to run its cleanup - force-killed, hung past the stop timeout, or
+        the console closed under it - because a surviving catch-all rule keeps
+        EVERY process on the machine resolving names through a tunnel that no
+        longer exists. Idempotent, cheap (one registry enumeration) and
+        best-effort: a failure here must not block the teardown, and the
+        watchdog plus the next launch's startup recovery are the backstops."""
+        try:
+            ok, _msg = _dns_guard.ensure_removed()
+        except Exception:
+            return False
+        return bool(ok)
+
     def _sweep_geo_leftovers(self, progress=None):
         """Last-resort exit sweep for HELPER-installed geoip country-bypass
         routes. The helper removes its own routes in cleanup() when it exits
@@ -8509,6 +8689,12 @@ class BTopTui:
                           lambda r=rows: self._batch_delete_routes(r)))
         tasks.append(("Tearing down wintun routes + tun2socks",
                       self._shutdown_teardown_wintun))
+        # The tunnel is down now: drop the DNS leak-guard rule so name
+        # resolution is no longer pinned to a tunnel that no longer exists.
+        # The helper's own cleanup does this on a clean stop; this covers a
+        # force-killed/hung helper the shutdown sequence had to kill.
+        tasks.append(("Removing the DNS leak-guard rule",
+                      self._sweep_dns_guard))
         tasks.append(("Sweeping leftover geoip country routes",
                       lambda: self._sweep_geo_leftovers(
                           progress=self._sweep_progress_cb)))
@@ -8936,6 +9122,140 @@ def _pyinstaller_clean_env():
     return env
 
 
+class _StartupLogSink:
+    """Where the startup update check writes while the dashboard may not exist.
+
+    The check runs in the INITIAL startup block (right after the binary
+    integrity lines), so a line it produces can land before BTopTui is even
+    constructed. Every line is printed to the console - the durable record,
+    and the only one if the app dies during launch - and buffered; attach()
+    then replays the buffer into the dashboard's log panel so nothing is
+    invisible once the UI is up. After attach() the console still gets the
+    line, but the buffer is not re-filled, so nothing is doubled."""
+
+    def __init__(self):
+        self._app = None
+        self._pending = []
+        # Guards the check-then-append in __call__ against the rebind in
+        # attach(): without it a producer can observe _app is None, then have
+        # attach() drain the buffer, then append to the already-drained list -
+        # and that message is never replayed into the panel.
+        self._lock = threading.Lock()
+
+    def __call__(self, msg):
+        print(msg, flush=True)
+        with self._lock:
+            app = self._app
+            if app is None:
+                self._pending.append(msg)
+                return
+        try:
+            app.logs.put(msg)
+        except Exception:
+            pass
+
+    def attach(self, app):
+        """Bind to the dashboard and flush whatever was produced before it
+        existed. Idempotent: a second attach() is a no-op (the buffer is
+        already empty)."""
+        if app is None:
+            return
+        with self._lock:
+            if self._app is not None:
+                return
+            self._app = app
+            pending, self._pending = self._pending, []
+        for msg in pending:
+            try:
+                app.logs.put(msg)
+            except Exception:
+                pass
+
+    def reset(self):
+        """Test helper: drop the binding and the buffer."""
+        with self._lock:
+            self._app = None
+            self._pending = []
+
+
+#: The single startup-update-check sink (module level so the staging thread
+#: and main() share it).
+_UPDATE_SINK = _StartupLogSink()
+
+#: The inline check is bounded SHORT (the default 20 s is right for a
+#: background download, far too long for something the user is staring at
+#: during launch) - a stalled release feed must not look like a hung app.
+_STARTUP_UPDATE_TIMEOUT = 6
+
+
+def _startup_update_check(args, timeout=_STARTUP_UPDATE_TIMEOUT,
+                          sink=None):
+    """Check for a newer TunTop release ONCE, in the initial startup block.
+
+    The verdict ("newer release available" / "already current" / "skipped,
+    here's why") is printed inline so the user sees it next to the integrity
+    lines instead of hunting for it in the log panel later. Only the
+    download + SHA-256 verification runs in the background, so a slow or
+    large release never delays the dashboard opening.
+
+    Every line goes through `sink` (the module-level _UPDATE_SINK), which
+    prints to the console AND replays into the log panel once the dashboard
+    exists - so the result is visible in the UI too, never console-only.
+
+    Returns the staging thread (or None). The running executable is never
+    touched or launched - the verified TunTop-<version>.exe is staged next
+    to it and picked up on the next manual start.
+    """
+    emit = sink or _UPDATE_SINK
+    if not getattr(_sys, "frozen", False):
+        emit("[i] Update check skipped: not a packaged TunTop.exe.")
+        return None
+    if os.environ.get("BTOP_NO_UPDATE"):
+        emit("[i] Update check skipped: BTOP_NO_UPDATE is set.")
+        return None
+    if getattr(args, "no_update_check", False):
+        emit("[i] Update check skipped: --no-update-check.")
+        return None
+    from tuntop.config import updates as _updates
+    import tuntop as _pkg
+    emit("[*] Checking for a newer TunTop release...")
+    try:
+        info = _updates.check_latest(_pkg.__version__, timeout=timeout)
+    except Exception as e:
+        # Offline, rate-limited, a draft tag, a malformed feed: none of it
+        # may stop the launch - say what happened and move on.
+        emit(f"[i] Update check: no verdict ({e}).")
+        return None
+    if not info.get("update_available"):
+        emit(f"[i] Update check: already on the newest release "
+             f"(v{_pkg.__version__}).")
+        return None
+    version = str(info.get("version") or "?")
+    emit(f"[+] Update {version} available - downloading the verified exe "
+         "in the background.")
+    exe_dir = os.path.dirname(os.path.abspath(_sys.executable))
+
+    def _stage():
+        try:
+            os.makedirs(exe_dir, exist_ok=True)
+            staged = _updates.download_release(info, exe_dir)
+        except Exception as e:
+            emit(f"[!] Update {version} could not be downloaded: {e}")
+            return
+        if staged is not None:
+            emit(f"[+] Update {staged.version} downloaded and verified "
+                 f"(SHA-256): {staged.path} - close TunTop and run that exe "
+                 "to apply it.")
+        else:
+            emit(f"[i] Update {version} staging reported nothing - "
+                 "run TunTop again to retry.")
+
+    th = threading.Thread(target=_stage, daemon=True,
+                          name="tuntop-update-stage")
+    th.start()
+    return th
+
+
 def main():
     # ── Frozen child-process dispatch (PyInstaller onefile) ──────────────
     # The tunnel helper and the cleanup watchdog run as SEPARATE processes,
@@ -9021,6 +9341,23 @@ def main():
     ap.add_argument("--dns6", default=None, metavar="IP",
                     help="IPv6 DNS server for the Wintun adapter "
                          "(default: none, unless no DNS was chosen at all)")
+    ap.add_argument("--dns-guard", action="store_true", dest="dns_guard",
+                    default=True,
+                    help="(Default) While the tunnel is up, a catch-all NRPT "
+                         "rule pins Windows' DNS client to the Wintun "
+                         "resolvers so a DHCP-assigned physical adapter's "
+                         "resolver can never be queried in parallel (the real "
+                         "DNS leak that browser leak tests show). A .local "
+                         "(mDNS) exemption is installed alongside it.")
+    ap.add_argument("--no-dns-guard", action="store_false", dest="dns_guard",
+                    help="Disable the catch-all DNS pin (legacy behavior: "
+                         "Windows may query every adapter's resolver in "
+                         "parallel and answer with the ISP/router one).")
+    ap.add_argument("--dns-guard-exempt", action="append", default=[],
+                    metavar="DOMAIN",
+                    help="Extra domain that must stay resolvable by the LAN/"
+                         "router resolver while the DNS guard is up "
+                         "(repeatable; .local is always exempt).")
     ap.add_argument("--font", default="", metavar="FACE",
                     help="console font face, e.g. Cascadia Code "
                          "(classic conhost only; Windows Terminal keeps "
@@ -9172,6 +9509,19 @@ def main():
             print(_m)
     if not _bin_ok:
             sys.exit(1)
+
+    # ── Update check (same initial block, right after the integrity lines) ─
+    # The verdict is printed HERE, before the dashboard opens, so the user
+    # sees it in the same startup output as the integrity lines instead of
+    # having to go looking for it in the log panel later. Only the
+    # download + SHA-256 verification continues in the background, so a slow
+    # or big release never delays the launch. The staging thread reports
+    # through _UPDATE_SINK, which the dashboard picks up (see BTopTui below).
+    try:
+        _startup_update_check(args)
+    except Exception as e:
+        # An update check must NEVER be able to stop the launch.
+        print(f"[i] Update check could not run: {e}")
 
     # Fix the console codepage/font up *before* deciding whether Unicode
     # glyphs are safe - this is what actually makes a plain cmd.exe or
@@ -9429,6 +9779,14 @@ def main():
                         # /32+/128 regardless of the helper's progress - one
                         # batched PowerShell call, seconds at most.
                         app._final_host_route_sweep()
+                        # DNS leak guard: the helper was just signalled to
+                        # clean up and may be killed before it gets there, so
+                        # drop the catch-all NRPT rule here too. A surviving
+                        # rule would keep EVERY process resolving names
+                        # through a tunnel that is being torn down. Cheap and
+                        # idempotent - the watchdog and the next launch's
+                        # startup recovery are the remaining backstops.
+                        app._sweep_dns_guard()
                         # _cleanup_live_routes only covers the routes THIS
                         # process tracked - geo routes the HELPER installed at
                         # startup are NOT in _live_geo_added, and they live on
@@ -9490,6 +9848,11 @@ def main():
     app = None
     try:
         app = BTopTui(args)
+        # The update check already ran in the startup block above; anything
+        # it produced before this point (a download that finished while the
+        # dashboard was being built) is replayed into the log panel now, so
+        # the result is visible in the UI and not only in the console.
+        _UPDATE_SINK.attach(app)
         # Leftover GEO routes from an accidental exit (the [X] close, a crash,
         # a power loss) live on the PHYSICAL adapter, not on wintun - so the
         # startup recovery above (which tears down the wintun adapter) never

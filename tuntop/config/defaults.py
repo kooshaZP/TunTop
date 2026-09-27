@@ -104,3 +104,21 @@ DEFAULT_GEOIP_CODE = ""
 # (component "ADAPTER") while the tunnel is up. Off by default to avoid
 # log noise.
 DEFAULT_LOG_ADAPTER_ACTIVITY = False
+
+# ── DNS leak guard ──────────────────────────────────────────────────────────
+# When True (the default) the helper installs a catch-all Name Resolution
+# Policy Table (NRPT) rule for as long as the tunnel is up, so the Windows
+# DNS client can ONLY ask the resolvers configured on wintun - a DHCP-assigned
+# physical resolver can no longer be queried in parallel (Windows' Smart
+# Multi-Homed Name Resolution), which is the classic TUN-mode DNS leak. A
+# `.local` (RFC 6762 mDNS) exemption is installed alongside it so printers and
+# NAS boxes keep resolving. The rules live under
+# HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig\
+# TunTop-*  and are removed by every teardown path (helper cleanup, startup
+# recovery, cleanup watchdog, dashboard stop/quit sweeps).
+# See tuntop/network/dns_guard.py.
+DEFAULT_DNS_GUARD = True
+#: Domains that must ALSO stay resolvable while the guard is up (names only a
+#: LAN/corporate resolver can answer). ".local" is always exempt - this is the
+#: user-extendable part (--dns-guard-exempt).
+DEFAULT_DNS_GUARD_EXEMPT = ()
