@@ -68,6 +68,7 @@ if _PKG_PARENT not in _sys.path:
     _sys.path.insert(0, _PKG_PARENT)
 
 from tuntop.psshell import ps_quote  # noqa: E402
+from tuntop.config import defaults as _cfgdef  # noqa: E402
 from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
     TUN, TUN4, TUN4_MASK, TUN6, TUN2, TUN2_IP4, TUN2_IP6,
     DNS4, DNS6, LAN_BYPASS_PREFIXES, GEO_SUB_BATCH, GEO_MAX_WORKERS, GEO_SUB_TIMEOUT,
@@ -86,22 +87,12 @@ def _resolve_dns_choice(d4, d6):
     the Wintun adapter. A None result for one family means "do not set (and
     remove any stale) DNS for that family".
 
-      * no input at all              -> both defaults (DNS4 + DNS6)
-      * a real choice (v4 and/or v6) -> EXACTLY what was chosen: a v4-only
-                                        choice gets NO default v6 injected,
-                                        and vice versa
-      * the legacy pass of --dns4 8.8.8.8 alone (what old dashboards,
-                                        profiles and launchers always sent)
-                                        still means "both defaults", so
-                                        existing setups keep their behavior
-    """
-    d4 = str(d4).strip() if d4 else None
-    d6 = str(d6).strip() if d6 else None
-    if not d4 and not d6:
-        return DNS4, DNS6
-    if d4 == DNS4 and not d6:
-        return DNS4, DNS6
-    return d4, d6
+    The rule itself lives in tuntop.config.defaults.resolve_dns_choice, which
+    the DASHBOARD also calls (for the health rows and the live-reconfig control
+    file). It used to be duplicated here, and the copies drifting apart is what
+    let a server edit write `dns4: null` into the control file, wipe the
+    running resolver and take the catch-all leak pin down with it."""
+    return _cfgdef.resolve_dns_choice(d4, d6)
 
 # Second proxy pipe (optional, behind --proxy2-port).  A second TUN adapter +
 # tun2socks process against a second local SOCKS5 port; specific destinations
@@ -1208,8 +1199,22 @@ def configure_tun(dns4=None, dns6=None):
     "the user did not choose a DNS server for that family": that family's DNS
     is left unset (and any stale entry removed), NOT silently replaced with
     the hardcoded DNS4/DNS6 defaults - the old `dns6 = dns6 or DNS6` fallback
-    made a v4-only DNS choice impossible."""
+    made a v4-only DNS choice impossible.
+
+    Returns True when the adapter's resolver is now DoH over TCP/443, False
+    otherwise (plain/auto mode, or a DoH registration that did not take).
+    Only the start sequence's DoH escalation uses that answer, to avoid
+    re-probing a resolver it has just proved cannot be reached."""
     mode = _ACTIVE_DNS_MODE
+
+    # Whether the RESOLVER actually ended up on DoH. Initialised ONCE, here,
+    # because the three modes are not all covered below: "plain" matches
+    # neither `mode == "doh"` nor `mode == "auto"`, so with the assignment
+    # living inside the branches the final `return applied` raised
+    # UnboundLocalError - i.e. `--dns-mode plain`, a documented and supported
+    # choice, crashed the helper at tunnel bring-up (and again in
+    # self_heal_tunnel), not just in the DoH path that guards its call.
+    applied = False
 
     _set_wintun_addresses_plain(dns4, dns6)
 
@@ -1245,11 +1250,13 @@ def configure_tun(dns4=None, dns6=None):
                 failed.append(dns6)
         chosen = [s for s in (dns4, dns6) if s]
         if registered and _set_wintun_dns_servers(chosen):
+            applied = True
             for ip, tmpl in registered:
                 print(f"[*] Wintun DNS set to DoH: {ip} -> {tmpl} (TCP/443)")
         elif chosen:
-            print(f"[!] DoH enable failed for {', '.join(chosen)}; falling back "
-                  "to plain UDP DNS (the addresses set above stay as-is).")
+            print("[!] DoH enable failed for %s; falling back "
+                  "to plain UDP DNS (the addresses set above stay as-is)."
+                  % ", ".join(chosen))
         # Per-family failures are reported separately: the success line above
         # only names the families that DID register, so without this a v4
         # registration that failed next to a v6 one that succeeded was
@@ -1259,10 +1266,10 @@ def configure_tun(dns4=None, dns6=None):
             print(f"[!] DoH registration FAILED for {', '.join(failed)} - "
                   f"those resolver(s) stay on raw UDP/53 and may fail to "
                   f"resolve through the tunnel.", flush=True)
-    elif mode == "auto":
-        # Start plain; the monitor/verify loop escalates to DoH if plain DNS
-        # through the TUN proves unreliable.
-        pass
+    # mode == "auto": start plain; the monitor/verify loop escalates to DoH if
+    # plain DNS through the TUN proves unreliable. mode == "plain": the user
+    # pinned it. Both leave `applied` False, which is what the return means -
+    # "the resolver is not on DoH", the only question the caller asks.
 
     # Prefer Wintun for DNS at the OS level: lower the Wintun adapter's
     # InterfaceMetric below the physical adapter's so Windows selects Wintun
@@ -1275,6 +1282,14 @@ def configure_tun(dns4=None, dns6=None):
     # converge on identical precedence. Re-applied by wait_for_tunnel_stable's
     # DoH re-call and by self_heal_tunnel() (both go through configure_tun()).
     _set_wintun_interface_metric(2)
+
+    # Whether the RESOLVER actually changed to DoH. Only meaningful in doh
+    # mode, and only the caller that is about to re-probe needs it: when
+    # nothing registered, the adapter still carries the same plain UDP/53
+    # resolver that just failed to resolve through the tunnel, so a re-probe
+    # costs a full round and returns the identical getaddrinfo failure. That
+    # is start latency spent on a foregone conclusion.
+    return applied
 
 
 # ── DNS leak guard (catch-all NRPT rule) ────────────────────────────────────
@@ -1429,13 +1444,18 @@ def _route_identity_present(rows, fam, iface, gateway, metric=None):
     (interface + normalized next-hop [+ route metric]) live in the table?
     Windows keeps multiple routes per prefix, so 'the prefix exists' proves
     nothing about OUR route being installed."""
-    want_gw = (gateway or "").strip() or ("0.0.0.0" if fam == "v4" else "::")
+    # Normalize BOTH sides through _norm_v4_gw so on-link is '' on each. They
+    # must agree on that spelling before being handed to _gw_matches: it
+    # recognises the tunnel's own address by comparing against an on-link
+    # report, so mixing '0.0.0.0' (this function's old sentinel) with ''
+    # (_norm_v4_gw's) made that case unreachable here even though add_v4
+    # reaches it.
+    want_gw = _norm_v4_gw(gateway)
     for r in rows or []:
         if str(r.get("InterfaceAlias", "")).lower() != str(iface or "").lower():
             continue
-        r_gw = str(r.get("NextHop", "") or "").strip() or \
-            ("0.0.0.0" if fam == "v4" else "::")
-        if r_gw != want_gw:
+        r_gw = _norm_v4_gw(r.get("NextHop", ""))
+        if not _gw_matches(iface, want_gw, r_gw, fam):
             continue
         if metric is not None:
             try:
@@ -1461,6 +1481,40 @@ def _norm_v4_gw(gw):
     if g in ("0.0.0.0", "::", "0", ""):
         return ""
     return g
+
+
+#: Each Wintun adapter's own address per family, keyed by its alias. Every
+#: route this helper installs through a TUN uses that adapter's own address
+#: as the next hop (TUN4/TUN6 for the primary pipe, TUN2_IP4/TUN2_IP6 for the
+#: secondary one).
+_TUN_OWN_ADDRS = {
+    TUN: {"v4": TUN4, "v6": TUN6},
+    TUN2: {"v4": TUN2_IP4, "v6": TUN2_IP6},
+}
+
+
+def _gw_matches(iface, want, have, fam):
+    """Do a wanted next hop and a reported one describe the SAME route?
+
+    `want` is what we asked for, `have` is what Get-NetRoute reported (both
+    already run through _norm_v4_gw, so on-link is '').
+
+    The extra case beyond equality is the tunnel's own address. Windows
+    reports a next hop that is the outgoing interface's own address as
+    on-link, so `192.168.123.1` on wintun comes back as ''. Comparing them
+    literally made EVERY TUN route look stale on every add: the self-heal
+    deleted and re-added 0.0.0.0/1, 128.0.0.0/1, ::/0, ::/1 and 8000::/1 on
+    every cycle - a reinstall of unchanged state, which is the "self-heal
+    fires even though nothing happened" report and a large part of the
+    start-to-RUNNING latency (each cycle is several PowerShell/netsh
+    processes).
+    """
+    if want == have:
+        return True
+    if want == "" or have != "":
+        return False
+    own = _TUN_OWN_ADDRS.get(str(iface or ""), {}).get(fam, "")
+    return bool(own) and want == own
 
 
 def _wrong_family_gw(gw, family):
@@ -1536,7 +1590,7 @@ def add_v4(dest, iface, gateway, metric=1):
         r_iface = str(r.get("InterfaceAlias", ""))
         r_gw = _norm_v4_gw(r.get("NextHop", ""))
         same_iface = r_iface.lower() == iface.lower()
-        same_gateway = r_gw == (gateway or "")
+        same_gateway = _gw_matches(iface, gateway or "", r_gw, "v4")
 
         if same_iface and same_gateway:
             print(f"    [=] Route already exists and is correct: {dest} -> {iface} ({gateway})")
@@ -1557,13 +1611,21 @@ def add_v4(dest, iface, gateway, metric=1):
             del_cmd.append(stale_gateway)   # omit the token => on-link
         run(del_cmd)
 
-    if found_correct:
+    if found_correct and ("v4", dest, iface, gateway) not in added_routes:
         # The route is already present, but older builds installed it
         # PERSISTENTLY (registry) so it survived reboots.  Convert it to
         # active-store-only: delete it (clears both stores) and re-add with
         # store=active below.  If this is the machine's real default route it
         # lives on a different interface and was never marked found_correct, so
         # we never touch it here.
+        #
+        # SKIPPED when this process is the one that installed the route: our
+        # own adds always pass store=active, so there is no persistent copy to
+        # clear and the delete+re-add pair is pure cost. The self-heal re-adds
+        # every TUN route on every cycle, so paying two extra netsh processes
+        # per route there was a real part of the start-to-RUNNING latency. A
+        # route this process did not install (a legacy persistent leftover)
+        # is not in the ledger and is still converted.
         del_cmd = ["netsh", "interface", "ipv4", "delete", "route", dest, iface]
         if gateway:
             del_cmd.append(gateway)
@@ -1636,7 +1698,7 @@ def add_v6(dest, iface, gateway=None, metric=1):
         # IPv6 on-link routes report NextHop '::' (unspecified) - normalize
         # to '' so it compares equal to an on-link install (gateway='').
         same_iface = r_iface.lower() == iface.lower()
-        same_gateway = r_gw == (gateway or "")
+        same_gateway = _gw_matches(iface, gateway or "", r_gw, "v6")
         if same_iface and same_gateway:
             print(f"    [=] Route already exists and is correct: {dest} -> {iface}")
             found_correct = True
@@ -1653,8 +1715,9 @@ def add_v6(dest, iface, gateway=None, metric=1):
         print(f"    [~] Replacing stale route: {dest} -> {stale_iface}")
         run(del_cmd)
 
-    if found_correct:
-        # Same persistent->active conversion as add_v4 (see there for why).
+    if found_correct and ("v6", dest, iface, gateway) not in added_routes:
+        # Same persistent->active conversion as add_v4, and skipped under the
+        # same condition (see there: our own adds are already store=active).
         del_cmd = ["netsh", "interface", "ipv6", "delete", "route", dest, iface]
         if gateway:
             del_cmd.append(gateway)
@@ -1914,10 +1977,18 @@ _live_mode = {
 def _remove_host_routes_v6(dest):
     """Delete every existing IPv6 route for `dest` (used when a mode switch
     leaves no usable IPv6 gateway for a host: without its direct /128 the
-    traffic rides the TUN splits instead, exactly like the startup path)."""
+    traffic rides the TUN splits instead, exactly like the startup path).
+
+    Returns True when at least one route was actually deleted, so a caller
+    can report the removal only when there was something to remove - the
+    dashboard often cleans the same route up first, and an unconditional
+    "host route removed" line then reported a change that never happened."""
+    removed = False
     for r in get_existing_v6_routes(dest):
         remove_route(("v6", dest, str(r.get("InterfaceAlias", "")),
                       str(r.get("NextHop", "") or "")))
+        removed = True
+    return removed
 
 
 def _remove_host_routes_v4(dest):
@@ -1926,10 +1997,16 @@ def _remove_host_routes_v4(dest):
     the endpoint IP, so Find-NetRoute inside get_egress_for() returns the
     stale route itself - which makes a direct->over-VPN mode switch a
     silent no-op (the VPN's lower-metric default can never beat our own
-    /32). Removing first lets egress resolution see the real table."""
+    /32). Removing first lets egress resolution see the real table.
+
+    Returns True when at least one route was actually deleted (see
+    _remove_host_routes_v6 for why the caller needs to know)."""
+    removed = False
     for r in get_existing_v4_routes(dest):
         remove_route(("v4", dest, str(r.get("InterfaceAlias", "")),
                       str(r.get("NextHop", "") or "")))
+        removed = True
+    return removed
 
 
 def _live_set_vpn_shadow(active):
@@ -2177,19 +2254,26 @@ def _live_apply_servers(hosts, endpoints):
     # next restart sweeps it - losing coverage would not be.
     for ip in list(_live_mode["v4"]):
         if ip not in new_v4:
-            _remove_host_routes_v4(f"{ip}/32")
-            lines.append(f"[-] [U] old server {ip} host route removed")
+            if _remove_host_routes_v4(f"{ip}/32"):
+                lines.append(f"[-] [U] old server {ip} host route removed")
     for ip in list(_live_mode["v6"]):
         if ip not in new_v6:
-            _remove_host_routes_v6(f"{ip}/128")
-            lines.append(f"[-] [U] old server {ip} host route removed")
+            if _remove_host_routes_v6(f"{ip}/128"):
+                lines.append(f"[-] [U] old server {ip} host route removed")
     # (Re)install every current endpoint so it lands under THIS helper's
     # route tracking: the gateway-change re-point and the self-heal only
     # see routes the helper installed itself. add_v4/add_v6 replace any
     # same-prefix copy, so a dashboard-installed route is adopted, never
     # duplicated.
     for ip in new_v4:
-        _remove_host_routes_v4(f"{ip}/32")
+        # NO pre-clean of the NEW server's /32. The dashboard resolves the
+        # server and installs its /32 itself before writing the control file
+        # (see _rehost_endpoint_routes), so this reconcile only has to make the
+        # HELPER's tracking and its 15 s endpoint heal cover the new server.
+        # The pre-clean deleted that live, correct route and then re-added it,
+        # so one [U] server change performed the work TWICE - the "server
+        # change happens twice" report. add_v4 already replaces a drifted
+        # same-prefix copy on its own, so a stale copy is still cleaned up.
         if over:
             # Same deterministic VPN pin as the startup/[V] paths: in
             # over-VPN mode a fresh [U] server's /32 must land on the VPN,
@@ -2208,7 +2292,6 @@ def _live_apply_servers(hosts, endpoints):
             lines.append(f"[!] [U] could not install the {ip}/32 bypass - "
                          "the self-heal retries.")
     for ip in new_v6:
-        _remove_host_routes_v6(f"{ip}/128")
         d6 = get_ipv6_default()
         if d6 and add_v6(f"{ip}/128", d6["InterfaceAlias"],
                          d6.get("NextHop") or "", 1):
@@ -3949,20 +4032,36 @@ def wait_for_tunnel_stable(timeout=5, budget=None):
               "rides over TCP/443...", flush=True)
         _ACTIVE_DNS_MODE = "doh"
         try:
-            configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
+            doh_on = configure_tun(_ACTIVE_DNS4, _ACTIVE_DNS6)
         except Exception as e:
+            doh_on = False
             print(f"[!] DoH switch failed: {e}", flush=True)
-        # Flush the resolver cache so lookups stop hitting the broken plain-UDP
-        # path and pick up the freshly registered DoH servers immediately.
-        # Folded into ONE PowerShell call with the cache clear: each psshell
-        # spawn costs hundreds of ms and this is on the critical path.
-        try:
-            run_ps("Clear-DnsClientCache -ErrorAction SilentlyContinue; "
-                   "ipconfig /flushdns | Out-Null")
-        except Exception:
-            pass
-        if _run_round(" (DoH)"):
-            return True
+        if not doh_on:
+            # Nothing registered, so the adapter still carries the same plain
+            # UDP/53 resolver that just failed to resolve through the tunnel.
+            # A second probe round cannot succeed against it - it would spend
+            # a full _VERIFY_ROUND_BUDGET of start latency to re-report the
+            # same getaddrinfo failure. The monitor loop re-probes anyway, and
+            # the state is announced DEGRADED below so the user sees the real
+            # reason instead of a spinner.
+            print("[!] DoH could not be registered, so resolution through the "
+                  "TUN is still on plain UDP/53 - not re-probing a resolver "
+                  "that just failed. Check the DoH lines above for why "
+                  "(Windows build without DoH support, or a blocked "
+                  "dns-query endpoint).", flush=True)
+        else:
+            # Flush the resolver cache so lookups stop hitting the broken
+            # plain-UDP path and pick up the freshly registered DoH servers
+            # immediately. Folded into ONE PowerShell call with the cache
+            # clear: each psshell spawn costs hundreds of ms and this is on
+            # the critical path.
+            try:
+                run_ps("Clear-DnsClientCache -ErrorAction SilentlyContinue; "
+                       "ipconfig /flushdns | Out-Null")
+            except Exception:
+                pass
+            if _run_round(" (DoH)"):
+                return True
     return False
 
 

@@ -12,8 +12,160 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from tuntop.tunnel.helper import DNS4, DNS6, _resolve_dns_choice
+
+
+class TestEffectiveDnsSingleSource(unittest.TestCase):
+    """The leak, pinned at its source.
+
+    Observed live: the tunnel up, wintun holding 8.8.8.8 + 2606:4700:4700::1111,
+    the catch-all NRPT pin ABSENT, and the health panel reading "no DNS
+    resolver is configured" for all four DNS rows - while a leak test showed
+    the ISP's own resolvers (2.188.21.46, 2.189.44.x).
+
+    `ns.dns4` is None whenever the user relies on the defaults, and the
+    dashboard used to write those raw attributes into the live-reconfig
+    control file. The helper reads a PRESENT-but-null key as "clear this
+    family's DNS" - it has to, that is how an explicit [N] clear is expressed
+    - so every server edit, bypass add/remove and [V]/[Y] toggle silently
+    cleared the running resolver, and a guard with no resolvers would
+    black-hole name resolution, so the helper removed the catch-all pin with
+    it. One bypass addition put the machine back on the ISP's resolvers.
+    """
+
+    def test_no_choice_resolves_to_the_defaults(self):
+        from tuntop.config import defaults as D
+        self.assertEqual(D.resolve_dns_choice(None, None), (D.DNS4, D.DNS6))
+
+    def test_a_choice_is_passed_through_exactly(self):
+        from tuntop.config import defaults as D
+        self.assertEqual(D.resolve_dns_choice("9.9.9.9", None), ("9.9.9.9", None))
+        self.assertEqual(D.resolve_dns_choice(None, "2620:fe::fe"),
+                         (None, "2620:fe::fe"))
+
+    def test_legacy_default_v4_alone_still_means_both(self):
+        from tuntop.config import defaults as D
+        self.assertEqual(D.resolve_dns_choice(D.DNS4, None), (D.DNS4, D.DNS6))
+
+    def test_helper_uses_the_shared_rule(self):
+        """One implementation: two copies drifting apart is what allowed this
+        bug in the first place."""
+        from tuntop.config import defaults as D
+        from tuntop.tunnel import helper
+        for d4, d6 in ((None, None), ("9.9.9.9", None), (None, "2620:fe::fe"),
+                       (D.DNS4, None), (" 1.1.1.1 ", "  ")):
+            self.assertEqual(helper._resolve_dns_choice(d4, d6),
+                             D.resolve_dns_choice(d4, d6))
+
+    def test_control_file_carries_the_effective_pair(self):
+        """The assertion that actually prevents the regression."""
+        import argparse
+        from tuntop.ui import dashboard
+        app = dashboard.BTopTui.__new__(dashboard.BTopTui)
+        app.ns = argparse.Namespace(dns4=None, dns6=None,
+                                    dns_policy="availability")
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, ".ctl.json")
+        with mock.patch.object(dashboard, "_control_file_path",
+                               return_value=path):
+            app._write_control_file()
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        self.assertEqual(payload["dns4"], dashboard._cfgdef.DNS4)
+        self.assertEqual(payload["dns6"], dashboard._cfgdef.DNS6)
+
+    def test_an_unchanged_pair_produces_no_helper_change(self):
+        """End to end: the payload must be a NO-OP for a helper already
+        running on the defaults - the whole point."""
+        import argparse
+        from tuntop.config import defaults as D
+        from tuntop.tunnel import helper
+        from tuntop.ui import dashboard
+        app = dashboard.BTopTui.__new__(dashboard.BTopTui)
+        app.ns = argparse.Namespace(dns4=None, dns6=None,
+                                    dns_policy="availability")
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, ".ctl.json")
+        with mock.patch.object(dashboard, "_control_file_path",
+                               return_value=path):
+            app._write_control_file()
+        saved = (helper.CONTROL_FILE, helper._ACTIVE_DNS4, helper._ACTIVE_DNS6,
+                 helper._ACTIVE_DNS_POLICY, helper._control_mtime,
+                 helper._dns_guard_state)
+        try:
+            helper.CONTROL_FILE = path
+            helper._ACTIVE_DNS4, helper._ACTIVE_DNS6 = D.DNS4, D.DNS6
+            helper._ACTIVE_DNS_POLICY = "availability"
+            helper._control_mtime = 0.0
+            helper._dns_guard_state = None
+            self.assertFalse(
+                helper.poll_control_file(),
+                "a server edit / bypass add must not read as a DNS change")
+            self.assertEqual(helper._ACTIVE_DNS4, D.DNS4)
+            self.assertEqual(helper._ACTIVE_DNS6, D.DNS6)
+        finally:
+            (helper.CONTROL_FILE, helper._ACTIVE_DNS4, helper._ACTIVE_DNS6,
+             helper._ACTIVE_DNS_POLICY, helper._control_mtime,
+             helper._dns_guard_state) = saved
+
+    def test_a_v4_only_choice_still_clears_v6(self):
+        """The fix must not neuter a real choice: an explicit v4-only
+        selection still means 'no IPv6 DNS', in both channels."""
+        import argparse
+        from tuntop.config import defaults as D
+        from tuntop.tunnel import helper
+        from tuntop.ui import dashboard
+        app = dashboard.BTopTui.__new__(dashboard.BTopTui)
+        app.ns = argparse.Namespace(dns4="9.9.9.9", dns6=None,
+                                    dns_policy="availability")
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, ".ctl.json")
+        with mock.patch.object(dashboard, "_control_file_path",
+                               return_value=path):
+            app._write_control_file()
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        self.assertEqual(payload["dns4"], "9.9.9.9")
+        self.assertIsNone(payload["dns6"])
+        saved = (helper.CONTROL_FILE, helper._ACTIVE_DNS4, helper._ACTIVE_DNS6,
+                 helper._ACTIVE_DNS_POLICY, helper._control_mtime,
+                 helper._dns_guard_state, helper.configure_tun,
+                 helper._install_dns_guard)
+        try:
+            helper.CONTROL_FILE = path
+            helper._ACTIVE_DNS4, helper._ACTIVE_DNS6 = D.DNS4, D.DNS6
+            helper._ACTIVE_DNS_POLICY = "availability"
+            helper._control_mtime = 0.0
+            helper._dns_guard_state = None
+            helper.configure_tun = lambda *a, **k: None
+            helper._install_dns_guard = lambda *a, **k: True
+            self.assertTrue(helper.poll_control_file())
+            self.assertEqual(helper._ACTIVE_DNS4, "9.9.9.9")
+            self.assertIsNone(helper._ACTIVE_DNS6)
+        finally:
+            (helper.CONTROL_FILE, helper._ACTIVE_DNS4, helper._ACTIVE_DNS6,
+             helper._ACTIVE_DNS_POLICY, helper._control_mtime,
+             helper._dns_guard_state, helper.configure_tun,
+             helper._install_dns_guard) = saved
+
+    def test_health_rows_receive_the_effective_pair(self):
+        """The rows that read "no DNS resolver is configured" while the tunnel
+        was up and the adapter really did hold 8.8.8.8."""
+        import argparse
+        import inspect
+        from tuntop.ui import dashboard
+        ns = argparse.Namespace(
+            port=10808, server=["1.2.3.4"], dns4=None, dns6=None,
+            endpoint_port=443, bypass_ip=[], vless_over_vpn=False, geoip=None,
+            geoip_code="cn", geoip_target=None, proxy2_port=None,
+            proxy2_server=[])
+        row = [f for label, f in dashboard.build_checks(ns)
+               if label == "DNS configuration (Wintun is selected source)"][0]
+        cell = inspect.getclosurevars(row).nonlocals
+        self.assertEqual(cell["dns_cfg"], dashboard._cfgdef.DNS4)
+        self.assertEqual(cell["dns6_cfg"], dashboard._cfgdef.DNS6)
 
 
 class TestResolveDnsChoice(unittest.TestCase):

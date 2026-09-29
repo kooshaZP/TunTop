@@ -16,6 +16,46 @@ from __future__ import annotations
 DNS4 = "8.8.8.8"
 DNS6 = "2606:4700:4700::1111"
 
+
+def resolve_dns_choice(d4, d6):
+    """The EFFECTIVE resolver pair for a user's --dns4/--dns6 input.
+
+    THE single place this rule lives. It is deliberately in this module
+    because two independent processes need it and they MUST agree: the helper
+    resolves it at startup, and the DASHBOARD resolves it again when it
+    reports the tunnel's configuration, writes the live-reconfig control file
+    and builds the DNS health rows. When those two copies of the rule drifted
+    apart the failure was silent and severe:
+
+      * `ns.dns4` is None whenever the user relies on the defaults, so the
+        dashboard wrote `{"dns4": null, "dns6": null}` into the control file on
+        every server/bypass/mode change. The helper reads a PRESENT-but-null key
+        as "clear this family's DNS" (correct - that is how an explicit
+        clear works), so the running tunnel's resolver was wiped by a server
+        edit, and because a guard with no resolvers would black-hole
+        resolution, the catch-all NRPT leak pin was ACTIVELY REMOVED with it.
+        The DNS health rows said "no resolver configured" at the same time,
+        while the tunnel was up and the adapter really did hold 8.8.8.8.
+
+    Resolving here means the control file always carries the effective pair, so
+    "unchanged" arrives at the helper as genuinely unchanged and every other
+    case (v4-only, v6-only, explicit clear) still means exactly what it says.
+
+      * no input at all              -> both defaults (DNS4 + DNS6)
+      * a real choice (v4 and/or v6) -> EXACTLY what was chosen: a v4-only
+                                        choice gets NO default v6 injected,
+                                        and vice versa
+      * the legacy pass of dns4=DNS4 alone (what old dashboards, profiles and
+        launchers always sent) still means "both defaults"
+    """
+    d4 = str(d4).strip() if d4 else None
+    d6 = str(d6).strip() if d6 else None
+    if not d4 and not d6:
+        return DNS4, DNS6
+    if d4 == DNS4 and not d6:
+        return DNS4, DNS6
+    return d4, d6
+
 # Resolution-fallback policy. 'availability' (default): if the system
 # resolver fails while the tunnel is up, fall back to direct UDP/53 + DoH
 # queries - resolution beats perfection, but a half-broken tunnel CAN leak

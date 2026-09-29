@@ -29,6 +29,179 @@ from tuntop.network import egress_scripts as _es
 from tuntop.tunnel import helper
 
 
+class TestTunNextHopCountsAsTheSameRoute(unittest.TestCase):
+    """Every route through the TUN is installed with the adapter's OWN address
+    as the next hop (TUN4 / TUN6). Windows does not keep it: a next hop that is
+    the outgoing interface's own address reads back as on-link ('0.0.0.0' /
+    '::'). Comparing the wanted next hop against the reported one literally
+    therefore made every single TUN route look STALE on every add.
+
+    The visible symptom was the self-heal firing "though nothing happened": it
+    deleted and re-added 0.0.0.0/1, 128.0.0.0/1, ::/0, ::/1 and 8000::/1 on
+    every cycle, on routes that were already exactly right. Each of those
+    cycles is several PowerShell and netsh processes, so it was also a large
+    slice of the start-to-RUNNING latency.
+    """
+
+    def test_own_v4_address_matches_the_on_link_report(self):
+        self.assertTrue(helper._gw_matches(helper.TUN, helper.TUN4, "", "v4"))
+
+    def test_own_v6_address_matches_the_on_link_report(self):
+        self.assertTrue(helper._gw_matches(helper.TUN, helper.TUN6, "", "v6"))
+
+    def test_secondary_pipe_addresses_too(self):
+        self.assertTrue(helper._gw_matches(helper.TUN2, helper.TUN2_IP4,
+                                          "", "v4"))
+        self.assertTrue(helper._gw_matches(helper.TUN2, helper.TUN2_IP6,
+                                          "", "v6"))
+
+    def test_a_real_gateway_is_unaffected(self):
+        # A physical next hop is never the tunnel's own address, so ordinary
+        # route comparison (and stale-route cleanup) behaves exactly as before.
+        self.assertTrue(helper._gw_matches("Wi-Fi", "192.168.1.1",
+                                          "192.168.1.1", "v4"))
+        self.assertFalse(helper._gw_matches("Wi-Fi", "192.168.1.1",
+                                           "10.0.0.1", "v4"))
+
+    def test_the_wrong_family_own_address_does_not_match(self):
+        self.assertFalse(helper._gw_matches(helper.TUN, helper.TUN6, "", "v4"))
+
+    def test_a_physical_adapter_never_claims_the_tun_address(self):
+        """The exemption belongs to the TUN only. If it leaked to another
+        interface, a physical route pinned to 192.168.123.1 would compare equal
+        to an on-link row and a real stale copy would be left in place."""
+        self.assertFalse(helper._gw_matches("Wi-Fi", helper.TUN4, "", "v4"))
+
+    def test_on_link_never_matches_a_real_next_hop(self):
+        # The reverse direction must stay false: an on-link install does not
+        # become "already correct" because some other row has a gateway.
+        self.assertFalse(helper._gw_matches(helper.TUN, "", helper.TUN4, "v4"))
+
+    def test_the_post_add_identity_check_agrees_with_add_v4(self):
+        """_route_identity_present verifies an add that just succeeded, so it
+        must recognise exactly the same routes add_v4 considers correct.
+
+        It used to normalise on-link to '0.0.0.0' while add_v4 normalises it
+        to ''. Routing the wanted next hop through the SAME helper makes the
+        two agree, so a TUN route (own address installed, reported on-link) is
+        found here too - otherwise a successful TUN install of a /32 would be
+        reported as having vanished."""
+        rows = [{"InterfaceAlias": helper.TUN, "NextHop": "0.0.0.0",
+                 "RouteMetric": 1}]
+        self.assertTrue(helper._route_identity_present(
+            rows, "v4", helper.TUN, helper.TUN4, metric=1))
+        rows6 = [{"InterfaceAlias": helper.TUN, "NextHop": "::",
+                  "RouteMetric": 1}]
+        self.assertTrue(helper._route_identity_present(
+            rows6, "v6", helper.TUN, helper.TUN6, metric=1))
+        # An on-link install must still match an on-link report.
+        self.assertTrue(helper._route_identity_present(
+            rows, "v4", helper.TUN, "", metric=1))
+        # And a genuinely different gateway must still NOT match.
+        self.assertFalse(helper._route_identity_present(
+            rows, "v4", "Wi-Fi", "192.168.1.1", metric=1))
+
+
+class TestTunRouteIsNotRewritten(unittest.TestCase):
+    """add_v4/add_v6 must treat an already-correct TUN route as correct, not as
+    stale. This is the end-to-end version of TestTunNextHopCountsAsTheSameRoute:
+    the unit test proves the comparison, this one proves the comparison is
+    actually the one add_v4 uses (a wrong wiring would pass the unit test and
+    still churn the table on every self-heal)."""
+
+    def setUp(self):
+        # The ledger decides whether the persistent->active conversion runs, so
+        # it must be empty here: these tests decide the ledger state themselves.
+        # RouteLedger iterates 4-tuples (fam, dest, iface, gw) - the same shape
+        # append() takes - so restoring is a straight re-append. (Unpacking each
+        # entry into `item, metric` does not work: the entry IS the 4-tuple.)
+        self._saved = list(helper.added_routes)
+        helper.added_routes.clear()
+
+    def tearDown(self):
+        helper.added_routes.clear()
+        for item in self._saved:
+            helper.added_routes.append(item)
+
+    def _row(self, alias, nexthop):
+        return {"InterfaceAlias": alias, "NextHop": nexthop, "RouteMetric": 1}
+
+    @staticmethod
+    def _fake_run(calls):
+        """Stand in for the shell layer: record the command, report success."""
+        def _run(cmd, *a, **k):
+            calls.append(list(cmd))
+            return (0, "", "")
+        return _run
+
+    def _add(self, family, tracked):
+        """Run one TUN route add with a correct existing row; return
+        (shell commands, printed output)."""
+        import io
+        from contextlib import redirect_stdout
+        calls, buf = [], io.StringIO()
+        dest, gw = (("0.0.0.0/1", helper.TUN4) if family == "v4"
+                    else ("::/1", helper.TUN6))
+        if tracked:
+            # Pretend this process installed it earlier: active store, nothing
+            # to convert.
+            helper.added_routes.append(
+                (family, dest, helper.TUN, gw), metric=1)
+        try:
+            with mock.patch.object(helper, "get_existing_v4_routes",
+                                   return_value=[self._row(helper.TUN,
+                                                           "0.0.0.0")]), \
+                    mock.patch.object(helper, "get_existing_v6_routes",
+                                      return_value=[self._row(helper.TUN,
+                                                              "::")]), \
+                    mock.patch.object(helper, "run", self._fake_run(calls)), \
+                    redirect_stdout(buf):
+                if family == "v4":
+                    helper.add_v4(dest, helper.TUN, gw, metric=1)
+                else:
+                    helper.add_v6(dest, helper.TUN, gw, metric=1)
+        finally:
+            helper.added_routes.clear()
+        return calls, buf.getvalue()
+
+    def test_existing_tun_split_route_is_not_replaced(self):
+        calls, out = self._add("v4", tracked=True)
+        self.assertNotIn("Replacing stale route", out,
+                         "a correct TUN route was judged stale and rewritten")
+        self.assertIn("already exists and is correct", out)
+        self.assertEqual([c for c in calls if "delete" in c], [],
+                         "our own active-store route was deleted and re-added")
+
+    def test_existing_tun_v6_default_is_not_replaced(self):
+        calls, out = self._add("v6", tracked=True)
+        self.assertNotIn("Replacing stale route", out,
+                         "a correct TUN IPv6 route was judged stale and rewritten")
+        self.assertIn("already exists and is correct", out)
+        self.assertEqual([c for c in calls if "delete" in c], [],
+                         "our own active-store route was deleted and re-added")
+
+    def test_a_legacy_persistent_leftover_is_still_converted(self):
+        """The conversion must survive for a route we did NOT install - that is
+        the case it exists for (a pre-store=active build left it in the
+        registry, where it survives a reboot)."""
+        calls, out = self._add("v4", tracked=False)
+        self.assertNotIn("Replacing stale route", out,
+                         "the route is correct, not stale")
+        self.assertTrue([c for c in calls if "delete" in c],
+                        "a legacy persistent leftover was left in the registry")
+
+    def test_a_genuinely_stale_copy_is_still_replaced(self):
+        """The fix must not disable stale-route cleanup: a drifted copy on a
+        different interface is exactly what this code exists to remove."""
+        calls = []
+        with mock.patch.object(helper, "get_existing_v4_routes",
+                               return_value=[self._row("Wi-Fi", "192.168.1.1")]), \
+                mock.patch.object(helper, "run", self._fake_run(calls)):
+            helper.add_v4("0.0.0.0/1", helper.TUN, helper.TUN4, metric=1)
+        self.assertTrue([c for c in calls if "delete" in c],
+                        "a drifted same-prefix copy survived")
+
+
 class TestNormV4Gw(unittest.TestCase):
     """0.0.0.0 and :: are the on-link spellings. netsh must be given NO
     next-hop token for them - a literal 0.0.0.0 is rejected with "The

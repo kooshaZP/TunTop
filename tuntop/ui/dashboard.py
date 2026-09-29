@@ -1422,9 +1422,17 @@ def build_checks(ns):
     # - a resolver the tunnel never uses - and two rows stayed permanently
     # RED, one of them CRITICAL, so the top badge read UNHEALTHY forever with
     # nothing the user could fix. Gate every DNS row on what is really set;
-    # keep the _cfgdef fallback for DISPLAY only.
-    dns_cfg = getattr(ns, "dns4", None) or None
-    dns6_cfg = getattr(ns, "dns6", None) or None
+    # The EFFECTIVE resolvers, resolved by the SAME rule the helper uses at
+    # startup (tuntop.config.defaults.resolve_dns_choice). `ns.dns4` is None
+    # whenever the user relies on the defaults, and reading that as "no DNS"
+    # was wrong twice over: the health rows reported "no resolver configured"
+    # while the tunnel was up and wintun really did hold 8.8.8.8, and - worse -
+    # the live-reconfig control file below was written with dns4:null, which
+    # the (correctly strict) helper reads as "clear this family's DNS". One
+    # server edit therefore wiped the running resolver AND took the catch-all
+    # NRPT leak pin down with it, which is how the DNS went back to the ISP.
+    dns_cfg, dns6_cfg = _cfgdef.resolve_dns_choice(
+        getattr(ns, "dns4", None), getattr(ns, "dns6", None))
     dns = dns_cfg or _cfgdef.DNS4       # probe/display fallback
     dns6 = dns6_cfg or _cfgdef.DNS6     # probe/display fallback
     ep = getattr(ns, "endpoint_port", 443)
@@ -5367,10 +5375,24 @@ class BTopTui:
         so a running tunnel re-binds its DNS without a restart. `extra`
         merges additional keys on top (e.g. the [V]/[Y] mode toggles) - the
         helper treats a MISSING key as "no change", so both writers can
-        never fight each other."""
+        never fight each other.
+
+        The DNS keys carry the EFFECTIVE pair, resolved with the helper's own
+        rule (resolve_dns_choice) - never the raw ns attributes. The helper
+        treats a present-but-null key as "clear this family's DNS" (it has to:
+        that is how an explicit [N] clear is expressed), so writing
+        `ns.dns4` verbatim meant that every server edit, bypass add/remove and
+        [V]/[Y] toggle silently cleared the running resolver - and because a
+        guard with no resolvers would black-hole name resolution, the helper
+        then removed the catch-all NRPT pin as well. One bypass addition
+        turned the machine back over to the ISP's resolvers. With the
+        effective pair, an unchanged configuration arrives as genuinely
+        unchanged, and every real case (v4-only, v6-only, explicit clear)
+        still means exactly what it says."""
         path = _control_file_path()
-        payload = {"dns4": getattr(self.ns, "dns4", None),
-                   "dns6": getattr(self.ns, "dns6", None),
+        _eff4, _eff6 = _cfgdef.resolve_dns_choice(
+            getattr(self.ns, "dns4", None), getattr(self.ns, "dns6", None))
+        payload = {"dns4": _eff4, "dns6": _eff6,
                    "dns_policy": getattr(self.ns, "dns_policy", "availability")}
         if extra:
             payload.update(extra)
@@ -5421,9 +5443,15 @@ class BTopTui:
                 # Set the FULL chosen list (not just the new IP): a v4-only
                 # choice must remove the v6 resolver, and adding a v6 must
                 # not wipe the v4 one. The helper's poll_control_file
-                # re-applies the same list within ~1 s.
-                _servers = [s for s in (getattr(self.ns, "dns4", None),
-                                        getattr(self.ns, "dns6", None)) if s]
+                # re-applies the same list within ~1 s. Resolved with the
+                # shared rule, so this can never build an EMPTY list (which
+                # would strip every resolver off the adapter) - the raw ns
+                # attributes are both None whenever the user relies on the
+                # defaults.
+                _eff4, _eff6 = _cfgdef.resolve_dns_choice(
+                    getattr(self.ns, "dns4", None),
+                    getattr(self.ns, "dns6", None))
+                _servers = [s for s in (_eff4, _eff6) if s]
                 _lst = ",".join("'" + s + "'" for s in _servers)
                 _ps("Set-DnsClientServerAddress -InterfaceAlias 'wintun' "
                     f"-ServerAddresses @({_lst}) -ErrorAction SilentlyContinue; "
@@ -7851,9 +7879,21 @@ class BTopTui:
                 # Drain log queue
                 while not self.logs.empty():
                     try:
-                        self.log_lines.append(self.logs.get_nowait())
+                        _ln = self.logs.get_nowait()
                     except queue.Empty:
                         break
+                    self.log_lines.append(_ln)
+                    # Mirror to the session log. These are the lines that
+                    # arrive through the queue - which is the HELPER's stdout,
+                    # i.e. exactly the startup/guard/self-heal verdicts that
+                    # matter and that _blog() never sees. Without this the
+                    # on-disk log held dashboard lines only, so a session
+                    # whose helper output explained the failure still left no
+                    # trace of the explanation.
+                    _sev = (_LOG_ERROR if _ln.startswith("[!]") else
+                            (_LOG_WARNING if _ln.startswith("[*]") else
+                             _LOG_INFO))
+                    self._session_log_write(_sev, "HELPER", _ln)
                 self.log_lines = self.log_lines[-200:]
 
                 try:

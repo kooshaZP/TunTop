@@ -11,6 +11,8 @@ Everything here is text/state/logic: the PowerShell runner is INJECTED, so
 these tests never touch the real registry (on an elevated machine a real
 install would pin the whole system's name resolution).
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -827,6 +829,68 @@ class TestSessionFileRetirement(unittest.TestCase):
         self.assertIn("_retire_session_files()", body)
 
 
+class TestConfigureTunDohModes(unittest.TestCase):
+    """configure_tun() returns "is the resolver on DoH now?", and all three
+    --dns-mode values must be able to answer it.
+
+    The `applied` flag was initialised INSIDE the mode branches, and "plain"
+    matches neither branch - so `--dns-mode plain` (a documented, supported
+    choice) raised UnboundLocalError at the final `return applied`. The DoH
+    escalation calls this inside a try/except, so the crash did not show up
+    there; the tunnel bring-up, poll_control_file and self_heal_tunnel call it
+    UNGUARDED, so the helper died at startup with that mode."""
+
+    def _call(self, mode, **extra):
+        """Run configure_tun with every Windows edge stubbed. `extra` maps a
+        helper name to the return_value it should answer with, and is applied
+        LAST so a test can override the default True."""
+        from tuntop.tunnel import helper
+        returns = {"_disable_netbios_on_wintun": True,
+                   "_register_doh_server": True,
+                   "_set_wintun_dns_servers": True}
+        returns.update(extra)
+        void = ("_set_wintun_addresses_plain", "_set_wintun_interface_metric")
+        with contextlib.ExitStack() as stack:
+            for name in void:
+                stack.enter_context(mock.patch.object(helper, name))
+            for name, val in returns.items():
+                stack.enter_context(
+                    mock.patch.object(helper, name, return_value=val))
+            stack.enter_context(mock.patch.object(helper, "_ACTIVE_DNS_MODE",
+                                                  mode))
+            with contextlib.redirect_stdout(io.StringIO()):
+                return helper.configure_tun("8.8.8.8", "2606:4700:4700::1111")
+
+    def test_every_mode_answers(self):
+        self.assertIs(self._call("doh"), True)
+        self.assertIs(self._call("auto"), False)
+        self.assertIs(self._call("plain"), False)
+
+    def test_plain_never_registers_doh(self):
+        from tuntop.tunnel import helper
+        calls = []
+        with mock.patch.object(helper, "print",
+                               side_effect=lambda *a, **k: calls.append(a[0]
+                                                                        if a else "")):
+            self._call("plain")
+        joined = "\n".join(str(c) for c in calls)
+        self.assertNotIn("Wintun DNS set to DoH", joined)
+
+    def test_a_failed_registration_is_not_reported_as_applied(self):
+        """The escalation caller skips a doomed re-probe on False, so False
+        must mean what the message says."""
+        from tuntop.tunnel import helper
+        with mock.patch.object(helper, "_set_wintun_dns_servers") as sets:
+            self.assertIs(self._call("doh", _register_doh_server=False),
+                          False)
+        # Nothing registered -> the adapter's list must not be touched.
+        sets.assert_not_called()
+
+    def test_a_failed_adapter_set_is_not_reported_as_applied(self):
+        self.assertIs(self._call("doh", _set_wintun_dns_servers=False),
+                      False)
+
+
 class TestStaleWintunDeviceCleanup(unittest.TestCase):
     """An ORPHANED Wintun PnP device node blocks the next start.
 
@@ -955,6 +1019,19 @@ class TestSessionLog(unittest.TestCase):
         src = open(dashboard.__file__, encoding="utf-8").read()
         self.assertIn("TUNTOP_NO_SESSION_LOG", src)
         self.assertIn("tuntop_session_", src)
+
+    def test_helper_output_reaches_the_session_log(self):
+        """The queue carries the HELPER's stdout - the startup, guard and
+        self-heal verdicts. _blog() never sees those, so if the drain loop
+        does not mirror them the on-disk log holds dashboard lines only and a
+        session whose helper output explained the failure still leaves no
+        trace of the explanation."""
+        from tuntop.ui import dashboard
+        src = open(dashboard.__file__, encoding="utf-8").read()
+        drain = src.split("# Drain log queue", 1)[1][:2000]
+        self.assertIn("self.logs.get_nowait()", drain)
+        self.assertIn("_session_log_write", drain)
+        self.assertIn("HELPER", drain)
 
     def test_exported_with_the_diagnostics_section(self):
         """It has to be findable, or it is not evidence - the [D] export

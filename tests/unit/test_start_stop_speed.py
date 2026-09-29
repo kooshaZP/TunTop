@@ -97,18 +97,41 @@ class TestVerifyBudget(unittest.TestCase):
 
     def test_a_fetch_failure_still_gets_its_retries(self):
         """Only DNS failures fast-path. A resolved-but-failed fetch can be
-        transient, so the retry budget must remain."""
+        transient, so the retry budget must remain.
+
+        The retry GAP is observed, not slept. This test used to run against the
+        real clock with a 2.0s budget - exactly the `time.sleep(2)` the worker
+        takes between attempts - so whether a second attempt landed before the
+        round's deadline was decided by thread scheduling: the workers woke at
+        t=2.000 and the round loop noticed its (equally 2.0s) deadline at
+        t=2.000 too. It failed on the CI runner and passed on an idle machine,
+        so the failure said nothing about the code. Sleep is recorded instead,
+        which makes the attempt count deterministic while still pinning the
+        spacing the retry budget promises."""
         n = []
+        slept = []
 
         def _fetch_fail(url, timeout=5):
             n.append(url)
             return False, f"{_host(url)} resolved (1.2.3.4) but fetch failed: timeout"
+
+        class _RecordedClock:
+            """A real clock with a non-blocking sleep. The round's own
+            deadlines stay wall-clock (monotonic is the real one); only the
+            inter-attempt wait is recorded rather than taken."""
+            monotonic = staticmethod(time.monotonic)
+
+            def sleep(self, seconds):
+                slept.append(seconds)
+
         with mock.patch.object(H, "_probe_tunnel_no_dns", return_value=(True, "TUN carries TCP")), _tunnel_up(), mock.patch.object(H, "_probe_tunnel_once", side_effect=_fetch_fail), \
                 mock.patch.object(H, "_ACTIVE_DNS_MODE", "plain"), \
-                mock.patch.object(H, "time", wraps=time):
+                mock.patch.object(H, "time", _RecordedClock()):
             H.wait_for_tunnel_stable(timeout=1, budget=2.0)
         self.assertGreater(len(n), len(H._VERIFY_URLS),
                            "non-DNS failures lost their retries")
+        self.assertEqual(set(slept), {2},
+                         "non-DNS retries are no longer spaced 2s apart")
 
     def test_doh_escalation_is_skipped_when_out_of_budget(self):
         """No point reconfiguring the resolver and flushing the DNS cache when
@@ -134,11 +157,81 @@ class TestVerifyBudget(unittest.TestCase):
             return True, "host resolved -> 1.2.3.4"
         with mock.patch.object(H, "_probe_tunnel_no_dns", return_value=(True, "TUN carries TCP")), _tunnel_up(), mock.patch.object(H, "_probe_tunnel_once", side_effect=_probe), \
                 mock.patch.object(H, "_ACTIVE_DNS_MODE", "auto"), \
-                mock.patch.object(H, "configure_tun") as cfg, \
+                mock.patch.object(H, "configure_tun", return_value=True) as cfg, \
                 mock.patch.object(H, "run_ps"):
             ok = H.wait_for_tunnel_stable(timeout=1, budget=20.0)
         cfg.assert_called_once()
         self.assertTrue(ok)
+
+
+class TestDohEscalationThatCannotTake(unittest.TestCase):
+    """When the DoH switch does not actually take, the second probe round is a
+    foregone conclusion and its cost is pure start latency.
+
+    The escalation runs when plain UDP/53 cannot resolve through the TUN. If
+    the DoH registration then fails (a Windows build without DoH support, or a
+    blocked dns-query endpoint), the adapter is left holding the SAME broken
+    plain resolver that just failed, so re-probing it cannot succeed. The old
+    code ran that second round anyway: a full _VERIFY_ROUND_BUDGET spent to
+    re-report the identical getaddrinfo failure, which is a visible slice of
+    the "start takes too long" the user reported.
+
+    The verdict stays DEGRADED either way - this only removes the wasted wait,
+    it does not paper over a tunnel that is not carrying traffic.
+    """
+
+    def _run(self, doh_on):
+        seen = []
+
+        def _probe(url, timeout=5):
+            seen.append(url)
+            return False, "DNS resolve x: [Errno 11001] getaddrinfo failed"
+
+        with mock.patch.object(H, "_probe_tunnel_no_dns",
+                               return_value=(True, "TUN carries TCP")), \
+                _tunnel_up(), \
+                mock.patch.object(H, "_probe_tunnel_once", side_effect=_probe), \
+                mock.patch.object(H, "_ACTIVE_DNS_MODE", "auto"), \
+                mock.patch.object(H, "configure_tun", return_value=doh_on), \
+                mock.patch.object(H, "run_ps") as ps:
+            ok = H.wait_for_tunnel_stable(timeout=1, budget=20.0)
+        return ok, seen, ps
+
+    def test_no_second_round_when_doh_did_not_register(self):
+        ok, seen, ps = self._run(doh_on=False)
+        self.assertFalse(ok, "an unverified tunnel must not report success")
+        self.assertEqual(len(seen), len(H._VERIFY_URLS),
+                         "the doomed DoH round ran against the same broken "
+                         "resolver")
+        ps.assert_not_called()
+
+    def test_second_round_still_runs_when_doh_took(self):
+        """The guard must be narrow: a successful registration genuinely can
+        fix resolution, so that round must still happen."""
+        ok, seen, ps = self._run(doh_on=True)
+        self.assertGreater(len(seen), len(H._VERIFY_URLS),
+                           "the post-DoH verification round was skipped")
+
+    def test_the_reason_is_reported_not_swallowed(self):
+        """The user is told the resolver is still plain UDP/53, so a DEGRADED
+        verdict is diagnosable instead of looking like a mystery."""
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with mock.patch.object(H, "_probe_tunnel_no_dns",
+                               return_value=(True, "TUN carries TCP")), \
+                _tunnel_up(), \
+                mock.patch.object(H, "_probe_tunnel_once", side_effect=
+                                  lambda u, timeout=5:
+                                  (False, "DNS resolve x: [Errno 11001] failed")), \
+                mock.patch.object(H, "_ACTIVE_DNS_MODE", "auto"), \
+                mock.patch.object(H, "configure_tun", return_value=False), \
+                mock.patch.object(H, "run_ps"), \
+                redirect_stdout(buf):
+            H.wait_for_tunnel_stable(timeout=1, budget=20.0)
+        out = buf.getvalue()
+        self.assertIn("still on plain UDP/53", out)
+        self.assertIn("not re-probing", out)
 
 
 class TestLiteralTunnelProbe(unittest.TestCase):

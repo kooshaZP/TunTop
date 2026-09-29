@@ -182,21 +182,56 @@ class TestLiveApplyServers(unittest.TestCase):
         with mock.patch.object(helper, "_remove_host_routes_v4") as rm, \
              mock.patch.object(helper, "get_egress_for",
                                return_value=("Wi-Fi", "192.168.1.1")) as eg, \
+             mock.patch.object(helper, "_direct_bypass_egress",
+                               return_value=("Wi-Fi", "192.168.1.1")), \
              mock.patch.object(helper, "add_v4", return_value=True) as add:
             lines = helper._live_apply_servers(
                 ["1.2.3.4"], {"1.2.3.4": {"v4": ["1.2.3.4"], "v6": []}})
-        # Called for the dropped old server AND as the pre-clean before the
-        # fresh install (the startup pattern - a stale copy can never
-        # outrank the new route).
-        rm.assert_any_call("9.9.9.9/32")
-        rm.assert_any_call("1.2.3.4/32")
-        self.assertEqual(rm.call_count, 2)
-        eg.assert_called_once_with("1.2.3.4", exclude_vpn=True)
+        # Only the DROPPED server's /32 is removed. The NEW server's route is
+        # NOT pre-cleaned: the dashboard resolves it and installs the /32
+        # itself before writing the control file, so deleting and re-adding it
+        # here did the work twice for one [U] change ("server change happens
+        # twice"), and it briefly tore down a live, correct route. add_v4
+        # already replaces a drifted same-prefix copy.
+        rm.assert_called_once_with("9.9.9.9/32")
         add.assert_called_once_with("1.2.3.4/32", "Wi-Fi", "192.168.1.1",
                                     metric=1)
         self.assertEqual(helper._live_mode["v4"], ["1.2.3.4"])
         self.assertEqual(helper._live_mode["args"].server, ["1.2.3.4"])
         self.assertTrue(any("9.9.9.9" in ln for ln in lines))
+
+    def test_a_dropped_server_reports_removal_only_when_one_existed(self):
+        """The dashboard resolves the new server and removes the old one's
+        /32 itself, so by the time this reconcile runs there is often nothing
+        left to delete. The line claimed a removal either way, so one [U]
+        change printed the same transition twice and the second copy described
+        a change that never happened."""
+        with mock.patch.object(helper, "_remove_host_routes_v4",
+                               return_value=False) as rm, \
+             mock.patch.object(helper, "get_egress_for",
+                               return_value=("Wi-Fi", "192.168.1.1")), \
+             mock.patch.object(helper, "_direct_bypass_egress",
+                               return_value=("Wi-Fi", "192.168.1.1")), \
+             mock.patch.object(helper, "add_v4", return_value=True):
+            lines = helper._live_apply_servers(
+                ["1.2.3.4"], {"1.2.3.4": {"v4": ["1.2.3.4"], "v6": []}})
+        rm.assert_called_once_with("9.9.9.9/32")
+        self.assertFalse([ln for ln in lines if "9.9.9.9" in ln],
+                         "reported removing a route the dashboard already removed")
+
+    def test_a_dropped_server_that_did_exist_is_reported(self):
+        with mock.patch.object(helper, "_remove_host_routes_v4",
+                               return_value=True), \
+             mock.patch.object(helper, "get_egress_for",
+                               return_value=("Wi-Fi", "192.168.1.1")), \
+             mock.patch.object(helper, "_direct_bypass_egress",
+                               return_value=("Wi-Fi", "192.168.1.1")), \
+             mock.patch.object(helper, "add_v4", return_value=True):
+            lines = helper._live_apply_servers(
+                ["1.2.3.4"], {"1.2.3.4": {"v4": ["1.2.3.4"], "v6": []}})
+        self.assertTrue([ln for ln in lines
+                         if "9.9.9.9" in ln and "removed" in ln],
+                        "a real removal went unreported")
 
     def test_add_mode_keeps_untouched_server_endpoints(self):
         # ADD mode: the map from the dashboard covers EVERY current server
