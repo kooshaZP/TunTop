@@ -169,6 +169,63 @@ class TestBackoffAndEscalation(unittest.TestCase):
             eng.shutdown()
 
 
+    def test_report_mid_repair_does_not_open_a_second_incident(self):
+        """The flood test above races the worker: whether a report lands
+        INSIDE the attempt window depends on thread scheduling, which is why
+        it failed on CI on 3.10/3.11 while passing on 3.12. Reporting from
+        inside the repair exercises the absorbed-report path deterministically
+        - the report is stored while that attempt is the one in flight, and a
+        VERIFIED fix must not turn a stale same-kind report into a second
+        repair for the same incident."""
+        m = TunnelStateMachine(initial=TunnelState.DEGRADED)
+        attempts = []
+        eng = make_engine(m)
+
+        def repair():
+            attempts.append(1)
+            if len(attempts) == 1:
+                eng.report_failure(FailureKind.DNS, "raised mid-repair")
+            return True
+
+        eng.register(FailureKind.DNS, [RecoveryAction("fix", repair=repair)])
+        try:
+            eng.report_failure(FailureKind.DNS)
+            wait_for(lambda: eng.stats()["repairs_ok"] == 1,
+                     what="single repair success")
+            time.sleep(0.05)
+            self.assertEqual(len(attempts), 1)          # no duplicate repair
+            self.assertEqual(eng.stats()["incidents"], 1)
+        finally:
+            eng.shutdown()
+
+    def test_new_kind_reported_mid_repair_is_still_actioned(self):
+        """The other half of that rule. The pending slot exists because the
+        reader thread reports a dead helper only ONCE, so a DIFFERENT failure
+        arriving while an attempt runs must survive that attempt - including
+        when the attempt succeeds."""
+        m = TunnelStateMachine(initial=TunnelState.DEGRADED)
+        attempts = []
+        eng = make_engine(m)
+
+        def dns_repair():
+            attempts.append("dns")
+            eng.report_failure(FailureKind.PROCESS, "helper died mid-repair")
+            return True
+
+        eng.register(FailureKind.DNS,
+                     [RecoveryAction("fix dns", repair=dns_repair)])
+        eng.register(FailureKind.PROCESS, [RecoveryAction(
+            "restart helper",
+            repair=lambda: attempts.append("process") or True)])
+        try:
+            eng.report_failure(FailureKind.DNS)
+            wait_for(lambda: "process" in attempts,
+                     what="the mid-repair PROCESS report was actioned")
+            self.assertEqual(attempts, ["dns", "process"])
+        finally:
+            eng.shutdown()
+
+
 class TestPauseAndGiveUp(unittest.TestCase):
     def test_pause_blocks_reports(self):
         m = TunnelStateMachine(initial=TunnelState.DEGRADED)

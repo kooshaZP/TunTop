@@ -437,7 +437,10 @@ class RecoveryEngine:
                         TunnelState.RUNNING,
                         f"recovery verified after '{action.name}'")
                 self._log(f"[+] Recovery verified: {action.name} fixed it.")
-                self._drain_pending()
+                # A report absorbed during this attempt describes the failure
+                # that was just fixed - it must NOT become a second incident
+                # for the same flood (see _drain_pending).
+                self._drain_pending(same_kind=incident.kind)
                 return
             self._stats["repairs_failed"] += 1
             if incident.attempt >= self._max_attempts:
@@ -489,16 +492,35 @@ class RecoveryEngine:
                       f"{self._fmt(wait)}.")
         self._wakeup.set()
 
-    def _drain_pending(self):
+    def _drain_pending(self, same_kind=None):
         """Turn a report absorbed during an attempt into a real incident.
 
         Must be called with the lock held, and it schedules the incident
-        directly (report_failure would try to re-take the lock)."""
+        directly (report_failure would try to re-take the lock).
+
+        `same_kind` is the kind the attempt just handled, passed by the
+        SUCCESS path. A matching pending report is DROPPED there instead of
+        being re-opened: it was raised while the repair was already in
+        flight, and that repair then verified a fix - so it is stale by
+        definition. Re-opening it made one flood cost a second repair, and a
+        slow repair plus a monitor that reports every 200 ms kept the engine
+        permanently one incident behind (the module's "a report flood never
+        accelerates the schedule" contract, pinned by
+        test_report_flood_does_not_accelerate_or_duplicate). A pending report
+        of a DIFFERENT kind is still actioned - that one is the reader
+        thread's "a dead helper is reported only once" case the pending slot
+        exists for.
+        """
         pending = self._pending_report
         if not pending:
             return
         self._pending_report = None
         kind, detail, delay = pending
+        if same_kind is not None and kind is same_kind:
+            self._log(f"[i] {kind.value} report(s) raised while the attempt "
+                      "was running are dropped - it verified a fix after they "
+                      "were reported, so they describe the failure it fixed.")
+            return
         if self._stopped or self._paused or self._gave_up:
             return
         if kind not in self._ladders or self._incident is not None:
