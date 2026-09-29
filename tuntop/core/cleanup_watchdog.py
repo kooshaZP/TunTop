@@ -593,16 +593,33 @@ def main(argv=None) -> int:
              "recovery can still clean up")
 
     try:
-        # Bounded wait: the dashboard normally exits within seconds, but a
-        # wedged one (a hung console read, a blocked PowerShell) must not
-        # park the watchdog forever - every sweep below is deadline-free
-        # otherwise and nothing would ever run. 15 minutes is far beyond any
-        # legitimate dashboard lifetime.
-        if not wait_for_exit(args.pid, timeout_s=900.0):
-            _log("watchdog: dashboard still alive after 15m - abandoning "
-                 "the sweep (refusing to tear down a running session)",
-                 None)
-            return 0
+        # Wait for the dashboard to die - for as long as it lives.
+        #
+        # This used to be bounded at 15 minutes, and the log on the reporting
+        # machine showed exactly what that costs:
+        #     "watchdog: dashboard still alive after 15m - abandoning the
+        #      sweep (refusing to tear down a running session)"
+        # A watchdog whose only job is to survive its parent was giving up on
+        # every session longer than a quarter of an hour - i.e. most of them.
+        # After that the catch-all NRPT DNS pin, the wintun adapter and every
+        # route stayed exactly as they were when the user closed the console
+        # with Alt+F4, and DNS stayed hijacked machine-wide until the next
+        # launch happened to run startup recovery. Refusing to tear down a
+        # RUNNING session is right; giving up on a LONG one is not - a session
+        # that is still up has not failed yet, and when it does die this
+        # process is still here to clean up.
+        #
+        # It is a hidden, console-less process with a 1 s wait slice, so
+        # waiting costs nothing. A heartbeat keeps the state visible in
+        # .cleanup_watchdog.log rather than silent.
+        _heartbeat = 0.0
+        while True:
+            if wait_for_exit(args.pid, timeout_s=60.0):
+                break
+            if time.time() - _heartbeat > 600.0:
+                _heartbeat = time.time()
+                _log(f"watchdog: dashboard pid {args.pid} still running - "
+                     "still watching for its exit (nothing to sweep yet)", None)
         # Grace: a clean exit may still be tearing routes down right now
         # (atexit runs inside the parent, but the OS can report the exit a
         # moment before the last route delete lands).

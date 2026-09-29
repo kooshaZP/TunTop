@@ -891,6 +891,72 @@ class TestConfigureTunDohModes(unittest.TestCase):
                       False)
 
 
+class TestWatchdogOutlivesTheSession(unittest.TestCase):
+    """Alt+F4 kills the dashboard and the helper; only the DETACHED watchdog
+    is left to clean up - and the catch-all NRPT pin must go with it.
+
+    The watchdog was spawned with CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+    so it is not attached to the console Alt+F4 closes and survives it. But it
+    used to abandon the sweep after 15 minutes, and the log on the reporting
+    machine showed the cost:
+        "watchdog: dashboard still alive after 15m - abandoning the sweep"
+    Any session longer than that left the pin, the adapter and the routes
+    behind until the next launch ran startup recovery."""
+
+    def _source(self):
+        from tuntop.core import cleanup_watchdog
+        return open(cleanup_watchdog.__file__, encoding="utf-8").read()
+
+    def test_it_does_not_abandon_a_long_session(self):
+        """No exit path may return from the wait WITHOUT sweeping.
+
+        The old bound was `if not wait_for_exit(pid, 900.0): return 0`, so a
+        session longer than 15 minutes left nothing to clean up. The property
+        worth pinning is structural: between the wait and the sweep there is
+        no `return` at all. (Asserting on the old log wording would only match
+        the comment that documents the fix.)"""
+        src = self._source()
+        main = src.split("def main(", 1)[1] if "def main(" in src else src
+        self.assertNotIn("timeout_s=900.0", main)
+        wait_at = main.index("wait_for_exit(args.pid")
+        sweep_at = main.index("sweep_after_unclean_exit(args.pid")
+        between = main[wait_at:sweep_at]
+        self.assertNotIn("return", between,
+                         "the wait can still end the watchdog without sweeping")
+
+    def test_it_waits_in_a_loop_and_keeps_sweeping_afterwards(self):
+        src = self._source()
+        main = src.split("def main(", 1)[1] if "def main(" in src else src
+        self.assertIn("while True:", main)
+        self.assertIn("wait_for_exit", main)
+        # ...and the sweep still runs once the dashboard is actually gone.
+        after = main.split("while True:", 1)[1]
+        self.assertIn("sweep_after_unclean_exit", after)
+
+    def test_a_long_wait_is_visible_not_silent(self):
+        src = self._source()
+        main = src.split("def main(", 1)[1] if "def main(" in src else src
+        self.assertIn("_log(", main)
+        self.assertIn("still running", main)
+
+    def test_the_sweep_still_removes_the_guard(self):
+        """The end the whole thing exists for."""
+        from tuntop.core import cleanup_watchdog
+        src = open(cleanup_watchdog.__file__, encoding="utf-8").read()
+        self.assertIn("scan(", src)
+        self.assertIn("recover(", src)
+        self.assertTrue(hasattr(cleanup_watchdog, "sweep_after_unclean_exit"))
+
+    def test_the_watchdog_is_spawned_without_the_console(self):
+        """If it shared the console, Alt+F4 would kill it too and nothing
+        would be left to do the cleanup."""
+        from tuntop.ui import dashboard
+        src = open(dashboard.__file__, encoding="utf-8").read()
+        spawn = src.split("_wd_cmd = [sys.executable", 1)[1][:3000]
+        self.assertIn("CREATE_NO_WINDOW", spawn)
+        self.assertIn("CREATE_NEW_PROCESS_GROUP", spawn)
+
+
 class TestStaleWintunDeviceCleanup(unittest.TestCase):
     """An ORPHANED Wintun PnP device node blocks the next start.
 

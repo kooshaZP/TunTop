@@ -2,6 +2,21 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.48] - 2026-09-29
+
+Closing the console with **Alt+F4** did not reliably restore DNS, and the cleanup watchdog's own log said why.
+
+### Fixed (the watchdog gave up on every session longer than 15 minutes)
+- **`watchdog: dashboard still alive after 15m - abandoning the sweep (refusing to tear down a running session)`** - twice, in `.cleanup_watchdog.log` on the reported machine. The watchdog's entire job is to outlive the dashboard and clean up after it, and it was bounded at 15 minutes: `if not wait_for_exit(args.pid, timeout_s=900.0): return 0`. A session longer than a quarter of an hour - i.e. nearly every real one - therefore ended with **no cleanup process at all**. Closing that session with Alt+F4 killed the dashboard and the helper instantly, so neither `cleanup()` nor the dashboard's stop checklist ever ran, and the catch-all NRPT pin, the wintun adapter and every route stayed exactly as they were: DNS stayed hijacked machine-wide until the next launch happened to run startup recovery.
+- The watchdog now waits **for as long as the dashboard lives**, in 60 s slices, and sweeps the moment it dies. Refusing to tear down a *running* session is still correct; giving up on a *long* one is not - a session that is still up has not failed yet. It is a hidden, console-less process with a 1 s wait slice, so waiting costs nothing, and a 10-minute heartbeat keeps `.cleanup_watchdog.log` informative instead of silent. There is now no code path from the wait to the sweep that returns without sweeping, which is the property the tests pin.
+
+### How the two exit paths compare
+- **`[Q]` / the close button / Ctrl-C** - the clean path: the helper's `cleanup()` removes the guard, the dashboard's stop checklist runs `_sweep_dns_guard()` again (idempotent), the crash marker and session files are retired, and the watchdog sees a clean exit and does nothing.
+- **Alt+F4 / Task Manager / power loss** - the unclean path: nothing in the dashboard can run, so the detached watchdog is the only owner left. It survives Alt+F4 because it is spawned with `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` and is therefore *not* attached to the console being closed; it notices within a second, waits the 3 s grace for in-flight deletes, then sweeps - including the NRPT pin. The one remaining gap is unchanged and deliberate: if the watchdog itself never started (it is best-effort, and the code says so), the rule survives until the next launch, which removes it.
+
+### Tests
+- 1055 passed, 7 skipped (was 1045/7). `TestWatchdogOutlivesTheSession` pins the abandonment (structurally: no `return` between the wait and the sweep), the heartbeat, the sweep still calling the guard removal, and the console-less spawn that lets it survive Alt+F4.
+
 ## [1.0.47] - 2026-09-29
 
 **The DNS leak was self-inflicted.** The catch-all NRPT pin was installed correctly at startup, and then **removed by the user's own next action** - changing the server, adding a bypass, or toggling `[V]`/`[Y]`.
