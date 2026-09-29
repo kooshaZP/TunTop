@@ -55,6 +55,20 @@ def make_probes(orphans=0, wintun_routes=0, host_routes=(), fail=None,
     return p, calls, state
 
 
+def dead_session(_path):
+    """Pin scan()'s liveness verdict to "the session that wrote this marker is
+    gone".
+
+    The verdict must not be inherited from the machine running the suite:
+    `marker_is_live` answers True for ANY process in the host's PID table, and
+    CI runners reuse low PIDs (999 was live on windows-latest), so scan()
+    reported a live session, `dirty` came back False and the crash marker was
+    treated as another instance's. `marker_live` is scan()'s injection point
+    for exactly this - pass it wherever a leftover marker is simulated.
+    """
+    return False
+
+
 class TestMarker(unittest.TestCase):
     def setUp(self):
         self.path = os.path.join(tempfile.mkdtemp(), "marker.json")
@@ -106,9 +120,24 @@ class TestScan(unittest.TestCase):
     def test_unclean_marker_marks_dirty_with_pid(self):
         path = os.path.join(tempfile.mkdtemp(), "marker.json")
         write_marker(999, path)
-        f = scan(probes=make_probes()[0], marker_path=path)
+        f = scan(probes=make_probes()[0], marker_path=path,
+                 marker_live=dead_session)
         self.assertTrue(f.dirty)
         self.assertEqual(f.marker["pid"], 999)
+
+    def test_live_marker_is_left_alone(self):
+        """The mirror case: a marker whose dashboard PID is STILL RUNNING
+        belongs to another instance. It is not a crash, so nothing is
+        reported - and not a single probe is consulted."""
+        path = os.path.join(tempfile.mkdtemp(), "marker.json")
+        write_marker(999, path)
+        p, calls, _ = make_probes(orphans=2, wintun_routes=3)
+        f = scan(probes=p, marker_path=path, marker_live=lambda _p: True)
+        self.assertFalse(f.dirty)
+        self.assertEqual(f.live_session, 999)
+        self.assertIsNone(f.marker)
+        self.assertEqual(calls, [])                    # no probe ran
+        self.assertIn("999", " ".join(f.summary_lines()))
 
     def test_broken_probes_degrade_to_clean_not_crash(self):
         p, _, _ = make_probes(fail={"tun2socks_count", "wintun_route_count",
@@ -279,7 +308,8 @@ class TestOneCallConvenience(unittest.TestCase):
         path = os.path.join(tempfile.mkdtemp(), "marker.json")
         write_marker(111, path)                   # leftover from a crash
         p, _, state = make_probes(wintun_routes=4)
-        actions = startup_recover(probes=p, marker_path=path)
+        actions = startup_recover(probes=p, marker_path=path,
+                                  marker_live=dead_session)
         self.assertEqual(len(actions), 1)
         self.assertTrue(state["torn_down"])
         # The stale marker was REPLACED by this run's marker.

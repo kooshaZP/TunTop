@@ -543,12 +543,21 @@ def _do_sweep(p: Probes, f: StartupFindings) -> str:
 
 
 def startup_recover(hosts=None, log=None, marker_path: str = MARKER_FILE,
-                    probes: Optional[Probes] = None) -> list:
+                    probes: Optional[Probes] = None,
+                    marker_live: Optional[Callable[[str], Optional[bool]]] = None
+                    ) -> list:
     """One-call convenience for the dashboard: scan + recover + write the
     fresh marker. Returns the recovery actions (empty list on a clean
-    system)."""
+    system).
+
+    `marker_live` is forwarded to `scan` (see the note there): a caller can
+    state the previous session's liveness instead of inheriting the verdict
+    from the host's process table, which is what makes "a crashed run is
+    recovered" testable on a machine whose PID table is unknown.
+    """
     p = probes
-    findings = scan(hosts=hosts, probes=p, marker_path=marker_path)
+    findings = scan(hosts=hosts, probes=p, marker_path=marker_path,
+                    marker_live=marker_live)
     if findings.live_session:
         # Deliberately do NOT write our own marker: that would steal
         # ownership from the session that is still running, so its watchdog

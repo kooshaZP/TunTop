@@ -34,6 +34,23 @@ def make_marker(pid=1234, helper_pid=None, path=None):
     return path
 
 
+def dead_session(_path):
+    """Pin scan()'s liveness verdict to "the session that wrote this marker is
+    gone".
+
+    Every test below simulates a CRASHED run, and the verdict must not be
+    inherited from the machine running the suite: `marker_is_live` answers
+    True for ANY process in the host's PID table, and CI runners reuse low
+    PIDs - 999 was live on windows-latest. scan() then reported a live
+    session, so `dirty` was False and recover() refused to touch anything:
+    test_unclean_exit_runs_sweep_and_clears_marker and
+    test_leftover_dns_guard_is_removed failed on CI while passing locally.
+    `marker_live` is the injection point scan() documents for exactly this,
+    so pass it wherever a marker is present.
+    """
+    return False
+
+
 # ── wait_for_exit ────────────────────────────────────────────────────
 
 class TestWaitForExit(unittest.TestCase):
@@ -150,13 +167,19 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
         with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
                    return_value=0), \
              patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
-                   return_value=0):
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.kill_pid") as mock_kill:
             result = sweep_after_unclean_exit(999, hosts=("example.com",),
                                               helper_pid=5555,
-                                              marker_path=path, probes=p)
+                                              marker_path=path, probes=p,
+                                              marker_live=dead_session)
 
         self.assertTrue(result)
         self.assertEqual(state["killed"], 2)
+        # kill_pid is the REAL taskkill /F /T against a PID from the HOST's
+        # table - patched here so the suite never kills an unrelated process.
+        mock_kill.assert_called_once()
+        self.assertEqual(mock_kill.call_args[0][0], 5555)
         self.assertTrue(state["torn_down"])
         self.assertIsNone(read_marker(path))  # marker cleared
 
@@ -172,9 +195,11 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
         with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
                    return_value=0), \
              patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
-                   return_value=None):   # sweep FAILED
+                   return_value=None), \
+             patch("tuntop.core.cleanup_watchdog.kill_pid"):   # sweep FAILED
             sweep_after_unclean_exit(999, hosts=(), helper_pid=5555,
-                                     marker_path=path, probes=p)
+                                     marker_path=path, probes=p,
+                                     marker_live=dead_session)
         self.assertIsNotNone(read_marker(path))  # marker KEPT
 
     def test_geo_sweep_failure_keeps_marker_too(self):
@@ -185,7 +210,7 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
              patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
                    return_value=0):
             sweep_after_unclean_exit(999, hosts=(), marker_path=path,
-                                     probes=p)
+                                     probes=p, marker_live=dead_session)
         self.assertIsNotNone(read_marker(path))  # marker KEPT
 
     def test_leftover_dns_guard_is_removed(self):
@@ -202,7 +227,7 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
              patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
                    return_value=0):
             sweep_after_unclean_exit(999, hosts=(), marker_path=path,
-                                     probes=p)
+                                     probes=p, marker_live=dead_session)
         p.remove_dns_guard.assert_called_once()
 
     def test_no_guard_means_no_guard_removal(self):
@@ -215,7 +240,7 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
              patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
                    return_value=0):
             sweep_after_unclean_exit(999, hosts=(), marker_path=path,
-                                     probes=p)
+                                     probes=p, marker_live=dead_session)
         p.remove_dns_guard.assert_not_called()
 
     def test_helper_killed_before_sweep(self):
@@ -242,9 +267,10 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
         with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
                    return_value=0), \
              patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
-                   return_value=0):
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.kill_pid"):
             sweep_after_unclean_exit(888, helper_pid=4444, marker_path=path,
-                                     probes=p)
+                                     probes=p, marker_live=dead_session)
 
         self.assertEqual(call_order[0], "kill", "helper must die before teardown")
 
@@ -269,6 +295,24 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
         # Should still return True (unclean exit detected and swept)
         self.assertTrue(result)
 
+    def test_live_session_marker_is_left_completely_alone(self):
+        """The mirror image of the crash tests, and the reason the liveness
+        verdict is injectable: a marker whose dashboard PID is STILL RUNNING
+        belongs to another live instance - not one process, route or DNS
+        guard it owns may be touched."""
+        path = make_marker(pid=999)
+        p, state = self._make_probes(killed=2)
+        with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
+                   return_value=0):
+            result = sweep_after_unclean_exit(999, marker_path=path, probes=p,
+                                              marker_live=lambda _p: True)
+        self.assertTrue(result)
+        self.assertIsNone(state["killed"])      # no orphan was killed
+        self.assertFalse(state["torn_down"])    # the live adapter survived
+        self.assertIsNone(state["swept"])       # no route was swept
+
 
 # ── main() ────────────────────────────────────────────────────────────
 
@@ -277,8 +321,13 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
         """sweep_after_unclean_exit takes geoip/geoip_code (physical-adapter sweep)."""
         path = make_marker(pid=4242)
         p, state = self._make_probes()
-        result = sweep_after_unclean_exit(4242, marker_path=path, probes=p,
-                                          geoip=None, geoip_code="ir")
+        with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
+                   return_value=0):
+            result = sweep_after_unclean_exit(4242, marker_path=path, probes=p,
+                                              geoip=None, geoip_code="ir",
+                                              marker_live=dead_session)
         self.assertTrue(result)
 
 class TestMain(unittest.TestCase):
