@@ -428,7 +428,8 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
 def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
                              marker_path: str = MARKER_FILE, log=None,
                              probes=None, geoip: str = None,
-                             geoip_code: str = "") -> bool:
+                             geoip_code: str = "",
+                             marker_live=None) -> bool:
     """The watchdog's whole decision, in one testable function.
 
     Returns True when an unclean exit of session `pid` was detected and
@@ -439,6 +440,15 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
     so tests can run the whole path with fakes and no Windows. When
     `geoip`/`geoip_code` are given, geo-bypass routes on the PHYSICAL
     adapter are swept too (the Wintun teardown can't see them).
+
+    `marker_live` is passed straight through to scan as well, so a caller
+    can STATE whether the marker's dashboard PID is still running instead of
+    leaving that verdict to the machine's process table. That verdict is a
+    property of the HOST, not of this decision: a marker PID that happens to
+    be alive (CI runners reuse low PIDs) IS a live session by definition, and
+    the sweep then correctly refuses to touch anything - which is what made
+    the crash-path tests fail on CI while passing locally. Tests that
+    simulate a crashed run pin it to False.
     """
     log = log or (lambda m: None)
     try:
@@ -484,7 +494,7 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
         kill_pid(helper_pid, log)
 
     findings = scan(hosts=list(hosts or []), probes=probes,
-                    marker_path=marker_path)
+                    marker_path=marker_path, marker_live=marker_live)
     actions = recover(findings, probes=probes,
                       log=lambda m: _log(m, log))
     if not actions:
