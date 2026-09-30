@@ -18,7 +18,7 @@ facade, but nothing stops the UI reaching around it - and it does.
 """
 from __future__ import annotations
 
-__version__ = "1.0.49"
+__version__ = "1.0.50"
 
 # Public, layered surface. Legacy flat names still resolve via shims.
 __all__ = [

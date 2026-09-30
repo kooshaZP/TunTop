@@ -9479,9 +9479,18 @@ _GEOIP_MAX_AGE_DAYS = 14
 def _download_to(url, dest):
     """Stream `url` to `dest` with a coarse progress print. Returns dest."""
     import urllib.request
+    # B310: the guard lives here, not at the call sites, so a future caller
+    # cannot hand urlopen a scheme that reads the local filesystem or reaches a
+    # protocol handler we never audited. Both current callers (geoip.dat, the
+    # staged update) build https URLs.
+    if not url.startswith(("https://", "http://")):
+        raise ValueError(f"refusing to download a non-http(s) URL: {url[:48]}")
+    # The urlopen below carries an inline bandit suppression for B310, whose
+    # check is static (it flags every urlopen whose URL is not a string
+    # literal) and cannot see the guard above.
     req = urllib.request.Request(url, headers={"User-Agent": "TunTop/1.0"})
     last = [0]
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:  # nosec B310
         total = int(resp.headers.get("Content-Length") or 0)
         with open(dest, "wb") as f:
             while True:

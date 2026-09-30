@@ -62,6 +62,19 @@ jobs:
       - name: Install linters
         run: python -m pip install --upgrade pip ruff bandit
 
+      # Both gates read a COMMITTED config file, and a missing config is
+      # SILENT: ruff falls back to its default rule set and bandit to its
+      # default skips, neither of which is the gate this repo documents. A run
+      # without them is a green light earned by a check that never ran.
+      - name: Verify the gate configs are in the checkout
+        run: |
+          for f in ruff.toml bandit.yaml; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f is missing from the checkout - the lint gate would evaluate an unintended rule set"
+              exit 1
+            fi
+          done
+
       # Ruff honours the per-file ignores in ruff.toml, which document the
       # intentional `import *` re-export shims and the three dead locals left
       # in draw(). The rule set is deliberately narrow (see ruff.toml): it is
@@ -71,9 +84,10 @@ jobs:
       - name: ruff
         run: ruff check tuntop tests
 
-      # B104 ("hardcoded_bind_all_interfaces") fires on every "0.0.0.0" route
-      # prefix in this codebase, which is the whole point of the tool - a
-      # default route is what we install. Everything else in bandit stays
-      # enabled on purpose.
+      # bandit.yaml lists every skipped class with a measured count and a
+      # rationale - all of them inherent to a tool that drives netsh and
+      # PowerShell and treats cleanup as best-effort. Without -c this step
+      # would run with bandit's own defaults and fail on all ~157 of them.
+      # Everything not listed in bandit.yaml stays enabled.
       - name: bandit
-        run: bandit -q -r tuntop --skip B104
+        run: bandit -q -c bandit.yaml -r tuntop

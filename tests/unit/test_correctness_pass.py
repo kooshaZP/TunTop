@@ -1049,5 +1049,79 @@ class TestSourceLevelGuards(unittest.TestCase):
         self.assertIn("vpn_bypass_ip", body)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 2.16  urlopen() accepts ANY scheme - these three paths accept http(s) only
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestUrlOpenSchemeGuards(unittest.TestCase):
+    """B310 is the one class of bandit finding NOT skipped in bandit.yaml,
+    because each of its three call sites can say what it accepts. urlopen
+    resolves file:, ftp: and data: as readily as https:, and two of the three
+    URLs are assembled from configuration (the DoH endpoint, the download
+    target), so the guard IS the audit and the inline B310 suppression points
+    back at it. Every test here asserts the opener is NEVER reached - a guard
+    that still calls urlopen has audited nothing."""
+
+    NON_HTTP = ("file:///C:/Windows/win.ini", "ftp://example.com/x",
+                "data:text/plain,hello", "//example.com/x", "")
+
+    class _Resp:
+        def __init__(self, status):
+            self.status = status
+            self.headers = {}
+
+        def read(self, _n):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def test_probe_refuses_a_non_http_url(self):
+        for url in self.NON_HTTP:
+            with self.subTest(url=url), \
+                 mock.patch("urllib.request.urlopen") as opener:
+                ok, msg = H._probe_tunnel_once(url, timeout=1)
+            self.assertFalse(ok)
+            self.assertIn("not http(s)", msg)
+            opener.assert_not_called()
+
+    def test_probe_still_accepts_http_and_https(self):
+        # The guard must not cost the 204 endpoint its success case.
+        for url in ("https://api.ipify.org/",
+                    "http://connectivitycheck.gstatic.com/generate_204"):
+            with self.subTest(url=url), \
+                 mock.patch("socket.getaddrinfo", return_value=[
+                     (2, 1, 6, "", ("1.2.3.4", 443))]), \
+                 mock.patch("urllib.request.urlopen",
+                            return_value=self._Resp(204)):
+                ok, msg = H._probe_tunnel_once(url, timeout=2)
+            self.assertTrue(ok, msg)
+
+    def test_doh_query_refuses_a_non_http_endpoint(self):
+        import tuntop.network.dns as D
+        for endpoint in self.NON_HTTP:
+            with self.subTest(endpoint=endpoint), \
+                 mock.patch("urllib.request.urlopen") as opener:
+                self.assertEqual(
+                    D._dns_query_doh("example.com", 1, endpoint), [])
+            opener.assert_not_called()
+
+    def test_download_to_refuses_a_non_http_url(self):
+        import tuntop.ui.dashboard as D
+        dest = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "never-written.bin")
+        for url in self.NON_HTTP:
+            with self.subTest(url=url), \
+                 mock.patch("urllib.request.urlopen") as opener:
+                with self.assertRaises(ValueError):
+                    D._download_to(url, dest)
+            opener.assert_not_called()
+        self.assertFalse(os.path.exists(dest),
+                         "the refusal happened after the file was opened")
+
+
 if __name__ == "__main__":
     unittest.main()

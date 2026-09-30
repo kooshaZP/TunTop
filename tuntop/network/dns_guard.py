@@ -243,13 +243,20 @@ def install_script(resolvers, exempt=(), comment: str = GUARD_COMMENT) -> str:
     New-ItemProperty -Path $ex -Name 'ConfigOptions' -PropertyType DWord -Value {CONFIG_OPTIONS_OVERRIDE_DNS} -Force | Out-Null
     New-ItemProperty -Path $ex -Name 'Comment' -PropertyType String -Value {_ps_quote('TunTop: NRPT exemption - names the tunnel resolvers must not answer (mDNS .local etc.).')} -Force | Out-Null
 """
+    # Pre-computed rather than inline. A BACKSLASH inside an f-string
+    # EXPRESSION is a SyntaxError before 3.12 (PEP 701 is what relaxed it), and
+    # this module has to import on the 3.10 floor CI tests - the inline form
+    # made every import of tuntop.network.dns_guard (and therefore the whole
+    # dashboard) fail there. The value is unchanged: a literal backslash, so
+    # the script still builds the sibling "$root\TunTop-Match.new" key name.
+    new_key_ps = _ps_quote('\\' + MATCH_KEY + '.new')
     return f"""$ErrorActionPreference = 'Stop'
 $root = {_ps_quote(NRPT_PS_ROOT)}
 try {{
     if (-not (Test-Path $root)) {{ New-Item -Path $root -Force | Out-Null }}
     # WRITE FIRST. See the docstring: deleting up front opened a leak window on
     # every re-assert. Build each rule under a .new key, then swap it in.
-    $matchNew = $root + {_ps_quote('\\' + MATCH_KEY + '.new')}
+    $matchNew = $root + {new_key_ps}
     if (Test-Path $matchNew) {{ Remove-Item -Path $matchNew -Recurse -Force -ErrorAction SilentlyContinue }}
     New-Item -Path $matchNew -Force | Out-Null
     New-ItemProperty -Path $matchNew -Name 'Version' -PropertyType DWord -Value {RULE_VERSION} -Force | Out-Null

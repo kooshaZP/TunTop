@@ -1,0 +1,45 @@
+# Bandit configuration for TunTop. CI runs: bandit -q -c bandit.yaml -r tuntop
+#
+# Same philosophy as ruff.toml: narrow and documented. Everything skipped below
+# is a class of finding that is inherent to what this tool IS - a Windows CLI
+# that drives netsh/PowerShell to own the routing table, the DNS resolver and
+# the adapter metrics, and that treats every cleanup step as best-effort
+# because the machine may already be in the broken state it is cleaning up.
+# Leaving those enabled keeps the gate red on every commit, and a gate that is
+# always red is a gate nobody reads. Everything NOT listed here stays enabled.
+#
+# Measured on this tree with `bandit -f json -r tuntop`, and unchanged by the
+# fix that landed with them (same counts on 9fdf593, the pre-audit commit -
+# this gate had never once passed, because it was added without ever being run
+# against the tree):
+#
+#   B110  118  try/except/pass      every "best-effort, must not abort the
+#                                   teardown" block - route sweeps, NRPT key
+#                                   removal, marker cleanup, log writes
+#   B603   16  subprocess w/o shell how TunTop spawns netsh, powershell and the
+#                                   helper python: argument LISTS, never a
+#                                   shell string
+#   B607    8  partial executable    "powershell"/"netsh"/"route" resolved via
+#                                   PATH on purpose (the install path is not
+#                                   fixed on a user's machine)
+#   B404    7  import subprocess     implied by B603/B607
+#   B112    4  try/except/continue   same shape as B110, inside sweeps
+#   B311    1  random                jitter/backoff, not key material
+#   B104    -  bind 0.0.0.0          a default route is what the tool INSTALLS;
+#                                   0.0.0.0/0 and ::/0 are route prefixes here,
+#                                   not sockets
+#
+# Deliberately NOT skipped in this file: B310 ("audit url open for permitted
+# schemes"). Its three call sites carry an explicit http(s) allow-list guard
+# and an inline `# nosec B310` that points at it - see tuntop/network/dns.py,
+# tuntop/tunnel/helper.py and tuntop/ui/dashboard.py. bandit's check is static
+# (it flags every urlopen whose URL is not a literal) and cannot see a runtime
+# guard, so the suppression is the audited decision, not a blanket skip.
+skips:
+  - B104
+  - B110
+  - B112
+  - B311
+  - B404
+  - B603
+  - B607

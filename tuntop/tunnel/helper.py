@@ -4038,6 +4038,15 @@ def _probe_tunnel_once(url="https://api.ipify.org/", timeout=5):
     handed to getaddrinfo (passing the scheme is exactly what produced the old
     "[Errno 11001] getaddrinfo failed" crash)."""
     import urllib.request
+    # B310: every entry in _VERIFY_URLS is http(s). urlopen would happily take
+    # file:, ftp: or data: as well, and this probe's verdict is what declares a
+    # tunnel healthy, so a caller passing a non-http(s) URL is a bug that must
+    # fail here rather than be "verified" by reading something local.
+    if not url.startswith(("https://", "http://")):
+        return False, f"probe URL is not http(s): {url[:48]}"
+    # The urlopen below carries an inline bandit suppression for B310, whose
+    # check is static (it flags every urlopen whose URL is not a string
+    # literal) and cannot see this guard.
     host = _host_from_url(url)
     if not host:
         host = "api.ipify.org"
@@ -4048,7 +4057,7 @@ def _probe_tunnel_once(url="https://api.ipify.org/", timeout=5):
         return False, f"DNS resolve {host}: {e}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "tun-probe/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310
             body = r.read(64).decode("utf-8", "replace").strip()
             status = getattr(r, "status", None) or r.getcode()
         if body:

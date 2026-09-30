@@ -211,13 +211,24 @@ def _dns_query_doh(host, qtype, endpoint, timeout=4.0):
     as privacy enforcement."""
     try:
         import urllib.request
+        # B310: the endpoint is the one URL here that comes from CONFIGURATION
+        # (a DoH server the operator or a profile picked), so it is the one an
+        # attacker-influenced value could reach. urlopen resolves any scheme
+        # Python knows, including file: and data:, so refuse anything that is
+        # not an http(s) DoH URL instead of letting the opener interpret it.
+        if not endpoint.startswith(("https://", "http://")):
+            return []
+        # The urlopen below carries an inline bandit suppression for B310,
+        # because that check is static (it flags every urlopen whose URL is not
+        # a string literal) and cannot see this guard - so the suppression, not
+        # a config-wide skip in bandit.yaml, is the audited decision.
         _tid, pkt = _dns_build_query(host, qtype)
         q = base64.urlsafe_b64encode(pkt).rstrip(b"=").decode("ascii")
         req = urllib.request.Request(
             f"{endpoint}?dns={q}",
             headers={"Accept": "application/dns-message",
                      "User-Agent": "v2ray-tun-btop/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
             return _dns_parse_answers(resp.read(), qtype)
     except Exception:
         return []

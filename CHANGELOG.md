@@ -2,6 +2,20 @@
 
 All notable changes to TunTop are documented here.
 
+## [1.0.50] - 2026-09-30
+
+Two defects in 1.0.49's own audit, found by the release that shipped it - both of them in the machinery the audit had just declared sound.
+
+**Critical**
+
+- **The 1.0.49 zip did not import on Python 3.10 or 3.11.** `install_script()` in `tuntop/network/dns_guard.py` built the new NRPT key name with a backslash INSIDE an f-string expression (`{_ps_quote('\\' + MATCH_KEY + '.new')}`), and PEP 701 - the change that allows a backslash in an f-string expression - only landed in 3.12. On the 3.10/3.11 floor, every import of `tuntop.network.dns_guard`, and through it the whole dashboard, raised `SyntaxError: f-string expression part cannot include a backslash`. The value is now computed on the line above the template, and the generated PowerShell is byte-identical: same NRPT key name, same script. The 1.0.49 **exe** was unaffected (it is frozen on 3.12, where the syntax is legal) - which is precisely why the exe build could not catch this and CI had to: `release.yml` runs the suite on 3.12 only, and it was the new `ci.yml` matrix, 3.10 *and* 3.12 on both OSes, that went red on the first push of 1.0.49. The version that a `python 3.10` user installed from the zip never started, while the release page, the checksums and the frozen exe all said the release was healthy.
+
+**High**
+
+- **The lint job added by 1.0.49 could never pass.** `bandit -q -r tuntop --skip B104` exits 1 on ANY finding, and this tree has 157 of them - 160 before the audit, so the audit's own dead-code removal took three off and the gate was still red on its first run. None is fixable by a code change that would not make the tool worse: 118 are `try/except/pass` teardown blocks that must never abort a cleanup, 16 are `subprocess` calls made with argument lists (netsh, PowerShell, the helper python), 8 are PATH-resolved executables, 7 are `import subprocess`, 4 are `try/except/continue` inside route sweeps, 1 is jitter. They are now listed with their measured counts and a rationale in a new `bandit.yaml`, following `ruff.toml`'s precedent - a narrow, documented gate instead of a broad one that gets ignored. `B310` is deliberately NOT skipped in that file: its three `urlopen` call sites (the configuration-supplied DoH endpoint, the tunnel verification probe, the geoip/update downloader) now refuse any scheme that is not `http(s)`, and carry an inline suppression saying why, because bandit's check is static and cannot see a runtime guard. `ci.yml` also gained the step its own comment claimed to have: a job that fails when `ruff.toml` or `bandit.yaml` is missing from the checkout - without it, either gate silently evaluates a rule set nobody chose.
+
+**Tests** - 1128 passed, 6 skipped, on Python 3.10 and 3.12 (Windows). The four new tests assert that each scheme guard refuses `file:`, `ftp:`, `data:` and an unschemed URL **without ever reaching the opener**, and that the guard did not cost the 204 endpoint its success case.
+
 ## [1.0.49] - 2026-09-30
 
 A second full-repo audit, covering what the 1.0.48 correctness pass did not: the launchers, the CI and release pipeline, the test suite's own defects, the packaging manifest, and the dead surface left behind by the package restructure. Most of it is not application logic — it is the machinery *around* the tunnel, which is exactly the part a user meets at their worst moment (a broken install, a lost machine, a mistagged release).
