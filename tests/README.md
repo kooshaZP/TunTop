@@ -46,5 +46,19 @@ TUNTOP_NET_TESTS=1 python -m unittest discover -s tests -t . -v
 
 ## CI
 
-`.github/workflows/ci.yml` syntax-checks every module and runs the full
-suite (minus the live-network tier) on Windows for Python 3.10-3.12.
+`.github/workflows/ci.yml` runs the full suite — the same
+`python -m unittest discover -s tests -t . -v` — as a matrix with two
+independent axes: **OS** (`ubuntu-latest` and `windows-latest`) and
+**Python** (3.10, the supported floor, and 3.12, the interpreter
+`release.yml` builds the shipped exe on). There is **no** separate
+syntax-check step; the Windows-only tests gate themselves on
+`os.name == "nt"`, so the Linux jobs still exercise everything portable.
+
+The live-network tier never runs in CI: no job sets `TUNTOP_NET_TESTS`, so
+`tests/network/` skips itself everywhere. The only way those tests execute
+is locally, with the env var set.
+
+A second job (`Lint & security`, ubuntu-latest / Python 3.10) installs `ruff`
+and `bandit` and runs `ruff check tuntop tests` and
+`bandit -q -r tuntop --skip B104` (`B104` fires on every `0.0.0.0` route
+prefix, which is exactly what this project installs).

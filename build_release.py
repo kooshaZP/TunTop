@@ -8,8 +8,10 @@ Usage:  python build_release.py
 
 Produces dist/TunTop-x64.zip containing everything needed to run TunTop
 (the vendored binaries are included so the download is fully self-contained),
-plus dist/checksums.txt with a SHA-256 for every shipped artifact
-(TunTop-x64.zip, TunTop.exe when built, tun2socks.exe, wintun.dll).
+plus dist/checksums.txt with a SHA-256 for every PUBLISHED artifact
+(TunTop-x64.zip, and TunTop.exe when --with-exe produced one). The vendored
+binaries ship inside the zip but are not release assets, so they are not
+checksummed.
 
 Pure stdlib, no pip dependencies (PyInstaller is optional and only used for
 the --with-exe step).
@@ -33,16 +35,35 @@ DIST = os.path.join(ROOT, "dist")
 # Files and directories to include in the release zip
 INCLUDE_FILES = [
     "Run_Helper.ps1",
+    # The launcher the README shipped INSIDE this same zip tells users to
+    # double-click. It exists only to strip the Mark-of-the-Web and run under
+    # -ExecutionPolicy Bypass - the two blockers that make a bare
+    # Run_Helper.ps1 unusable straight out of the download. Omitting it ships
+    # instructions to a file that is not there.
+    "Start_TunTop.bat",
+    "Run_Monitor.ps1",
+    # Run_Monitor.ps1:52 executes this by path next to itself, so shipping the
+    # launcher without it produces an immediate "can't open file" traceback.
+    "monitor_windows2.py",
+    "check_dns_leak.ps1",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
+    "FAQ.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
 ]
 
+# Directories copied wholesale into the release zip. Every entry is walked by
+# build_zip() with the SAME rules (EXCLUDE_PATTERNS applied to both file and
+# directory names), so adding one here cannot silently bypass the filters.
 INCLUDE_DIRS = [
     "tuntop",
+    "assets",      # TunTop.spec's icon source
 ]
 
-# Files/dirs to exclude from tuntop/ in the zip
+# Files/dirs to exclude from every INCLUDE_DIRS entry in the zip (matched
+# against both file and directory names while walking)
 EXCLUDE_PATTERNS = {
     "__pycache__",
     "*.pyc",
@@ -302,22 +323,43 @@ def build_zip(version: str) -> str:
             else:
                 print(f"  ! {fname} not found, skipping")
 
-        # tuntop/ package
-        pkg_dir = os.path.join(ROOT, "tuntop")
-        for dirpath, dirnames, filenames in os.walk(pkg_dir):
-            dirnames[:] = [d for d in dirnames
-                           if d not in ("__pycache__", ".geo_cache")]
-            rel = os.path.relpath(dirpath, ROOT)
-            for fname in filenames:
-                if should_exclude(fname):
-                    continue
-                src = os.path.join(dirpath, fname)
-                arc = os.path.join(rel, fname).replace("\\", "/")
-                zf.write(src, arc)
-                print(f"  + {arc}")
+        # INCLUDE_DIRS - walk every listed directory, not a hardcoded path, so
+        # the constant above is authoritative. The same EXCLUDE_PATTERNS rules
+        # apply to each of them (a new entry must not start shipping
+        # __pycache__/.geo_cache or saved-profile state).
+        for dname in INCLUDE_DIRS:
+            pkg_dir = os.path.join(ROOT, dname)
+            if not os.path.isdir(pkg_dir):
+                print(f"  ! {dname}/ not found, skipping")
+                continue
+            for dirpath, dirnames, filenames in os.walk(pkg_dir):
+                dirnames[:] = [d for d in dirnames if not should_exclude(d)]
+                rel = os.path.relpath(dirpath, ROOT)
+                for fname in filenames:
+                    if should_exclude(fname):
+                        continue
+                    src = os.path.join(dirpath, fname)
+                    arc = os.path.join(rel, fname).replace("\\", "/")
+                    zf.write(src, arc)
+                    print(f"  + {arc}")
 
-        # Vendored binaries - shipped in the package dir so the app finds them
-        # via app_dir() (and sys._MEIPASS when frozen).
+        # geofil/ as an empty directory entry (never the geoip.dat itself): the
+        # geo-bypass path is where Run_Helper.ps1:193-195 drops/looks for it
+        # next to itself, so shipping the folder makes that first-run location
+        # discoverable instead of something the user has to discover.
+        geodir = zipfile.ZipInfo("geofil/")
+        geodir.external_attr = 0x10 << 16   # FILE_ATTRIBUTE_DIRECTORY
+        zf.writestr(geodir, b"")
+        print("  + geofil/")
+
+        # Vendored binaries - shipped in the package dir because that is where
+        # the app looks: tuntop/ui/dashboard.py's app_dir() resolves to
+        # <root>/tuntop in a source run, and sys._MEIPASS when frozen.
+        # Run_Helper.ps1 resolves them independently and used to look only at
+        # the zip ROOT, so an extracted release missed these bundled copies
+        # and re-downloaded them; it now searches the root first and falls
+        # back to this 'tuntop/' location, so both consumers are satisfied by
+        # a single copy in the archive.
         for b in BINARIES:
             src = os.path.join(ROOT, b)
             if os.path.isfile(src):
@@ -368,7 +410,17 @@ def main():
         try_defender_exclusion()
 
     zip_path = build_zip(version)
+    # Only files that are actually PUBLISHED as release assets get a
+    # checksum line. These three used to be added here and must not be again:
+    #   - tun2socks-windows-amd64-v3.exe and wintun.dll: gitignored, fetched
+    #     by CI, and shipped only INSIDE the zip. release.yml uploads neither.
+    #   - TunTop-<version>.standalone.exe: written to the repo ROOT by
+    #     _guard_exe as an AV-protection mirror. Never uploaded.
+    # A checksum line for a file no downloader can fetch from the release is a
+    # promise that cannot be checked, and it made checksums.txt list assets
+    # the release page did not have.
     artifacts = [zip_path]
+    exe_built = False
 
     if args.with_exe:
         exe = build_exe(onedir=args.onedir)
@@ -379,20 +431,20 @@ def main():
             exe = _guard_exe(exe, version, protect=not args.onedir)
             if exe:
                 artifacts.append(exe)
-            if not args.onedir:
-                # onefile only: the outside-dist standalone copy the guard
-                # keeps alive (onedir's support files are the artifact).
-                standalone = os.path.join(
-                    ROOT, f"TunTop-{version}.standalone.exe")
-                if os.path.isfile(standalone):
-                    artifacts.append(standalone)
+                exe_built = True
 
-    # Always checksum the vendored binaries that ship inside the zip too, so
-    # users can verify them independently of the archive.
-    for b in BINARIES:
-        bp = os.path.join(ROOT, b)
-        if os.path.isfile(bp):
-            artifacts.append(bp)
+    if args.with_exe and not exe_built:
+        # build_exe() returns None for three different failures - PyInstaller
+        # not importable, TunTop.spec missing, or an AV that ate every copy -
+        # and main() used to exit 0 for all of them. CI therefore recorded a
+        # "successful" release build and only failed later, in the upload
+        # step, with an opaque file-not-found from the publishing action.
+        # --with-exe was explicitly requested, so producing no exe is a build
+        # failure, not a warning.
+        print("ERROR: --with-exe was requested but no exe artifact was "
+              "produced (PyInstaller unavailable, TunTop.spec missing, or an "
+              "AV quarantined every copy).", file=sys.stderr)
+        raise SystemExit(1)
 
     checksum_path = write_checksums(version, artifacts)
 

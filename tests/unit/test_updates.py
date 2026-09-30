@@ -18,6 +18,7 @@ from unittest import mock
 
 import urllib.error
 import urllib.parse
+import urllib.request
 
 from tuntop.config import updates
 
@@ -256,12 +257,27 @@ class TestTransportPolicy(unittest.TestCase):
         302 was followed transparently and whatever the redirector served
         was treated as the release asset - with checksums.txt fetched over
         the same redirectable transport, validating the redirector's copy
-        too. The host allow-list must be enforced on every hop."""
+        too. The host allow-list must be enforced on every hop.
+
+        Called the way HTTPRedirectHandler.http_error_302 really calls it:
+        with the ORIGINAL Request in hand. Passing req=None is a shape
+        urlopen never produces, and it let a handler that reasoned about
+        `req` (a scheme change, a dropped header, a same-host re-issue)
+        pass here and break every real user.
+
+        An HTTPError IS a file-like object wrapping the 302 response, so it
+        has to be closed; left open it is collected later as a ResourceWarning
+        - "Implicitly cleaning up <HTTPError 302: 'refusing redirect to an
+        unexpected host ...'>" - which is noise landing in the middle of an
+        unrelated run, and a real leaked socket on the production path."""
         handler = updates._SameHostRedirectHandler()
+        req = urllib.request.Request(
+            "https://github.com/kooshaZP/TunTop/releases/download/v1/x.exe")
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             handler.redirect_request(
-                None, None, 302, "Found", {},
+                req, None, 302, "Found", {},
                 "https://evil.example/TunTop.exe")
+        self.addCleanup(ctx.exception.close)
         self.assertIn("unexpected host", str(ctx.exception))
 
     def test_a_redirect_inside_the_allowlist_is_followed(self):

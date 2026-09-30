@@ -54,8 +54,8 @@ class TestFamilyMatrix(unittest.TestCase):
 
     def test_case_D_v6_unavailable_v4_only(self):
         # IPv6 absent entirely: an IPv4-only bypass still commits cleanly
-        # (the loopback-blackhole fallback the dashboard installs is a
-        # Windows behavior covered by the live torture checklist).
+        # (with no IPv6 leg there is no v6 route to install and none is
+        # required - the commit must not invent one or fail over it).
         r = FakeExactRouter()
         res = _txn(r).add_v4("8.8.8.8/32", "Wi-Fi", "10.0.0.1", 1).commit()
         self.assertTrue(res.ok)

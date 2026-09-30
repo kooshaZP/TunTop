@@ -25,11 +25,11 @@ chcp 65001 >nul
 mode con: cols=120 lines=36 >nul
 cd /d "%~dp0"
 
-REM ── Find a working PowerShell (Windows PowerShell or PowerShell 7+) ─────────
+REM --- Find a working PowerShell (Windows PowerShell or PowerShell 7+) ---
 set "PS=powershell"
 where pwsh >nul 2>&1 && set "PS=pwsh"
 
-REM ── TrueType font for this console (raster fonts break the box glyphs) ──────
+REM --- TrueType font for this console (raster fonts break the box glyphs) ---
 REM HKCU\Console\TunTop matches consoles whose title is "TunTop" (set above).
 REM FaceName: Consolas (0x0 = auto). FontSize: 0x00120000 = 18px. DWORD values
 REM only touch THIS named-console profile, never the global console defaults.
@@ -44,8 +44,11 @@ REM -- Run the PowerShell launcher with the download-safe settings ----------
 REM The folder travels via an ENVIRONMENT VARIABLE, not string interpolation:
 REM a path containing an apostrophe (legal on Windows, e.g. C:\Users\O'Brien\)
 REM used to close the single-quoted PS literals below and break the parse.
+REM The "; exit $LASTEXITCODE" tail is what makes the error branch below
+REM reachable at all: powershell -Command returns 0 unless the top-level
+REM script exits itself, so a crashed helper was reported as a clean run.
 set "TUNTOP_DIR=%~dp0"
-%PS% -NoProfile -ExecutionPolicy Bypass -Command "& { Get-ChildItem -LiteralPath $env:TUNTOP_DIR -Recurse -Include *.ps1,*.py,*.bat,*.psm1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue; & (Join-Path $env:TUNTOP_DIR 'Run_Helper.ps1') }"
+%PS% -NoProfile -ExecutionPolicy Bypass -Command "& { Get-ChildItem -LiteralPath $env:TUNTOP_DIR -Recurse -Include *.ps1,*.py,*.bat,*.psm1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue; & (Join-Path $env:TUNTOP_DIR 'Run_Helper.ps1') }; exit $LASTEXITCODE"
 set "TUNTOP_DIR="
 
 set "RC=%ERRORLEVEL%"

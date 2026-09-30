@@ -1,0 +1,85 @@
+# Ruff configuration for TunTop.
+#
+# TunTop is stdlib-only, so linting is pure signal: every finding here is a
+# real defect class that reached main before 1.0.48 (an undefined name at
+# module scope, an unused `global`, a hand-rolled duplicate of the PowerShell
+# quoter, a declared-but-never-read CLI flag).
+
+line-length = 100
+
+[lint]
+# Deliberately narrow. TunTop is a 20k-line codebase with a very specific
+# house style; a broad rule set would bury the findings that matter under
+# hundreds of style hits and get disabled within a week.
+#
+# What IS enabled is the set that catches defects which actually reached
+# main before 1.0.48:
+#   F    - undefined name, unused local, unused import
+#   F821 - the `keybd_event(vk, ...)` class: a NameError on every run
+#   F841 - dead locals left behind by a refactor
+#   B008 - function call in an argument default (evaluated once, at def time)
+#   B023 - a closure over a loop variable (every iteration shares one binding)
+#   W291/W292/W293 - trailing whitespace / no newline at EOF
+#
+# B904 (raise ... from) is deliberately NOT enabled: exception chaining is a
+# style this codebase does not use anywhere, and enabling it would turn the
+# gate red on pre-existing code for no defect-class benefit.
+select = ["F", "B008", "B023", "W291", "W293", "W292"]
+
+[lint.per-file-ignores]
+# The `import *` shims are the documented public import surface
+# (tuntop/state.py -> tuntop.core.state, etc.). Re-exporting is the point.
+#
+# This list also used to name "tuntop/tunnel_manager.py", "tuntop/update.py"
+# and "tuntop/parse_geoip.py". Those pre-restructure paths no longer exist,
+# and ruff silently accepts an unmatched per-file-ignore, so all three were
+# inert. The modules they were meant for are the real implementations, not
+# shims - tuntop/core/tunnel_manager.py, tuntop/config/updates.py and
+# tuntop/geo/geoip.py - and each one uses every name it imports, so none of
+# them needs an ignore at all. Verified with:
+#   ruff check --isolated --line-length 100 \
+#     --select F,B008,B023,W291,W293,W292 \
+#     tuntop/core/tunnel_manager.py tuntop/config/updates.py \
+#     tuntop/geo/geoip.py
+#   -> All checks passed!   (with no per-file-ignores in play)
+# The three entries were therefore removed rather than re-pointed: an ignore
+# for a path that needs nothing is dead config.
+#
+# Seven more were removed with their modules. tuntop/monitor/diagnostics.py,
+# tuntop/network/{interfaces,resolver,vpn}.py, tuntop/tunnel/{socks,tun2socks,
+# wintun}.py and tuntop/ui/widgets.py were `from ... import *` re-export
+# shims with ZERO importers anywhere - not the UI, not the helper, not a
+# single test. `import *` is exactly what let the F rules stay silent about
+# them. Confirmed with a repo-wide search over .py/.md/.ps1/.toml/.yml/.spec/
+# .bat for the dotted path, for `from tuntop import <name>` and for dynamic
+# importlib/getattr access; the only importlib.import_module call sites in
+# the tree name tuntop.tunnel.helper, tuntop.geoip and
+# tuntop.core.cleanup_watchdog, none of which is one of the eight. The five
+# entries above are the ones that ARE still imported and stay.
+"tuntop/state.py" = ["F401", "F403"]
+"tuntop/routing.py" = ["F401", "F403"]
+"tuntop/recovery.py" = ["F401", "F403"]
+"tuntop/profiles.py" = ["F401", "F403"]
+"tuntop/startup_recovery.py" = ["F401", "F403"]
+
+# Three dead locals inside draw() - the layout/render method spanning
+# dashboard.py:6519-7764 (1,246 lines). The suppression is still required:
+#   ruff check tuntop/ui/dashboard.py --isolated --select F841
+# reports exactly three findings, and none of them can be fixed from here:
+#     6624  W            in the layout-constants block
+#     6807  avg_k        in the speed-snapshot block
+#     6830  total_bytes  in the traffic-cards block
+# All three are genuinely unread, so the honest options are to delete the
+# assignments when draw() is split into per-panel functions (dropping this
+# entry in the same change), or to widen the rule set deliberately.
+#
+# The previous version of this comment claimed the three "sit in a
+# contiguous block of layout constants". That stopped being true and is what
+# this replaces: the count is still three, but they are now one per panel,
+# ~200 lines apart.
+"tuntop/ui/dashboard.py" = ["F841"]
+
+# Test-suite style only: sys.path bootstraps before imports, tuple
+# unpacking of rows where only one field is asserted on, and closures over
+# loop variables that are deliberately re-evaluated per iteration.
+"tests/**" = ["E402", "B007", "B023"]

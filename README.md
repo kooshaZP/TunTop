@@ -29,12 +29,21 @@ v2rayN, Xray, sing-box, Clash Meta — any proxy client with a local SOCKS5 inbo
   the tunnel resolvers, so Windows' Smart Multi-Homed Name Resolution can
   no longer ask a DHCP-assigned physical adapter's resolver in parallel and
   let the ISP answer (`.local` stays exempt for mDNS printers/NAS).
-  Removed by every exit path — stop, close, Ctrl-C, crash; a removal that
-  cannot complete is reported as a failure and retried next launch rather than
-  quietly forgotten. Opt out with
+  The rule is **written before any old one is removed**, so a re-assert
+  (self-heal, a live `[N]` change, a VPN-shadow pass) never opens a window in
+  which no rule exists. A clean exit — stop, close, Ctrl-C — removes it, and
+  a removal that cannot complete is reported as a failure and retried next
+  launch rather than quietly forgotten. **A hard kill, a BSOD or a power cut
+  do not**: the rule is a registry entry that survives reboots and points at
+  a tunnel that is no longer there, which leaves the machine with no working
+  name resolution. If that happens, run
+  `python -m tuntop.ui.dashboard --remove-dns-guard` (see
+  [Recovery](#if-something-goes-wrong)). Opt out with
   `--no-dns-guard` (the `[C]` row then reads "DISABLED by choice", not a
   failure); keep a LAN-only domain resolvable with
-  `--dns-guard-exempt <domain>`. Checked by the `[C]` row "DNS leak
+  `--dns-guard-exempt <domain>` — given as `corp.example` it exempts
+  `corp.example` **and everything under it**, because exemption namespaces are
+  normalised to NRPT's suffix-match form. Checked by the `[C]` row "DNS leak
   protection (catch-all NRPT rule)" and by `[L]` — which reports a confirmed
   `DNS leak` only when it can establish no catch-all rule is in force, and
   `unknown` (naming the adapters and why) when the guard state can't be read.
@@ -46,14 +55,23 @@ v2rayN, Xray, sing-box, Clash Meta — any proxy client with a local SOCKS5 inbo
 - Optional adapter-activity logging (`--log-adapter-activity`) — UDP/QUIC
   connections, ICMP counter deltas and Wintun throughput deltas land in the
   structured event log (off by default; saved in your profile)
-- **Kill-safe cleanup — verified teardown on every exit.** Each teardown
-  phase is isolated, so one failing step cannot skip the rest; the geo
-  install threads are cancelled *and joined* before the route ledger is
-  snapshotted; and a repeated Ctrl+C can no longer abort a teardown that is
-  already running.
+- **Kill-safe cleanup — a teardown that always finishes.** Each teardown
+  phase is isolated, so one failing step cannot skip the rest (the isolation
+  catches `KeyboardInterrupt` and `SystemExit` too, not just `Exception`, so
+  a second Ctrl+C cannot abort a teardown already in progress). A re-entrancy
+  latch inside `cleanup()` itself means a second teardown — from the signal
+  handler *or* from `atexit` — cannot run a second full sweep over the route
+  ledger. The geo install threads are cancelled **and joined** before the
+  route ledger is snapshotted, and the ledger is rewritten *before* each
+  gateway re-point installs its replacement routes, so a teardown racing a
+  re-point can never leave live routes with no receipt. See
+  [Correctness & limitations](#correctness--limitations) for what this does
+  and does not cover.
 - Live bypass add/remove without restarting the tunnel
 - Geo-IP country routing from `geoip.dat`
-- **Health monitoring with 42+ live checks** (route, DNS, leak, proxy, geo).
+- **Health monitoring with 46+ live checks** (route, DNS, leak, proxy, geo) —
+  46 rows are always built; a bypass IP adds one row, each extra configured
+  server adds three, and `--vless-over-vpn` adds one more.
   Checks are **tri-state**: `✔` verified, `✗` a real fault, and a grey `?`
   for "this probe could not answer" (no route to probe right now, an
   ICMP-filtered host, a DNS family you never configured). The `?` rows are
@@ -115,7 +133,7 @@ origin is. Pick **one** of these ways:
 - **Command line** — `--server` is repeatable:
 
   ```powershell
-  python tuntop/ui/dashboard.py --server 203.0.113.10 --server example.com
+  python -m tuntop.ui.dashboard --server 203.0.113.10 --server example.com
   ```
 
 - **Live in the dashboard** — press `[U]` (Servers) and type the address(es),
@@ -189,9 +207,9 @@ Press **[S]** to start the tunnel, **[C]** to run a health scan, **[L]** for a l
 
 The dashboard edits a RUNNING tunnel in place:
 
-- **[U] Servers** — switch/add the proxy origin server live: pick from the list
-  (arrow keys / mouse, Enter to apply), or replace / add addresses. The
-  origin's protocol is irrelevant — only its host/IP is used.
+- **[U] Servers** — switch/add the proxy origin server live. You are prompted
+  for the new list, then for addresses to add. The origin's protocol is
+  irrelevant — only its host/IP is used.
 - **[E] Endpoint** — change the endpoint port (e.g. 443) live.
 - **[P] Port** — change the local SOCKS5 port live.
 - **[N] DNS** — change the tunnel DNS servers live.
@@ -280,14 +298,24 @@ when you run it, and what has / has not been verified:
   A hostile source could serve a wrong geo database — it could not achieve
   code execution, but it could route countries incorrectly; pin/ship your
   own `geoip.dat` if that threat matters to you.
-- **What a hostile `geoip.dat` CAN and CANNOT do** (since 1.0.41): a geo
+- **What a hostile `geoip.dat` CAN and CANNOT do**: a geo
   database is data, never code. The decoded-CIDR cache the helper writes
   next to the install used to be a `pickle`, which is a deserialization
   primitive — any unprivileged process able to write next to the install
   would have gained code execution in the **elevated** helper on the next
-  `[S]`. It is now plain JSON, shape-validated on read. A geo CIDR that
-  decodes to a `/0` is rejected outright (a default route is never a
-  country range), so a tampered `.dat` can still misroute traffic but
+  `[S]`. It is now plain JSON, and re-validated on read: every CIDR passes
+  through the same normaliser the decoders use, which parses it, canonicalises
+  it, and **refuses anything at or above a per-family prefix floor** (`/8` for
+  IPv4, `/16` for IPv6). That floor is the real rule — a range this broad
+  installed at `metric=1` is more specific than TunTop's own `0/0` + `/1`
+  (and `::/0` + `::/1` + `8000::/1`) split-defaults, so it would capture
+  *every* packet bound outside the tunnel. Before the floor existed, the
+  only protection was a six-string literal list, and `2000::/3` (the whole
+  IPv6 global-unicast space) sailed through it. The floor is enforced twice on
+  purpose — once when parsing, once at the install boundary — and
+  `tests/unit/test_correctness_pass.py` pins the two to the same values so
+  they cannot drift apart again. A tampered database can still misroute
+  traffic, but it cannot silently capture your whole connection and it
   cannot take over the process.
 - **The auto-updater's transport is pinned.** Release checks use TLS 1.2+
   with hostname verification, and every request — *including each redirect
@@ -295,7 +323,14 @@ when you run it, and what has / has not been verified:
   its `checksums.txt` all go through the same allow-list, so a redirect
   cannot substitute an artifact (and cannot substitute the checksum that
   "verifies" it). A non-200 response is reported with its status code and is
-  never reported as "offline".
+  never reported as "offline". **The `[W]` geo-database download now uses the
+  same transport** (TLS floor, per-hop host allow-list, 64 MB cap) — it
+  previously used a bare `urlopen` with none of the three, which is why the
+  geo data was the one download with a weaker guarantee than the exe. It also
+  **fails closed** by default: if the release's `.sha256sum` cannot be
+  fetched or does not parse, the database is *not* installed. Pass
+  `strict_checksum=False` to `download_geoip()` to opt back into
+  trust-on-first-use.
 - **What TunTop will never touch:** TunTop deletes routes it can attribute to
   itself. Same-prefix routes on adapters outside its own scope are treated as
   foreign and left alone, the crash sweeps re-check the session marker
@@ -319,12 +354,90 @@ when you run it, and what has / has not been verified:
   `CHANGELOG.md` disagree. Bug-class repeats are documented in the
   [changelog](CHANGELOG.md) rather than hidden.
 
+## Correctness & limitations
+
+This section is a register, not marketing. Each row is a behaviour this project
+*depends on*, whether it is actually enforced today, and where. If a row says
+**not enforced**, treat it as a thing to verify yourself before relying on it.
+
+The guiding rule, applied to every sentence in this file: **never write an
+intended behaviour in the voice of a delivered one.**
+
+| Behaviour you can rely on | Status | Enforced in | If it fails |
+|---|---|---|---|
+| A clean exit (`[T]`, `[Q]`, Ctrl-C) removes every route TunTop installed | verified | `helper.cleanup()`; bulk `netsh -f` deletion | `[Q]` prints the verified route count; startup recovery sweeps the next launch |
+| A teardown already in progress is not aborted by a second Ctrl+C | verified | `helper._step` catches `KeyboardInterrupt`/`SystemExit`; `cleanup()` latches re-entrance | — |
+| Geo install threads are joined before the route ledger is snapshotted | verified | `helper._stop_geo_installer` escalates 30s → 120s and says so if it gives up | a loud `[!] geo thread did not stop` line names the risk |
+| Every geo route has a ledger receipt, even if a teardown races a gateway re-point | verified | registration happens *before* install in both the install and re-point paths | a partial re-point rolls back its own receipts and keeps the originals |
+| A geo CIDR can never be a default route | verified | prefix floor `/8` v4, `/16` v6 — at parse time *and* at the install boundary | broad ranges are dropped and logged, not installed |
+| A hostile `geoip.dat` cannot execute code | verified | cache is JSON, never pickle; re-validated on every read | — |
+| DNS leak guard removed on a clean exit | verified | `cleanup()` phase ordering; failures reported and retried next launch | `[!] DNS leak guard removal failed` names the locked state |
+| DNS leak guard removed after a **crash / BSOD / power loss** | **not enforced** | no crash handler; the NRPT rule is a registry entry that survives reboot | **run `python -m tuntop.ui.dashboard --remove-dns-guard`** — see below |
+| DNS leak guard never has a window with no rule | verified | the new rule is written under a temp key and swapped in before stale keys are swept | — |
+| `--dns-guard-exempt corp.example` exempts the whole subtree | verified | namespaces normalised to NRPT suffix-match form | — |
+| A second `[T]` press does not start a second teardown | verified | the teardown is claimed on the UI thread before the worker spawns | — |
+| A start never launches a second helper | verified | `_managed_start` checks `self.proc` before the force-reset | — |
+| `[Q]` cannot report "routes cleared" while a resolver is still installing | verified | writers quiesced, then a final ledger flush, then the count | — |
+| A VPN's own routes are restored after a `[V]` toggle or an exit | verified | `_raw_add_route` normalises the on-link next hop and stores persistently | — |
+| VPN-override shadows never survive a reboot | verified | `store=active` on every install (netsh defaults to *persistent*) | a pre-1.0.48 leftover is removed by the next clean exit |
+| Geo data is verified before it is installed | verified | SHA-256 mismatch **and** an unreachable checksum both refuse | pass `strict_checksum=False` to opt out |
+| No `//` in any embedded PowerShell | verified | `tests/unit/test_correctness_pass.py` scans the generated scripts | CI fails |
+| Probe timeouts are real | verified | explicit `shutdown(wait=False)`; a `with` block would void them | — |
+| DNS server registration is confirmed, not assumed | verified | DoH registration re-reads the OS list; `-ErrorAction SilentlyContinue` no longer hides failure | the dashboard shows the real state |
+
+### Windows-only caveats
+
+These cannot be covered by the CI matrix and are worth knowing:
+
+- **On-link IPv6 defaults** report `NextHop = "::"`, which `netsh` rejects as a
+  token. TunTop normalises it to `""` everywhere it compares, stores or deletes
+  a route. A third-party script reading the route table directly must do the same.
+- **`CTRL_CLOSE_EVENT` is not handled.** Closing the console window with the X
+  button kills the process without running a teardown. Use `[Q]` instead.
+- **`netsh` output is localised.** The geo installer's progress counter parses
+  English success lines, so on a non-English Windows the *progress display* is
+  unreliable — the routes themselves install correctly.
+- **Administrator really is required.** TunTop rewrites the machine routing
+  table; launch it with `Start_TunTop.bat` (or `Run_Helper.ps1`).
+
+## If something goes wrong
+
+The failure most likely to leave your machine unusable is a hard kill (BSOD,
+power loss, *End Task* in Task Manager) while a tunnel is up: the DNS
+leak-protection rule survives as a registry entry and keeps every name pointed
+at a resolver that no longer answers.
+
+```powershell
+# From an Administrator PowerShell, in the repo folder. Removes TunTop's
+# NRPT rules and exits. Use the MODULE form - `python tuntop/ui/dashboard.py`
+# puts tuntop/ui/ on sys.path and dies with "No module named 'tuntop'".
+python -m tuntop.ui.dashboard --remove-dns-guard
+ipconfig /flushdns
+
+# Same thing for the standalone build, from the folder holding TunTop.exe:
+#   .\TunTop.exe --remove-dns-guard
+```
+
+The flag confirms the removal against the OS rather than trusting the command's
+own exit status, and tells you if a catch-all rule is *still* in force — which
+would then be a company GPO rule rather than ours. Check with
+`Get-DnsClientNrptPolicy -Effective`.
+
+| Symptom | Cause | What to do |
+|---|---|---|
+| No name resolution after a crash or reboot | stale catch-all NRPT rule | `python -m tuntop.ui.dashboard --remove-dns-guard` (or `.\TunTop.exe --remove-dns-guard`) |
+| Dashboard will not start, claims another instance is running | stale single-instance lock after a kill | close any `TunTop`/`tun2socks` process, then relaunch |
+| Tunnel up but every app is dead | the origin server's route was captured by the TUN | `[T]` then `[S]`; the `[L]` row names the endpoint |
+| Some sites work and others don't after connecting a VPN | split-tunnel conflict | `[T]`, connect the VPN, then `[S]` — or use `[V]` |
+| `[A]` bypass installed but the host is still unreachable | the proxy client resolves it differently | the health row shows the resolved addresses; use `[X]` to remove and retry |
+
 ## Project layout
 
 ```
 Run_Helper.ps1            <- launcher (PowerShell)
 tuntop/
-  core/                    <- tunnel orchestration (UI only talks to this)
+  core/                    <- state, recovery, route transactions, startup
+                             recovery, integrity, events (see the note below)
     tunnel_manager.py      <- lifecycle facade (start/stop/recover)
     state.py               <- tunnel state machine
     recovery.py            <- backoff-based recovery engine
@@ -332,15 +445,18 @@ tuntop/
     startup_recovery.py    <- crash detection + cleanup at launch
     integrity.py           <- binary SHA-256 verification
     events.py              <- structured logging
-  network/                 <- routing / DNS / VPN (Windows edge)
-    routing.py             <- netsh/PowerShell route engine
+  network/                 <- routing / DNS / egress selection (Windows edge)
+    routing.py             <- netsh/PowerShell route engine + VPN coexistence
     dns.py                 <- DNS resolver with cache
     dns_guard.py           <- catch-all NRPT DNS pin (leak protection)
-    vpn.py                 <- VPN detection / coexistence
+    egress_scripts.py      <- TUN-interface / egress PowerShell snippets
+    procguard.py           <- may kill tun2socks only when TunTop owns it
+    routeops/              <- bulk route sweeps
   tunnel/                  <- Wintun + tun2socks (Windows edge)
-    helper.py              <- tunnel builder + self-heal monitor
-    wintun.py              <- Wintun adapter management
-    tun2socks.py           <- tun2socks process management
+    helper.py              <- tunnel builder + self-heal monitor; owns the
+                              Wintun adapter, the tun2socks process and the
+                              VPN shadow routes
+    exec.py                <- child-process spawning helpers
   monitor/                 <- health / traffic / leak / diagnostics
     health.py              <- visual health report
     traffic.py             <- live traffic stats
@@ -353,6 +469,28 @@ tuntop/
     themes.py              <- terminal text/layout primitives
 tests/                     <- test suite across 5 tiers (count via: python -m unittest discover -s tests -t .)
 ```
+
+**The layering above is aspirational, not enforced.** `tuntop/__init__.py`
+describes the intended flow as `UI -> Core -> Network/Tunnel -> Windows`, and
+`core/tunnel_manager.py` is a real facade - but `tuntop/ui/dashboard.py` does
+not respect it. It reaches `tuntop.core.*` for only two things,
+`tunnel_manager` and `markers`; everything else comes in through twelve legacy
+top-level shims (`tuntop.routing`, `tuntop.state`, `tuntop.recovery`,
+`tuntop.routes_txn`, `tuntop.startup_recovery`, `tuntop.integrity`,
+`tuntop.profiles`, `tuntop.netdns`, `tuntop.psshell`, `tuntop.ui_text`,
+`tuntop.structured_log`, `tuntop.health_report`) plus six direct imports of the
+leaf packages (`tuntop.network.egress_scripts`, `tuntop.network.routeops`,
+`tuntop.network.procguard`, `tuntop.network.dns_guard`,
+`tuntop.config.defaults`, `tuntop.monitor.leak`). `tuntop.geo.geoip` and
+`tuntop.config.updates` are imported lazily, inside functions.
+
+The shims are not duplicate code - each one does
+`sys.modules[__name__] = <the real module>`, so the names above are the very
+same objects as `core/`/`network/`/`monitor/`. What is missing is the
+*boundary*, not the indirection: `core/` is where new orchestration logic is
+meant to live, but nothing stops the UI from reaching around it, and today
+it routinely does. Do not read the table above as a one-way dependency you
+can rely on when adding code.
 
 `tun2socks.exe` and `wintun.dll` are auto-downloaded on first run and not in the repo.
 
@@ -395,8 +533,8 @@ tests/                     <- test suite across 5 tiers (count via: python -m un
 
 ## Tests
 
-Pure-stdlib test suite (800+ tests; exact count via the command below — it changes with every release), runnable on any OS with no admin
-rights (current count prints with the command below):
+Pure-stdlib test suite, runnable on any OS with no admin rights. The exact
+count changes with every release — the command below prints it:
 
 ```bash
 # Run the full suite (what CI runs)
@@ -407,6 +545,14 @@ TUNTOP_NET_TESTS=1 python -m unittest discover -s tests -t . -v
 ```
 
 See `tests/README.md` for the tier layout (unit / routing / recovery / integration / network).
+
+CI runs the suite on **Ubuntu and Windows** (the Windows-only tests skip
+themselves on Linux via `skipUnless(os.name == "nt")`) plus `ruff` and
+`bandit`. Those are not decoration — every medium-tier defect fixed in
+1.0.48 (an undefined `vk` at module scope that raised `NameError` on every
+run, unused `global` statements, dead locals, a function call in an
+argument default) is something `ruff` catches on the first pass. The rule
+set is deliberately narrow; see `ruff.toml` for what is enabled and why.
 
 ## Contributing
 

@@ -253,13 +253,6 @@ class RouteTransaction:
                                  metric))
         return self
 
-    def remove_v6(self, dest: str, iface: str,
-                  gateway: Optional[str] = None,
-                  metric: int = 1) -> "RouteTransaction":
-        self._ops.append(RouteOp("remove", "v6", dest, iface, gateway,
-                                 metric))
-        return self
-
     @property
     def ops(self) -> tuple:
         """The planned operations, in apply order."""

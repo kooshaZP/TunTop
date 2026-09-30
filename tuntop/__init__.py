@@ -6,19 +6,19 @@ adapter, and gives you a live btop-style
 terminal dashboard - throughput graphs, health checks, instant bypasses,
 geo-splitting, profiles and leak tests - with zero pip dependencies.
 
-Architecture (Phase 1) - strict downward dependency flow:
+Architecture (Phase 1) - aspirational, not enforced:
 
     UI  ->  Core  ->  Network / Tunnel  ->  Windows
 
-The UI (``tuntop.ui``) must only ever drive ``tuntop.core`` (notably
-``TunnelManager``); Core talks to the Network/Tunnel layers, which are the
-only places that touch Windows.  Legacy top-level module names
-(``tuntop.routing``, ``tuntop.helper``, ...) remain importable as aliases
-for backward compatibility.
+The UI (``tuntop.ui``) reaches ``tuntop.core`` for only ``tunnel_manager``
+and ``markers``; the rest arrives through the legacy top-level names
+(``tuntop.routing``, ``tuntop.helper``, ...), which are ``sys.modules``
+aliases for the very same objects.  ``core/tunnel_manager.py`` is a real
+facade, but nothing stops the UI reaching around it - and it does.
 """
 from __future__ import annotations
 
-__version__ = "1.0.48"
+__version__ = "1.0.49"
 
 # Public, layered surface. Legacy flat names still resolve via shims.
 __all__ = [

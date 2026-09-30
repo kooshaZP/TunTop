@@ -12,6 +12,7 @@ these tests never touch the real registry (on an elevated machine a real
 install would pin the whole system's name resolution).
 """
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -113,13 +114,43 @@ class TestInstallScript(unittest.TestCase):
 
     def test_exemption_carries_every_namespace(self):
         # Namespaces are lower-cased (DNS is case-insensitive, and a
-        # normalised value is what every other TunTop list stores).
+        # normalised value is what every other TunTop list stores) AND given a
+        # single leading dot. The dot is load-bearing: NRPT reads a name
+        # WITHOUT one as an exact match and a name WITH one as a suffix match.
+        # Writing "home.example" literally exempted only the name itself, so
+        # every host under it stayed pinned to the tunnel resolvers.
         s = G.install_script(["8.8.8.8"], [".local", "Home.Example"])
-        self.assertIn("@('.local','home.example')", s)
+        self.assertIn("@('.local','.home.example')", s)
+
+    def test_exempt_namespace_gets_exactly_one_leading_dot(self):
+        for given, want in (
+                ("home.example", ".home.example"),
+                (".home.example", ".home.example"),
+                ("..home.example", ".home.example"),
+                ("HOME.Example.", ".home.example"),
+                ("  corp.example  ", ".corp.example"),
+        ):
+            with self.subTest(given=given):
+                s = G.install_script(["8.8.8.8"], [given])
+                self.assertIn(f"'{want}'", s)
+        # Duplicates collapse, so "example" and ".example" are one rule.
+        s = G.install_script(["8.8.8.8"], ["example", ".example", "EXAMPLE."])
+        self.assertEqual(s.count("'.example'"), 1)
 
     def test_exemption_is_optional(self):
         s = G.install_script(["8.8.8.8"])
         self.assertNotIn(G.EXEMPT_LOCAL_KEY, s)
+
+    def test_removing_the_last_exemption_drops_its_stale_rule(self):
+        # With no exemptions the exemption key must NOT be protected from the
+        # post-write sweep - otherwise dropping the final
+        # --dns-guard-exempt leaves a live NRPT exemption behind forever.
+        s = G.install_script(["8.8.8.8"])
+        self.assertNotIn(G.EXEMPT_LOCAL_KEY, s)
+        # ...and with exemptions it must be, or a re-apply would delete the
+        # very rule it just wrote.
+        s2 = G.install_script(["8.8.8.8"], [G.LOCAL_NAMESPACE])
+        self.assertIn(f"'{G.EXEMPT_LOCAL_KEY}'", s2)
 
     def test_no_resolver_never_writes_a_black_hole(self):
         s = G.install_script([], [G.LOCAL_NAMESPACE])
@@ -130,8 +161,20 @@ class TestInstallScript(unittest.TestCase):
     def test_quotes_in_a_namespace_cannot_break_out(self):
         s = G.install_script(["8.8.8.8"], ["evil'; Write-Output 'pwned"])
         # The embedded quote is doubled, so the whole thing stays ONE array
-        # element instead of becoming a second PowerShell statement.
-        self.assertIn("@('evil''; write-output ''pwned')", s)
+        # element instead of becoming a second PowerShell statement. Expected
+        # value written out by hand: lower-cased, given the suffix-match dot,
+        # then every ' doubled.
+        self.assertIn("'.evil''; write-output ''pwned'", s)
+
+    def test_unicode_quote_lookalikes_cannot_break_out(self):
+        # PowerShell's tokenizer accepts U+2018/2019/201A/201B as quote
+        # delimiters too, so escaping only the ASCII apostrophe is not enough
+        # - a namespace pasted from a word processor could close the literal
+        # and start a second statement.
+        for q in ("\u2018", "\u2019", "\u201a", "\u201b"):
+            with self.subTest(q=q):
+                s = G.install_script(["8.8.8.8"], [f"evil{q} Write-Output {q}pwned"])
+                self.assertIn(f"'.evil{q}{q} write-output {q}{q}pwned'", s)
 
     def test_comment_is_written(self):
         s = G.install_script(["8.8.8.8"])
@@ -690,8 +733,40 @@ class TestInstallRecordOwnership(unittest.TestCase):
         self.assertTrue(m.call_args.kwargs.get("force"))
 
     def test_pid_liveness_never_raises(self):
-        for bad in (None, "", "x", -5, 0, 2 ** 40, True):
-            self.assertIn(G._pid_alive(bad), (True, False))
+        """Unknown must read as DEAD, and this is the half of the contract
+        that actually protects the machine (see _pid_alive's own docstring).
+
+        A wrong "alive" is the dangerous direction: the record claims a live
+        owner, every recovery path then leaves the catch-all NRPT rule in
+        place, and a machine whose tunnel is long gone keeps pinning name
+        resolution to resolvers that no longer answer - a silent, permanent
+        DNS break with every TunTop health row still green. A wrong "dead"
+        only costs a removal of something that has already been torn down.
+
+        This used to assert `result in (True, False)`, which cannot fail: the
+        function is annotated `-> bool`, every path returns a bool, and `1 ==
+        True` anyway - so it stayed vacuous even if _pid_alive regressed to
+        returning ints, or to a fail-OPEN "unknown means alive". `assertIs
+        (..., False)` fails for 0, for 1, and for any non-bool."""
+        for bad, why in ((None, "not a pid at all"),
+                         ("", "empty string"),
+                         ("x", "not a number"),
+                         (-5, "negative"),
+                         (0, "the idle pid")):
+            self.assertIs(G._pid_alive(bad), False,
+                          f"_pid_alive({bad!r}) ({why}) must read as DEAD, not "
+                          f"alive: a false alive strands the catch-all DNS pin")
+        # A pid no system can have, and a bool (which int()s to 1): both must
+        # still fail closed rather than fall into an unhandled comparison.
+        self.assertIs(G._pid_alive(2 ** 40), False,
+                      "an impossible pid must read as dead")
+        self.assertIs(G._pid_alive(True), False,
+                      "a bool must not be answered as a live process")
+        # ...and the direction that actually matters: a process that IS
+        # running must still read as alive, or the guard would delete a live
+        # owner's own rule out from under it.
+        self.assertTrue(G._pid_alive(os.getpid()),
+                        "the live owner (this process) must read as alive")
 
 
 class TestSingleInstance(unittest.TestCase):
@@ -722,21 +797,89 @@ class TestSingleInstance(unittest.TestCase):
             self.assertLess(lock, body.index(later),
                             f"the lock must be taken before {later}")
 
+    @unittest.skipUnless(hasattr(ctypes, "windll"),
+                         "requires ctypes.windll (Windows only)")
     def test_an_unavailable_lock_never_blocks_the_launch(self):
         """No ctypes / a locked-down kernel must not make TunTop unusable -
         refusing to start because the lock could not be TAKEN is worse than
-        the race it prevents."""
+        the race it prevents.
+
+        Patching windll away is a Windows-only act: `ctypes.windll` does not
+        EXIST off Windows, and `mock.patch.object` defaults to create=False,
+        so the patch itself raised AttributeError there and errored the whole
+        module - which is why the ubuntu-latest leg of ci.yml was red. Hence
+        the skipUnless gate (nothing in the suite gated itself on os.name, so
+        the "the Windows-only tests gate themselves" comment in ci.yml was not
+        true of this one) plus create=True, so the intent survives on either
+        platform instead of resting on the gate staying in place."""
         from tuntop.ui import dashboard
-        with mock.patch.object(dashboard.ctypes, "windll", None):
+        with mock.patch.object(dashboard.ctypes, "windll", None, create=True):
             self.assertIsNotNone(dashboard._acquire_single_instance())
 
     def test_mutex_handle_is_held_for_the_process_lifetime(self):
+        """The exclusivity contract, checked against a STUBBED kernel32.
+
+        This used to call the real _acquire_single_instance(), which creates
+        the machine-wide mutex for real. Two things went with that. The handle
+        comes back as a plain int (restype = c_void_p), so nothing ever
+        closes it and the test process owned the Global-namespace mutex for
+        its whole remaining life - any later test calling the same function
+        then legitimately got None. And creating a Global\\ object needs
+        SeCreateGlobalPrivilege, so on an unelevated runner the call fails and
+        the test SKIPPED - the same suite reporting a different skip count run
+        to run on the same machine.
+
+        The only thing the old body asserted was `handle > 0`, which says
+        nothing about exclusivity, the one property the lock exists for. The
+        contract is: a clean GetLastError() (0) means the lock was taken and
+        the handle is kept - never closed - so it stays owned for the process
+        lifetime; ERROR_ALREADY_EXISTS (183) means somebody else holds it, so
+        the answer is None and the borrowed handle is closed again rather
+        than kept alive. Stubbed, that is asserted identically on Windows and
+        Linux, and no real mutex is ever created."""
         from tuntop.ui import dashboard
-        handle = dashboard._acquire_single_instance()
-        if handle is None or not isinstance(handle, int):
-            self.skipTest("no usable kernel32 mutex in this environment")
-        # A genuine handle value, not the "could not decide" sentinel.
-        self.assertGreater(handle, 0)
+
+        def _claim(last_error, handle=0x1234):
+            k32 = mock.Mock()
+            k32.CreateMutexW.return_value = handle
+            k32.GetLastError.return_value = last_error
+            with mock.patch.object(dashboard.ctypes, "windll",
+                                   mock.Mock(kernel32=k32), create=True):
+                return k32, dashboard._acquire_single_instance()
+
+        # `ctypes.windll` is PROCESS-GLOBAL and `_claim` swaps it out for the
+        # whole `with` block, so every other thread running concurrently reads
+        # the SAME kernel32 mock and its calls land in these call lists. Any
+        # "called exactly N times" assertion here is therefore a coin flip on
+        # whatever the rest of the process is doing (demonstrated: ~54
+        # failures in 12000 iterations with a concurrent ctypes.windll reader
+        # - "Expected 'CloseHandle' to have been called once. Called 787
+        # times." - and one spontaneous failure in ~5 real full-suite runs).
+        # The contract is WHICH handle was released, not how many times
+        # CloseHandle was called: assert the former, and a foreign caller can
+        # pollute the shared mock without changing the verdict.
+        def _closed(mock_k32):
+            return [c.args[0].value if hasattr(c.args[0], "value")
+                    else c.args[0]
+                    for c in mock_k32.CloseHandle.call_args_list]
+
+        # Nobody holds it: the handle comes back and stays open.
+        k32, handle = _claim(0)
+        self.assertIn((None, True, "Global\\TunTop-SingleInstance"),
+                      [c.args for c in k32.CreateMutexW.call_args_list],
+                      "the lock must be created machine-wide and initially "
+                      "owned, so a dead process releases it")
+        self.assertEqual(handle, 0x1234, "the taken lock must be returned")
+        self.assertNotIn(0x1234, _closed(k32),
+                         "the TAKEN lock must stay open for the process "
+                         "lifetime - closing it hands exclusivity away")
+
+        # Somebody else holds it: refused, and the borrowed handle released.
+        k32, handle = _claim(183)
+        self.assertIsNone(handle, "a second instance must be refused (None)")
+        self.assertIn(0x1234, _closed(k32),
+                      "the refused instance must release the handle it was "
+                      "handed, not some other one")
 
 
 class TestSessionFileRetirement(unittest.TestCase):

@@ -61,7 +61,6 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # Windows access rights / wait codes (ctypes only; absent on other OSes).
 _SYNCHRONIZE = 0x00100000
 _PROCESS_TERMINATE = 0x0001
-_INFINITE = 0xFFFFFFFF
 _ERROR_INVALID_PARAMETER = 87
 
 #: How long a dead parent's cleanup gets to finish before we look around.
@@ -587,7 +586,7 @@ def main(argv=None) -> int:
                 "".encode(_codec)
             except Exception:
                 pass
-    except Exception as _e:
+    except Exception:
         _log(f"watchdog: eager import failed: {traceback.format_exc()}"
              .rstrip() + " - sweeps may fail; continuing so startup "
              "recovery can still clean up")

@@ -20,6 +20,7 @@ No Windows calls: the routing/shell layers are mocked. Runs anywhere.
 import io
 import os
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -41,7 +42,61 @@ def _tunnel_up():
                              return_value=(True, "TUN carries TCP"))
 
 
+class _WedgedWorkers:
+    """Workers that block like getaddrinfo() and are released on demand.
+
+    The real getaddrinfo() has no timeout knob, so a wedged resolve is
+    modelled by parking on an Event, not by sleeping a fixed number of
+    seconds. The distinction matters at PROCESS level, not test level:
+    _run_round() shuts its executor down with wait=False (on purpose, so a
+    stuck resolve cannot hold the start sequence open), which leaves
+    non-daemon worker threads running. Those are what threading._shutdown()
+    joins at interpreter exit, so a raw `time.sleep(30)` fake kept the whole
+    process alive for another 30s AFTER unittest had already printed its own
+    timing and said "Ran 21 tests in 2.08s" - the stall was invisible in
+    every reported number and only showed up on the wall clock.
+
+    A test that starts one of these hands it back here; release() in
+    tearDown() then unblocks the workers and waits for the last of them to
+    really leave, so the process exits when the suite does.
+    """
+
+    def __init__(self):
+        self._release = threading.Event()
+        self._lock = threading.Lock()
+        self._live = 0
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def wait(self, timeout=30):
+        """Block like an un-timed-out getaddrinfo(). The 30s cap is only a
+        backstop: nothing should ever reach it, because tearDown releases."""
+        with self._lock:
+            self._live += 1
+            self._idle.clear()
+        try:
+            return self._release.wait(timeout)
+        finally:
+            with self._lock:
+                self._live -= 1
+                if self._live == 0:
+                    self._idle.set()
+
+    def release(self, timeout=5):
+        self._release.set()
+        return self._idle.wait(timeout)
+
+
 class TestVerifyBudget(unittest.TestCase):
+    def setUp(self):
+        self.wedged = _WedgedWorkers()
+
+    def tearDown(self):
+        # No worker may outlive its test: release them and wait for the last
+        # one to actually exit rather than letting the interpreter's exit
+        # join block on a thread nobody is waiting for.
+        self.wedged.release()
+
     def test_budget_is_bounded_and_small(self):
         # A healthy tunnel verifies in well under a second; the ceiling only
         # ever applies to a broken one, and it must be small enough that the
@@ -53,9 +108,15 @@ class TestVerifyBudget(unittest.TestCase):
     def test_a_wedged_resolve_cannot_hold_the_start_open(self):
         """A probe stuck inside getaddrinfo must not block the round: this is
         the exact stall the user saw, and it is unbounded because
-        getaddrinfo ignores every timeout we can pass."""
+        getaddrinfo ignores every timeout we can pass.
+
+        The round must return on its BUDGET while the workers are still
+        parked; tearDown then releases them so the abandoned non-daemon
+        executor threads cannot hold the interpreter open after the suite has
+        already reported its timing. The elapsed-time assertion below is the
+        point of the test and stays."""
         def _wedged(url, timeout=5):
-            time.sleep(30)          # simulates a hanging resolve
+            self.wedged.wait()      # simulates a hanging resolve
             return False, "DNS resolve x: [Errno 11001] getaddrinfo failed"
         t0 = time.monotonic()
         with mock.patch.object(H, "_probe_tunnel_once", side_effect=_wedged):

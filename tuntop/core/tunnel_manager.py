@@ -77,11 +77,26 @@ class TunnelManager:
 
     # -- Integrity (Phase 6) -------------------------------------------------
     def verify_binaries(self) -> bool:
-        """Return True only if the vendored binaries pass integrity checks."""
-        if self._verify is not None:
-            return bool(self._verify())
-        from tuntop.core.integrity import verify_for_launch
-        return bool(verify_for_launch())
+        """Return True only if the vendored binaries pass integrity checks.
+
+        The injected `_verify` callable is the ONLY supported path. The
+        previous fallback called `verify_for_launch()` with no argument, and
+        that function's first parameter (`tun2socks_path`) is required - so
+        constructing a TunnelManager without an explicit verifier and asking
+        it to verify raised TypeError instead of returning a verdict. The
+        fallback could never have worked; it was dead code that only looked
+        like a fallback. A real callable is the caller's to build from the
+        resolved binary paths - the dashboard checks integrity itself via
+        `integrity.verify_for_launch()` and drives the manager with
+        `verify_immediately=False` - so no TunnelManager in this codebase
+        is ever built with a verifier. Fail closed instead of crashing.
+        """
+        if self._verify is None:
+            self._blog("WARN", "CORE",
+                       "verify_binaries called with no verifier configured - "
+                       "treating as FAILED rather than raising")
+            return False
+        return bool(self._verify())
 
     # -- Lifecycle -----------------------------------------------------------
     def request_start(self, verify_immediately: bool = True) -> bool:
@@ -108,7 +123,7 @@ class TunnelManager:
                 self.machine.try_transition(TunnelState.VERIFYING,
                                             "launch attempted")
         except (Exception, SystemExit) as e:           # pragma: no cover
-            # SystemExit matters: make_launch() runs helper.main() IN-PROCESS
+            # SystemExit matters: an IN-PROCESS launch runs helper.main(),
             # and that code exits via sys.exit() on many failure paths. A
             # SystemExit is a BaseException, so `except Exception` let it
             # through - the process died instead of transitioning to FAILED,

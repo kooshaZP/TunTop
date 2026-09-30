@@ -156,10 +156,14 @@ def _tuntop_owned_locations():
     exe = getattr(sys, "executable", "") or ""
     if exe and getattr(sys, "frozen", False):
         locs.append(os.path.dirname(os.path.abspath(exe)))
-    # Source run: the package dir, the APP ROOT (one level up - that is
-    # where a checkout/release keeps tun2socks-windows-amd64-v3.exe,
-    # wintun.dll and geoip.dat, and what the dashboard's default --tun2socks
-    # resolves to), and the CWD.
+    # Source run: this module's own dir, its PARENT PACKAGE dir, and the
+    # CWD. The naming trap worth stating: __file__ is tuntop/network/
+    # procguard.py, so pkg_dir below is ``tuntop/network`` and the second
+    # entry is ``tuntop/`` - the PACKAGE dir, NOT the app/repo root, which
+    # is one level further up. So the release zip (binaries written into
+    # ``tuntop/``) is covered by the second entry, while a git checkout
+    # (binaries at the repo root, none inside the package) is covered only
+    # by the CWD entry - which is why launchers Set-Location to the root.
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     locs.append(pkg_dir)
     locs.append(os.path.dirname(pkg_dir))

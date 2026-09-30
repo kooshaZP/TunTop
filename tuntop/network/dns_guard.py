@@ -103,6 +103,7 @@ NRPT_PS_ROOT = ("HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache"
 # a route get pointed at an interface the rest of the code believed was "not
 # a VPN").
 from tuntop.config.defaults import VPN_IFACE_RE as VPN_IFACE_RE  # noqa: F401
+from tuntop.psshell import ps_quote
 
 #: Where the install record lives. Frozen exe: next to TunTop.exe (stable
 #: across runs, identical for the helper child and the watchdog); source run:
@@ -157,9 +158,40 @@ def _servers_value(resolvers) -> str:
 
 
 def _ps_quote(text) -> str:
-    """Single-quote a PowerShell literal (doubling embedded quotes), so a
-    namespace or comment can never break out into the script body."""
-    return "'" + str(text).replace("'", "''") + "'"
+    """Single-quote a PowerShell literal, so a namespace or comment can never
+    break out into the script body.
+
+    The ESCAPING is the shared tuntop.psshell.ps_quote - this used to be a
+    third copy of the same logic that only doubled the ASCII apostrophe, which
+    is precisely what the psshell docstring promised could never happen. It is
+    the only one of the three that also WRAPS the value in quotes, so the
+    wrapper stays here and only the escape delegates.
+    """
+    return "'" + ps_quote(text) + "'"
+
+
+def _normalise_exempt(names):
+    """Canonical NRPT namespace form for the exemption list.
+
+    NRPT treats a name WITHOUT a leading dot as an EXACT match and a name WITH
+    one as a suffix match ("this domain and everything under it"). So
+    `--dns-guard-exempt corp.example` used to be written literally and matched
+    only the name `corp.example` itself - `printer.corp.example`,
+    `files.corp.example` and every other host under it stayed pinned to the
+    tunnel resolvers, which is the opposite of what the user asked for and
+    looks like the exemption "not working".
+
+    So: lowercase, strip surrounding dots, and re-add exactly one leading dot.
+    `.local` is already written with its dot and is unaffected. A bare
+    hostname is still promoted to a suffix match, which is the only reading
+    anyone means by "keep this domain resolvable".
+    """
+    out = []
+    for n in (names or ()):
+        s = str(n).strip().lower().strip(".")
+        if s and f".{s}" not in out:
+            out.append(f".{s}")
+    return out
 
 
 # ── Script text (single source of truth, unit-tested) ───────────────────────
@@ -168,17 +200,33 @@ def install_script(resolvers, exempt=(), comment: str = GUARD_COMMENT) -> str:
     """PowerShell that installs (or refreshes) the catch-all rule plus the
     exemption rule, then flushes the resolver cache.
 
-    Idempotent by construction: it deletes every TunTop-* key first, so a
-    re-apply (self-heal, a live [N] DNS change, a VPN-shadow pass) can never
-    leave a stale namespace or an old server list behind."""
+    WRITE FIRST, THEN DELETE. This used to drop every TunTop-* key up front
+    and only then write the replacement, which opened a window - on EVERY
+    re-apply (self-heal, a live [N] DNS change, a VPN-shadow pass) - in which
+    no rule existed at all, i.e. Windows was free to ask a physical adapter's
+    resolver in parallel and let the ISP answer. That is exactly the leak the
+    guard exists to close, and it reopened for the duration of the re-assert
+    on a schedule the tunnel itself drives.
+
+    The ordering is safe in both directions: the new keys are written under
+    fresh temp names and moved into place individually, and only keys that
+    are NOT part of the new set are removed afterwards. A failure part-way
+    through therefore leaves a mix, never a gap."""
     servers = _servers_value(resolvers)
     if not servers:
         # Callers must use uninstall_script() for this case: a rule with no
         # servers is a black hole, so fail loudly instead of writing it.
         return "Write-Output 'DNS_GUARD_FAIL:no resolver configured'\n"
-    exempts = [str(n).strip().lower() for n in (exempt or ())
-               if str(n).strip()]
+    exempts = _normalise_exempt(exempt)
     exempt_script = ""
+    # Keys that must survive the post-write sweep. With no exemptions the
+    # exemption key is NOT protected, so removing the last --dns-guard-exempt
+    # actually deletes its stale NRPT rule (it is what
+    # `Remove-DnsClientNrptRule` would otherwise leave behind) - and the name
+    # does not appear in the script at all in that case.
+    keep_keys = [MATCH_KEY] + ([EXEMPT_LOCAL_KEY] if exempts else [])
+    keep_ps = "\n            -and ".join(
+        f"$_.PSChildName -ne {_ps_quote(k)}" for k in keep_keys)
     if exempts:
         names_ps = ",".join(_ps_quote(n) for n in exempts)
         exempt_script = f"""
@@ -199,18 +247,29 @@ def install_script(resolvers, exempt=(), comment: str = GUARD_COMMENT) -> str:
 $root = {_ps_quote(NRPT_PS_ROOT)}
 try {{
     if (-not (Test-Path $root)) {{ New-Item -Path $root -Force | Out-Null }}
-    # Refresh semantics: drop our previous rules, then write the current set.
-    Get-ChildItem -Path $root -ErrorAction SilentlyContinue |
-        Where-Object {{ $_.PSChildName -like {_ps_quote(GUARD_KEY_PREFIX + '*')} }} |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    # WRITE FIRST. See the docstring: deleting up front opened a leak window on
+    # every re-assert. Build each rule under a .new key, then swap it in.
+    $matchNew = $root + {_ps_quote('\\' + MATCH_KEY + '.new')}
+    if (Test-Path $matchNew) {{ Remove-Item -Path $matchNew -Recurse -Force -ErrorAction SilentlyContinue }}
+    New-Item -Path $matchNew -Force | Out-Null
+    New-ItemProperty -Path $matchNew -Name 'Version' -PropertyType DWord -Value {RULE_VERSION} -Force | Out-Null
+    New-ItemProperty -Path $matchNew -Name 'Name' -PropertyType MultiString -Value @({_ps_quote(CATCH_ALL_NAMESPACE)}) -Force | Out-Null
+    New-ItemProperty -Path $matchNew -Name 'GenericDNSServers' -PropertyType String -Value {_ps_quote(servers)} -Force | Out-Null
+    New-ItemProperty -Path $matchNew -Name 'ConfigOptions' -PropertyType DWord -Value {CONFIG_OPTIONS_OVERRIDE_DNS} -Force | Out-Null
+    New-ItemProperty -Path $matchNew -Name 'Comment' -PropertyType String -Value {_ps_quote(comment)} -Force | Out-Null
     $k = Join-Path $root {_ps_quote(MATCH_KEY)}
-    New-Item -Path $k -Force | Out-Null
-    New-ItemProperty -Path $k -Name 'Version' -PropertyType DWord -Value {RULE_VERSION} -Force | Out-Null
-    New-ItemProperty -Path $k -Name 'Name' -PropertyType MultiString -Value @({_ps_quote(CATCH_ALL_NAMESPACE)}) -Force | Out-Null
-    New-ItemProperty -Path $k -Name 'GenericDNSServers' -PropertyType String -Value {_ps_quote(servers)} -Force | Out-Null
-    New-ItemProperty -Path $k -Name 'ConfigOptions' -PropertyType DWord -Value {CONFIG_OPTIONS_OVERRIDE_DNS} -Force | Out-Null
-    New-ItemProperty -Path $k -Name 'Comment' -PropertyType String -Value {_ps_quote(comment)} -Force | Out-Null
-{exempt_script}    Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item -Path $k -Recurse -Force -ErrorAction SilentlyContinue
+    Move-Item -Path $matchNew -Destination $k -Force
+{exempt_script}    # NOW drop anything that is not part of the set we just wrote -
+    # i.e. a stale exemption key, or a leftover .new from an aborted run. The
+    # keys we just wrote are always kept.
+    Get-ChildItem -Path $root -ErrorAction SilentlyContinue |
+        Where-Object {{
+            $_.PSChildName -like {_ps_quote(GUARD_KEY_PREFIX + '*')}
+            -and {keep_ps}
+        }} |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null
     Write-Output 'DNS_GUARD_OK'
 }} catch {{
     Write-Output ('DNS_GUARD_FAIL:' + $_.Exception.Message)

@@ -100,6 +100,33 @@ def _leg(ip=None, err=None, ms=0):
     return {"ip": ip, "err": err, "ms": ms}
 
 
+class _PeakConcurrency:
+    """Counts how many workers were inside the fetcher AT THE SAME TIME.
+
+    Concurrency used to be inferred from elapsed time: work that should take
+    0.3s was asserted to finish inside 1.0s, i.e. 0.7s of slack, measured on a
+    2-core CI runner that is also running Defender. That is a clock reading
+    standing in for a scheduling property, and it is wrong in both directions -
+    a sequential implementation with three fast endpoints would slip through
+    it, and a merely loaded machine could fail it. `with peak:` brackets the
+    work itself, so the number asserted is the property being claimed.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._live = 0
+        self.high = 0
+
+    def __enter__(self):
+        with self._lock:
+            self._live += 1
+            self.high = max(self.high, self._live)
+
+    def __exit__(self, *exc):
+        with self._lock:
+            self._live -= 1
+
+
 class TestVerdictMatrix(unittest.TestCase):
     """The corrected semantics: direct == tunnel exit -> OK (nothing
     escapes); direct != tunnel exit -> LEAK."""
@@ -196,16 +223,21 @@ class TestRaceLeg(unittest.TestCase):
         self.assertIsNotNone(out["err"])
 
     def test_race_is_concurrent(self):
+        """All four endpoints in flight at once - the whole point of a race
+        is that a slow endpoint never delays a fast one, which is a property
+        of the scheduling, not of the clock."""
+        endpoints = [("https", f"h{i}.example", "/") for i in range(4)]
+        peak = _PeakConcurrency()
+
         def fake_fetch(scheme, host, path, timeout):
-            time.sleep(0.3)
+            with peak:
+                time.sleep(0.3)
             return "4.3.2.1"
-        with mock.patch.object(L, "_ECHO_ENDPOINTS",
-                               [("https", f"h{i}.example", "/")
-                                for i in range(4)]):
-            t0 = time.time()
+        with mock.patch.object(L, "_ECHO_ENDPOINTS", endpoints):
             out = L._race_leg(fake_fetch, timeout=2)
         self.assertEqual(out["ip"], "4.3.2.1")
-        self.assertLess(time.time() - t0, 1.0, "endpoints were not raced")
+        self.assertEqual(peak.high, len(endpoints),
+                         "endpoints were not raced concurrently")
 
 
 class TestRunLeakProbe(unittest.TestCase):
@@ -219,14 +251,18 @@ class TestRunLeakProbe(unittest.TestCase):
         self.assertIn("direct", out)
 
     def test_legs_run_concurrently(self):
+        """Both legs (direct and tunneled) in flight together, so the probe
+        costs one leg's duration rather than the sum of the two."""
+        peak = _PeakConcurrency()
+
         def slow_leg(fetcher, timeout):
-            time.sleep(0.3)
+            with peak:
+                time.sleep(0.3)
             return _leg("1.1.1.1")
         with mock.patch.object(L, "_race_leg", side_effect=slow_leg):
-            t0 = time.time()
             status, _, _ = L.run_leak_probe(10808)
         self.assertEqual(status, "ok")
-        self.assertLess(time.time() - t0, 1.0, "legs were not concurrent")
+        self.assertEqual(peak.high, 2, "legs were not run concurrently")
 
 
 class TestRaceStragglerBound(unittest.TestCase):
@@ -379,16 +415,31 @@ class TestRunBounded(unittest.TestCase):
         self.assertIsNone(L._run_bounded(boom, 5))
 
     def test_returns_none_on_timeout(self):
-        """A function that sleeps longer than the budget must return None
-        instead of hanging forever (regression: getaddrinfo on Windows)."""
+        """A function that outlasts the budget must return None instead of
+        hanging forever (regression: getaddrinfo on Windows).
+
+        The worker has to survive LONG ENOUGH for the 0.3s budget to expire -
+        that is the whole scenario - so it is parked on an Event that is only
+        set once the assertions are done, rather than on a 10s timer that
+        outlives the test it belongs to. The elapsed bound is a real deadline
+        claim, so it stays; it is measured with time.monotonic() (unaffected
+        by the wall clock being stepped) with plenty of headroom over 0.3s."""
+        release = threading.Event()
+        done = threading.Event()
+
         def hang():
-            time.sleep(10)
-            return "too-late"
-        t0 = time.time()
+            try:
+                release.wait(10)      # outlasts the 0.3s budget
+                return "too-late"
+            finally:
+                done.set()
+        t0 = time.monotonic()
         result = L._run_bounded(hang, 0.3)
-        dt = time.time() - t0
+        dt = time.monotonic() - t0
         self.assertIsNone(result)
         self.assertLess(dt, 2.0, "run_bounded waited past its timeout")
+        release.set()
+        self.assertTrue(done.wait(5), "the timed-out worker never exited")
 
 
 class TestDnsFallbackTimeout(unittest.TestCase):

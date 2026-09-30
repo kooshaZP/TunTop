@@ -82,14 +82,6 @@ TUN2_IP6 = "fd00:dead:beef:1::1"
 # checks everywhere (sweeps, conflict scans, snapshot filters) use this.
 TUNNEL_ALIASES = (TUN, TUN2)
 
-# Alias-prefix heuristic for the Wintun family ('wintun', 'wintun2',
-# "Wintun Tunnel"). Python-side checks only: tools like v2rayN/xray name
-# their own adapter freely ('xray_tun'), so PowerShell route lookups must
-# exclude by DRIVER (InterfaceDescription -match 'Wintun') - see
-# tunnel/helper.py:_tun_alias_powershell. Kept here so the heuristic
-# itself still has exactly one definition.
-WINTUN_FAMILY_RE = r"(?i)^wintun"
-
 # The Wintun adapters own these subnets; a bypass route overlapping either
 # would shadow the tunnel's own next-hop and break every Wintun route add.
 import ipaddress as _ipaddress  # noqa: E402  (std-lib only, still no Windows)
@@ -132,11 +124,6 @@ SWEEP_MAX_WORKERS = 6
 # Default SOCKS5 inbound port the dashboard expects v2rayN to expose.
 DEFAULT_SOCKS_PORT = 10808
 DEFAULT_ENDPOINT_PORT = 443
-
-# ── Geoip ────────────────────────────────────────────────────────────────────
-# Default geoip country code: NONE. Nothing is bypassed by country until
-# the user picks a code ([F] Geo Manager / --geoip-code / a profile).
-DEFAULT_GEOIP_CODE = ""
 
 # ── Adapter activity logging ──────────────────────────────────────────────────
 # When True, the dashboard logs UDP/TCP/QUIC connection activity, ICMP

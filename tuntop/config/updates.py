@@ -111,10 +111,6 @@ class UpdateError(Exception):
     pass
 
 
-class UpdateErrorTyped(UpdateError):
-    pass
-
-
 class StagedUpdate:
     """A verified TunTop-<version>.exe staged next to the running exe."""
 
@@ -176,12 +172,6 @@ def _version_gt(a: str, b: str) -> bool:
     ka = tuple(int(x) for x in a.split("."))
     kb = tuple(int(x) for x in b.split("."))
     return ka > kb
-
-
-def _asset_url(tag: str, name: str) -> str:
-    if not re.match(r"^[\w.\-]+$", name):
-        raise UpdateError(f"unexpected asset name {name!r}")
-    return (_ASSET_BASE + tag + "/" + name)
 
 
 def check_latest(current_version: str,
@@ -338,7 +328,9 @@ def prepare_update(current_version: str, directory: str,
             f"{getattr(e, 'url', 'the release feed')}"
             + (" (rate limited - try again later)"
                if e.code in (403, 429) else "")) from e
-    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+    except (urllib.error.URLError, socket.timeout, TimeoutError):
+        # Offline / timed out. "Cannot check" is not "up to date" and not
+        # "update available" - the caller decides what None means.
         return None
     if not info["update_available"]:
         return None

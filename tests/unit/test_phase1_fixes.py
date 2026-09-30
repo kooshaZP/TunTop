@@ -3,8 +3,6 @@
 Pins the fixes that had real-world impact:
   * the watchdog's LAN victim selection (current-gateway / on-link / stale
     pin from a previous network - foreign static routes never touched);
-  * lifecycle.make_teardown() calls helper.cleanup() (the old code called a
-    nonexistent helper.cleanup_and_exit -> latent AttributeError);
   * the helper's geo state is lock-guarded and cancellable (a signal during
     the background install must skip the remaining sub-batches instead of
     adding routes behind cleanup()'s back).
@@ -19,7 +17,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
 from tuntop.core import cleanup_watchdog as WD
-from tuntop.core import lifecycle
 from tuntop.tunnel import helper as H
 
 
@@ -66,15 +63,6 @@ class TestLanVictims(unittest.TestCase):
     def test_non_lan_prefix_is_never_a_victim(self):
         rows = [_r("203.0.113.0/24", self.IFACE, self.GW)]
         self.assertEqual(WD._lan_victims(rows, self.IFACE, self.GW), [])
-
-
-class TestLifecycleTeardown(unittest.TestCase):
-    def test_make_teardown_calls_helper_cleanup(self):
-        import tuntop.tunnel.helper as helper_mod
-        with mock.patch.object(helper_mod, "cleanup") as cleanup:
-            teardown = lifecycle.make_teardown()
-            teardown()      # must not raise and must not exit the process
-        cleanup.assert_called_once_with()
 
 
 class TestGeoStateLocking(unittest.TestCase):

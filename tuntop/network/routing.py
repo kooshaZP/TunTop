@@ -730,13 +730,18 @@ $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction Sil
     Sort-Object @{Expression={ [int]$_.RouteMetric + [int]$_.InterfaceMetric }} |
     Select-Object -First 1 NextHop, InterfaceAlias
 if ($null -eq $r) {
-    // Last resort only - and STILL VPN-excluded. The first block was
-    // hardened against a connected Windows VPN advertising a low-metric
-    // ::/0 (IKEv2/SSTP), which would otherwise capture every IPv6 bypass
-    // route onto the corporate adapter. The fallback used to drop the
-    // $vpnAliases clause entirely, so on a box with no native v6 default the
-    // very first candidate WAS the VPN - reintroducing exactly the hijack
-    // the first block prevents, silently and with no log line.
+    # Last resort only - and STILL VPN-excluded. The first block was
+    # hardened against a connected Windows VPN advertising a low-metric
+    # ::/0 (IKEv2/SSTP), which would otherwise capture every IPv6 bypass
+    # route onto the corporate adapter. The fallback used to drop the
+    # $vpnAliases clause entirely, so on a box with no native v6 default the
+    # very first candidate WAS the VPN - reintroducing exactly the hijack
+    # the first block prevents, silently and with no log line.
+    # (These lines were '//' comments. PowerShell has no // comment - the
+    # tokenizer raises a parse error, so the ENTIRE script failed and
+    # _get_ipv6_default() returned None for every caller, silently skipping
+    # every IPv6 bypass and geo route. The bug was invisible precisely
+    # because the block it was hiding never ran.)
     $r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
         Where-Object {
             $_.State -eq 'Alive' -and

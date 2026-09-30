@@ -181,7 +181,7 @@ class TestLiveApplyServers(unittest.TestCase):
     def test_replace_drops_old_and_installs_new(self):
         with mock.patch.object(helper, "_remove_host_routes_v4") as rm, \
              mock.patch.object(helper, "get_egress_for",
-                               return_value=("Wi-Fi", "192.168.1.1")) as eg, \
+                               return_value=("Wi-Fi", "192.168.1.1")), \
              mock.patch.object(helper, "_direct_bypass_egress",
                                return_value=("Wi-Fi", "192.168.1.1")), \
              mock.patch.object(helper, "add_v4", return_value=True) as add:
@@ -237,7 +237,7 @@ class TestLiveApplyServers(unittest.TestCase):
         # ADD mode: the map from the dashboard covers EVERY current server
         # (the dashboard completes it), so the untouched server's endpoint
         # is re-installed (adopted under the helper's tracking), not lost.
-        with mock.patch.object(helper, "_remove_host_routes_v4") as rm, \
+        with mock.patch.object(helper, "_remove_host_routes_v4"), \
              mock.patch.object(helper, "get_egress_for",
                                return_value=("Wi-Fi", "192.168.1.1")), \
              mock.patch.object(helper, "add_v4", return_value=True):

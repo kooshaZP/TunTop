@@ -1,9 +1,16 @@
 # TunTop test matrix (Phase 0)
 
-Legend: **AUTO** = covered by the automated suite (`py -m pytest tests`);
+Legend: **AUTO** = covered by the automated suite
+(`python -m unittest discover -s tests -t .`);
 **MANUAL** = needs a real Windows box + real network — walk it before every
 release (see the release checklist in `docs/MILESTONE-v1.0.md`);
 **pending** = not yet walked on the current build.
+
+An **AUTO** row is a unit/integration test, not a walked scenario. CI runs
+the suite on **both Linux and Windows**; the Windows-only tests gate
+themselves on `os.name == "nt"` and skip on Linux. The `network/` tier is
+**never** run by CI — it needs `TUNTOP_NET_TESTS=1` and real connectivity —
+so any row whose coverage is `+ MANUAL` is the only place it is exercised.
 
 ## Environments
 

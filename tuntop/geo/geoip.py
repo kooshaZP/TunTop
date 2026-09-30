@@ -5,8 +5,11 @@ import hashlib
 import ipaddress
 import json
 import os
+import ssl
 import tempfile
 import threading
+import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -26,6 +29,42 @@ def _read_varint(buf, pos):
 def _read_bytes(buf, pos):
     length, pos = _read_varint(buf, pos)
     return buf[pos:pos + length], pos + length
+
+
+#: Minimum prefix length for an installable country range, per family. No real
+#: country block is this broad; a range this wide is a default route or a slice
+#: of the entire address space. Installed at metric=1 as an active route it is
+#: more specific than the tunnel's 0/0 + /1 (and ::/0 + ::/1 + 8000::/1)
+#: split-defaults, so it would capture ALL traffic that is supposed to stay in
+#: the tunnel - a silent, total exfiltration rather than a misroute.
+#:
+#: Deliberately duplicated from
+#: tuntop.tunnel.helper._is_routable_bypass_cidr, which enforces the same
+#: floors at the INSTALL boundary. Two layers, on purpose: the helper and this
+#: parser are separately importable, and the check must not be optional on
+#: either path. tests/unit/test_geoip_trust.py pins them to the same values.
+_MIN_PREFIXLEN = {4: 8, 6: 16}
+
+
+def _normalise_cidr(text):
+    """Canonicalise one CIDR string; return None if it is unusable.
+
+    The single gate every geo range passes through, whichever decoder
+    produced it. Rejects non-strings, unparseable input, and any range at or
+    above the per-family prefix floor. Returns the CANONICAL compressed form
+    (`ipaddress.ip_network(..., strict=False)`), which is also what
+    `Get-NetRoute` reports - so the route table, the conflict sweep's HashSet
+    and the live-table comparisons all agree by construction. (They did not:
+    a non-canonical `2001:0DB8::/32` installed fine and then failed every
+    string comparison against the live table forever - see CHANGELOG 1.0.41.)
+    """
+    try:
+        net = ipaddress.ip_network(str(text).strip(), strict=False)
+    except (ValueError, TypeError):
+        return None
+    if net.prefixlen < _MIN_PREFIXLEN[net.version]:
+        return None
+    return str(net)
 
 
 def _geoip_skip(buf, pos, wire):
@@ -162,17 +201,86 @@ GEOIP_DAT_URL = ("https://github.com/v2fly/geoip/releases/"
 GEOIP_DAT_SHA_URL = GEOIP_DAT_URL + ".sha256sum"
 
 
+#: Hosts the geo database (and its checksum) may legitimately come from.
+#: A 30x that leaves this set is refused rather than followed - see
+#: config.updates._SameHostRedirectHandler, which this downloader now shares
+#: the transport with.
+GEO_ALLOWED_HOSTS = frozenset({"github.com", "objects.githubusercontent.com",
+                               "release-assets.githubusercontent.com",
+                               "raw.githubusercontent.com"})
+
+#: Hard cap on the download. The real file is a few MB; anything vastly larger
+#: is either a mistake or an attempt to exhaust memory/disk in an admin process.
+GEO_MAX_BYTES = 64 * 1024 * 1024
+
+_SSL_CONTEXT = ssl.create_default_context()
+if hasattr(ssl, "TLSVersion"):
+    _SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+
+
+class _GeoSameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse a 30x that leaves GEO_ALLOWED_HOSTS.
+
+    urlopen() installs the DEFAULT redirect handler, which follows a 302 to
+    any host and any scheme. The updater already learned this lesson and built
+    its own opener; the geo downloader kept using bare urlopen, so it had
+    neither a TLS floor, nor a redirect allow-list, nor a size cap.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            host = urllib.parse.urlsplit(newurl).hostname or ""
+        except ValueError:
+            raise urllib.error.HTTPError(
+                newurl, code, f"malformed redirect target: {msg}",
+                headers, fp)
+        if host.lower() not in GEO_ALLOWED_HOSTS:
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"refusing redirect to an unexpected host ({host})",
+                headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_GEO_OPENER = urllib.request.build_opener(
+    _GeoSameHostRedirectHandler(),
+    urllib.request.HTTPSHandler(context=_SSL_CONTEXT),
+)
+
+
+def _assert_allowed_geo_url(url):
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        raise ValueError(f"malformed geoip URL: {url!r}")
+    if host not in GEO_ALLOWED_HOSTS:
+        raise ValueError(
+            f"refusing to download the geo database from an unexpected host "
+            f"({host or 'none'}) - allowed: "
+            f"{', '.join(sorted(GEO_ALLOWED_HOSTS))}")
+
+
 def download_geoip(dest_path, url=GEOIP_DAT_URL, sha_url=GEOIP_DAT_SHA_URL,
-                   progress=None, timeout=60):
+                   progress=None, timeout=60, strict_checksum=True):
     """Stream the v2fly geoip database to `dest_path` and return its size.
 
     * Downloads via streaming chunks into a temp `.part` file IN THE SAME
       directory as dest_path, then atomically os.replace()s it - an aborted
       download can never leave a half-written geoip.dat behind.
+    * Goes through `_GEO_OPENER`, not urlopen: an explicit TLS 1.2+ floor, a
+      redirect allow-list (every hop must stay on a GitHub host), and a size
+      cap. Bare urlopen had NONE of the three, even though the updater in
+      config/updates.py has had all three since it was written.
     * SHA-256 is computed WHILE downloading (no re-read), then compared with
-      the release's .sha256sum when that is reachable: a MISMATCH raises
-      ValueError (bad file never installed); if the checksum URL itself is
-      unreachable the install proceeds with only a silent skip.
+      the release's .sha256sum: a MISMATCH raises ValueError and the bad file
+      is never installed.
+    * `strict_checksum=True` (the default) also FAILS CLOSED when the checksum
+      itself cannot be fetched. It used to fail OPEN - `except: ref = None`
+      and the install proceeded - which for a geo database is not a cosmetic
+      weakness: these CIDRs decide what leaves the machine unencrypted. The
+      README describes the weaker behaviour honestly, but "trust on first
+      use" is a reasonable thing to opt into deliberately and a bad default to
+      ship silently. Pass strict_checksum=False to get the old behaviour.
     * progress(done_bytes, total_bytes_or_0) is called per chunk - total comes
       from Content-Length and may be 0 when the server does not send it.
     * Honors HTTP(S)_PROXY environment variables automatically (urllib)."""
@@ -182,26 +290,8 @@ def download_geoip(dest_path, url=GEOIP_DAT_URL, sha_url=GEOIP_DAT_SHA_URL,
     fd, tmp = tempfile.mkstemp(suffix=".part", prefix="geoip_dl_", dir=dest_dir)
     sha = hashlib.sha256()
     done = 0
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "TunTop/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            with os.fdopen(fd, "wb") as f:
-                fd = None   # ownership moved to f (closed by the with-block)
-                while True:
-                    chunk = resp.read(262144)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    sha.update(chunk)
-                    done += len(chunk)
-                    if progress is not None:
-                        try:
-                            progress(done, total)
-                        except Exception:
-                            pass
-    except Exception:
-        # Never leave a partial file (or leaked fd) behind on failure.
+
+    def _abort():
         if fd is not None:
             try:
                 os.close(fd)
@@ -211,28 +301,71 @@ def download_geoip(dest_path, url=GEOIP_DAT_URL, sha_url=GEOIP_DAT_SHA_URL,
             os.unlink(tmp)
         except Exception:
             pass
+
+    try:
+        _assert_allowed_geo_url(url)
+        req = urllib.request.Request(url, headers={"User-Agent": "TunTop/1.0"})
+        with _GEO_OPENER.open(req, timeout=timeout) as resp:
+            # Re-check where we ACTUALLY ended up, after redirects.
+            _assert_allowed_geo_url(getattr(resp, "url", None) or url)
+            total = int(resp.headers.get("Content-Length") or 0)
+            if total > GEO_MAX_BYTES:
+                raise ValueError(
+                    f"geoip download is {total} bytes, over the "
+                    f"{GEO_MAX_BYTES}-byte cap - refusing")
+            with os.fdopen(fd, "wb") as f:
+                fd = None   # ownership moved to f (closed by the with-block)
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    done += len(chunk)
+                    if done > GEO_MAX_BYTES:
+                        raise ValueError(
+                            f"geoip download exceeded the "
+                            f"{GEO_MAX_BYTES}-byte cap - refusing")
+                    f.write(chunk)
+                    sha.update(chunk)
+                    if progress is not None:
+                        try:
+                            progress(done, total)
+                        except Exception:
+                            pass
+    except Exception:
+        # Never leave a partial file (or leaked fd) behind on failure.
+        _abort()
         raise
     local_hex = sha.hexdigest()
     if sha_url:
         ref = None
+        why = ""
         try:
+            _assert_allowed_geo_url(sha_url)
             sreq = urllib.request.Request(
                 sha_url, headers={"User-Agent": "TunTop/1.0"})
-            with urllib.request.urlopen(sreq, timeout=30) as r:
+            with _GEO_OPENER.open(sreq, timeout=30) as r:
                 txt = (r.read(512) or b"").decode("ascii", "replace")
             tok = txt.split()[0].strip().lower() if txt.split() else ""
             if len(tok) == 64 and all(c in "0123456789abcdef" for c in tok):
                 ref = tok
-        except Exception:
-            ref = None   # checksum endpoint unreachable -> best-effort skip
+            else:
+                why = "checksum response was not a sha256 hex digest"
+        except Exception as e:
+            why = f"{e.__class__.__name__}: {e}"
         if ref and ref != local_hex:
-            try:
-                os.unlink(tmp)
-            except Exception:
-                pass
+            _abort()
             raise ValueError(
                 "geoip download failed checksum verification "
                 "(computed %s..., expected %s...)" % (local_hex[:12], ref[:12]))
+        if not ref and strict_checksum:
+            _abort()
+            raise ValueError(
+                "geoip download could not be verified - the release's "
+                ".sha256sum was unusable (%s). Refusing to install an "
+                "unverified database: these CIDRs decide what traffic "
+                "leaves the machine unencrypted. Retry, or pass "
+                "strict_checksum=False to accept it anyway."
+                % (why or "no digest returned"))
     os.replace(tmp, dest_path)
     return done
 
@@ -278,12 +411,30 @@ def _geo_disk_load(file_path, code):
             data = json.load(f)
         # Validate the shape: a wrong-typed value used to reach
         # all_codes.get(code) and raise AttributeError on every lookup.
-        if isinstance(data, dict) and all(
+        #
+        # Shape is NOT enough. This cache file is exactly the unprivileged-
+        # writable -> elevated-read channel the pickle removal was about, and
+        # the old validation stopped at "dict[str, list[str]]" - so
+        # {"cn": ["2000::/3"]} written here by ANY unprivileged process was
+        # returned straight into _GEOIP_CACHE and installed by the ELEVATED
+        # helper on the next [S]: the whole IPv6 address space routed
+        # outside the tunnel, no error, dashboard still green. Re-validate
+        # every value through the same normaliser the decoders use.
+        if not (isinstance(data, dict) and all(
                 isinstance(k, str) and isinstance(v, list)
                 and all(isinstance(x, str) for x in v)
-                for k, v in data.items()):
-            return data
-        return None
+                for k, v in data.items())):
+            return None
+        clean = {}
+        for code_key, v in data.items():
+            seen, cidrs = set(), []
+            for raw in v:
+                norm = _normalise_cidr(raw)
+                if norm and norm not in seen:
+                    seen.add(norm)
+                    cidrs.append(norm)
+            clean[code_key] = cidrs
+        return clean
     except Exception:
         return None
 
@@ -505,7 +656,19 @@ def _geoip_decode_json(text, code=None):
         c = str(entry.get("code", "")).lower()
         if not c or (code_l is not None and c != code_l):
             continue
-        out[c] = [str(ip) for ip in entry.get("ip", []) if ip]
+        # Through _normalise_cidr, NOT a raw str() pass-through. This decoder
+        # used to hand every string in entry["ip"] straight to the route
+        # installer with no ip_network parse and no /0 rejection, so a v2fly
+        # "geoformat" .json could carry 2000::/3 - the entire IPv6 global
+        # unicast space - as a "country range". The binary decoder beside it
+        # has rejected /0 since 1.0.41; this path never did.
+        seen, cidrs = set(), []
+        for raw in entry.get("ip", []):
+            norm = _normalise_cidr(raw)
+            if norm and norm not in seen:
+                seen.add(norm)
+                cidrs.append(norm)
+        out[c] = cidrs
     return out
 
 

@@ -14,9 +14,35 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
 }
 
 $ScriptDir  = $PSScriptRoot
+
+function Resolve-DependencyPath {
+    <#
+      The vendored binaries legitimately live in TWO different places, and
+      the two consumers of this script disagree about which one:
+        - the release zip (build_release.py) ships tun2socks/*.exe|wintun.dll
+          under 'tuntop\', which is where tuntop/ui/dashboard.py's app_dir()
+          resolves to when run from source, and
+        - a git checkout - and anything that drops the binaries next to
+          TunTop.exe - keeps them at the ROOT, next to this script.
+      This script used to look ONLY at the root, so on a fresh zip it missed
+      the copies already inside the archive and Get-Dependency silently
+      re-downloaded ~12 MB that shipped with it.
+      Search both, ROOT FIRST so a source checkout behaves exactly as before
+      (and so a user who deliberately put a binary at the root keeps it).
+      Falls back to the root path when neither candidate exists, so a genuine
+      first run still downloads to the same place it always did.
+    #>
+    param([string]$Name)
+    foreach ($dir in @($ScriptDir, (Join-Path $ScriptDir 'tuntop'))) {
+        $candidate = Join-Path $dir $Name
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return (Join-Path $ScriptDir $Name)
+}
+
 $Helper     = Join-Path $ScriptDir 'tuntop/tunnel/helper.py'
 $Tui        = Join-Path $ScriptDir 'tuntop/ui/dashboard.py'
-$Tun2socks  = Join-Path $ScriptDir 'tun2socks-windows-amd64-v3.exe'
+$Tun2socks  = Resolve-DependencyPath 'tun2socks-windows-amd64-v3.exe'
 
 $VlessEndpointPort = '443'
 $SocksPort         = '10808'
@@ -83,7 +109,10 @@ function Get-Dependency {
         - tun2socks-windows-amd64-v3.exe  (GitHub releases)
         - wintun.dll                      (wintun.net bundle)
       Existing files are NEVER overwritten, so re-running stays
-      offline-friendly and idempotent.
+      offline-friendly and idempotent. A bare file name is resolved through
+      Resolve-DependencyPath first, so a binary that is already sitting in
+      the 'tuntop\' package dir of an extracted release is found rather
+      than re-downloaded.
     #>
     param(
         [string]$Destination,
@@ -92,6 +121,12 @@ function Get-Dependency {
         [string]$FriendlyName,
         [string]$ManualHint
     )
+    if (-not (Test-Path $Destination)) {
+        # Not a path we recognise (or not there): retry as a dependency name
+        # against both known locations before concluding it is missing.
+        $Destination = Resolve-DependencyPath `
+            ([System.IO.Path]::GetFileName($Destination))
+    }
     if (Test-Path $Destination) { return $true }
 
     $safe = $FriendlyName -replace '\W', '_'
@@ -176,7 +211,7 @@ $okTun2socks = Get-Dependency `
     -FriendlyName 'tun2socks' `
     -ManualHint 'https://github.com/xjasonlyu/tun2socks/releases -> place tun2socks-windows-amd64-v3.exe next to this script'
 
-$WintunDll   = Join-Path $ScriptDir 'wintun.dll'
+$WintunDll   = Resolve-DependencyPath 'wintun.dll'
 $okWintun    = Get-Dependency `
     -Destination $WintunDll `
     -Url 'https://www.wintun.net/builds/wintun-0.14.1.zip' `
@@ -417,3 +452,7 @@ else           { Write-Host "Helper exited with code $rc." }
 Write-Host ''
 Write-Host 'Press any key to close this window...'
 $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+# Leave with the helper's real status. Without this the script's exit code is
+# whatever ReadKey returned (0), so the launcher's "exited with code" branch can
+# never fire and a crashed dashboard is reported as "[+] TunTop finished."
+exit $rc

@@ -223,11 +223,6 @@ def _dns_query_doh(host, qtype, endpoint, timeout=4.0):
         return []
 
 
-def _dns_cache_clear():
-    with _DNS_CACHE_LOCK:
-        _DNS_CACHE.clear()
-
-
 def _ips_str(v4, v6):
     """Render v4/v6 lists for a DNS log line: '9.9.9.9 (none)'."""
     return f"{', '.join(v4) if v4 else '(none)'} {', '.join(v6) if v6 else '(none)'}"

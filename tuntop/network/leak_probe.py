@@ -546,18 +546,6 @@ _DNS_TYPE_A = 1
 _DNS_TYPE_TXT = 16
 
 
-def _injected_true(predicate):
-    """True when an injected predicate says so. A missing predicate or one
-    that raises counts as "unknown" (False), so a broken probe can never
-    manufacture a leak verdict on its own."""
-    if not callable(predicate):
-        return False
-    try:
-        return bool(predicate())
-    except Exception:
-        return False
-
-
 def _guard_state(guard_in_force):
     """Tri-state the guard probe: (True|False|None, why).
 

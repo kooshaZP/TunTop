@@ -187,4 +187,8 @@ if __name__ == "__main__":
         import traceback
         log("MONITOR CRASH:\n" + traceback.format_exc())
     time.sleep(0.08)
-    keybd_event(vk, 0, 2, 0)  # KEYEVENTF_KEYUP
+    # The stray `keybd_event(vk, 0, 2, 0)` that used to end this file was a
+    # debug leftover: `vk` is never assigned anywhere in the module, so the
+    # line raised NameError on every single run - after main() had already
+    # done its work and killed the exe tree. The exit code was therefore
+    # always 1 and any caller checking it saw a crash. Removed.

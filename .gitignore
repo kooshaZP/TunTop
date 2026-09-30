@@ -3,6 +3,13 @@ dist/
 build/
 
 # --- downloaded at first run; never commit binaries -----------------------
+# EXCEPTION, and it is a live one: geofil/geoip.dat IS tracked (mode 100644,
+# blob 58700b8e..., 23,330,258 bytes) even though the `geoip.dat` rule below
+# matches it. An ignore rule has no effect on an already-tracked path, so the
+# rule is inert for that file and the header line above is misleading.
+# Untracking it (`git rm --cached geofil/geoip.dat`) is a separate decision
+# about how users are meant to receive the database, and is deliberately NOT
+# done here.
 *.exe
 *.dll
 *.zip
@@ -21,6 +28,11 @@ crash_*.txt
 __pycache__/
 *.pyc
 .geo_cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
 # --- local / personal config ---------------------------------------------
 # Run_Helper.ps1 may contain your server IPs and geoip path - keep a copy of

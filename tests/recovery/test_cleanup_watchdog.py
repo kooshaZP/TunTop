@@ -275,25 +275,64 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
         self.assertEqual(call_order[0], "kill", "helper must die before teardown")
 
     def test_marker_not_ours_after_sweep_not_cleared(self):
-        """If a new session wrote its marker while we were sweeping, leave it."""
+        """If a new session wrote its marker while we were sweeping, leave it.
+
+        The marker is read THREE times by sweep_after_unclean_exit: once to
+        confirm the crash is ours, once immediately before the first
+        destructive step (the grace period is exactly the relaunch window),
+        and once more AFTER the sweep, before the marker is retired. The third
+        read is this test's subject: the sweeps take seconds, and a session
+        that started during them now owns the system. Clearing its marker
+        would tell the next launch the system is clean when it is not, and
+        leave that session's own watchdog with nothing to do.
+
+        sweep_geo_routes / sweep_lan_routes are patched because the REAL
+        sweep_lan_routes shells out to `powershell -EncodedCommand`
+        (Get-NetRoute) and netsh: a unit test must never spawn a subprocess,
+        and it is the only reason this test used to be slow. Their return
+        value 0 means "ran, found nothing", so the sweep is treated as clean
+        and the post-sweep re-read is genuinely reached. scan/recover are the
+        real ones over the fake probes, so the sweep really executes.
+
+        The read sequence is driven through read_marker itself, so the marker
+        file is rewritten for real when the newer session claims it - the
+        assertions below then read the file off disk, not the mock.
+        """
         path = make_marker(pid=777)
+        reads = []
 
-        def fake_read(p):
-            # After scan+recover, the marker is now owned by a new PID
-            if fake_read.call_count > 1:
-                return {"pid": 8888, "started": 2000.0}
-            return {"pid": 777, "started": 1000.0}
-        fake_read.call_count = 0
+        def fake_read(_p):
+            reads.append(1)
+            if len(reads) < 3:
+                return {"pid": 777, "started": 1000.0}
+            # A newer session claimed the marker mid-sweep: write it for
+            # real, so "not cleared" is asserted against the file on disk.
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"pid": 8888, "started": 2000.0}, f)
+            return {"pid": 8888, "started": 2000.0}
 
-        p, state = self._make_probes()
+        p, state = self._make_probes(killed=1)
         with patch("tuntop.core.cleanup_watchdog.read_marker", side_effect=fake_read), \
-             patch("tuntop.core.cleanup_watchdog.scan", return_value=MagicMock(orphan_tun2socks=0, wintun_routes=0, host_routes=[], marker={"pid": 777})), \
-             patch("tuntop.core.cleanup_watchdog.recover", return_value=[]):
-            fake_read.call_count = 0
-            # Just verify it doesn't crash - the second read returns new PID
-            result = sweep_after_unclean_exit(777, marker_path=path, probes=p)
-        # Should still return True (unclean exit detected and swept)
-        self.assertTrue(result)
+             patch("tuntop.core.cleanup_watchdog.sweep_geo_routes", return_value=0) as geo, \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes", return_value=0) as lan, \
+             patch("tuntop.core.cleanup_watchdog.clear_marker") as clear:
+            result = sweep_after_unclean_exit(777, marker_path=path, probes=p,
+                                              marker_live=dead_session)
+
+        self.assertEqual(len(reads), 3,
+                         "the marker is read before the sweep, just before the "
+                         "destructive step, and again before it is retired")
+        self.assertTrue(result, "the unclean exit WAS detected and swept")
+        self.assertEqual(state["killed"], 1, "the sweep really ran")
+        # The patched sweeps are the ones that ran - no powershell/netsh.
+        self.assertTrue(geo.called)
+        self.assertTrue(lan.called)
+        clear.assert_not_called()
+        on_disk = read_marker(path)
+        self.assertIsNotNone(on_disk, "the newer session's marker must survive")
+        self.assertEqual(on_disk["pid"], 8888,
+                         "the file must still be the NEWER session's marker, "
+                         "not deleted and not overwritten with ours")
 
     def test_live_session_marker_is_left_completely_alone(self):
         """The mirror image of the crash tests, and the reason the liveness

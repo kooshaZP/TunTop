@@ -3,6 +3,26 @@
 # actually USING it? (A rule in the registry that Windows ignores protects
 # nothing - that is the case this script is built to distinguish.)
 $ErrorActionPreference = 'Continue'
+# The header says ELEVATED, so enforce it here rather than in prose. Sections 1-2
+# read HKLM and query the effective NRPT policy and BOTH need elevation:
+# unelevated they fail with access-denied, and -ErrorAction SilentlyContinue
+# turns that into an empty result - indistinguishable from "no rule installed",
+# which is how a plain permission error used to print "this is the leak".
+$elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $elevated) {
+    Write-Host "`n  [!] This diagnostic must run ELEVATED - stopping before any verdict." -ForegroundColor Red
+    Write-Host '      It reads HKLM:\...\Dnscache\Parameters\DnsPolicyConfig and calls' -ForegroundColor Red
+    Write-Host '      Get-DnsClientNrptPolicy -Effective; unelevated, both fail with' -ForegroundColor Red
+    Write-Host '      access-denied, which looks exactly like "no DNS rule installed".' -ForegroundColor Red
+    Write-Host ''
+    Write-Host '      Re-run it from an administrator window:' -ForegroundColor Yellow
+    $cmd = 'Start-Process -Verb RunAs -Wait powershell -ArgumentList ''-NoProfile -ExecutionPolicy Bypass -File "{0}"''' -f $PSCommandPath
+    Write-Host "        $cmd" -ForegroundColor Yellow
+    Write-Host ''
+    exit 2
+}
+
 $root = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig'
 
 Write-Host "`n=== 1. TunTop NRPT keys in the registry ===" -ForegroundColor Cyan
@@ -44,10 +64,24 @@ Get-DnsClientServerAddress -ErrorAction SilentlyContinue |
         if ($a.Count -gt 0) { Write-Host ("  {0} = {1}" -f $_.InterfaceAlias, ($a -join ',')) -ForegroundColor Yellow }
     }
 
-Write-Host "`n=== 4. Installed TunTop instances (more than one = the guard is being fought over) ===" -ForegroundColor Cyan
-$p = @(Get-Process -Name 'TunTop*' -ErrorAction SilentlyContinue)
+Write-Host "`n=== 4. TunTop processes found (dashboard / helper / watchdog) ===" -ForegroundColor Cyan
+# Get-Process -Name 'TunTop*' matched the IMAGE name only, which gives no usable
+# signal in either mode: from source the processes are python.exe running
+# tuntop/ui/dashboard.py and tuntop/tunnel/helper.py, and frozen they are all
+# TunTop.exe - so the count was always 0, or always >= 3 for one healthy
+# session. Match the command line as well, and skip our own $PID.
+# -like is case-insensitive, so '*tuntop*' also catches TunTop.
+# A source-mode run and a frozen run legitimately give DIFFERENT counts for the
+# same single healthy session, so read the pid + command lines below rather than
+# the number alone: 2 (source) and 3 (frozen: dashboard, --helper-child,
+# --watchdog-child) are both normal, a second dashboard or helper is not.
+$p = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+       Where-Object {
+           $_.ProcessId -ne $PID -and
+           ($_.Name -like 'TunTop*' -or $_.CommandLine -like '*tuntop*')
+       })
 Write-Host ("  {0} running" -f $p.Count)
-$p | ForEach-Object { Write-Host ("    pid {0}  started {1}" -f $_.Id, $_.StartTime) }
+$p | ForEach-Object { Write-Host ("    pid {0}  {1}" -f $_.ProcessId, $_.CommandLine) }
 
 Write-Host "`n=== 5. Verdict ===" -ForegroundColor Cyan
 $hasKey = $keys.Count -gt 0

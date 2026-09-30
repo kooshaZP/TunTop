@@ -42,11 +42,25 @@ if _PKG_PARENT not in _sys.path:
 def app_dir() -> str:
     """Directory that holds TunTop's runtime assets (tun2socks.exe / wintun.dll).
 
-    When frozen by PyInstaller (``--onefile``) the script runs from a temp
-    extraction dir, so the real assets live under ``sys._MEIPASS``; when run
-    from source they ship inside the ``tuntop`` package (this file lives in
-    ``tuntop/ui/``, so the assets are one level up). Always resolves to the
-    directory the *assets* are shipped in, never the temp sandbox.
+    Always resolves to the directory the *assets* are actually shipped in,
+    never a temp sandbox - but which directory that is depends on how TunTop
+    was obtained, and the two source layouts are NOT interchangeable:
+
+    * frozen (PyInstaller ``--onefile``): the script runs from a temp
+      extraction dir, so the real assets are under ``sys._MEIPASS`` or next
+      to the exe - see the branch below;
+    * source, release zip: ``build_zip()`` writes the vendored binaries into
+      the ``tuntop`` package dir, so they are ONE level up from this file
+      (``tuntop/ui/`` -> ``tuntop/``);
+    * source, git checkout: there is NO copy inside the package at all. The
+      vendored binaries are gitignored and live at the REPO ROOT, TWO levels
+      up from this file (``tuntop/ui/`` -> ``tuntop/`` -> ``<root>``).
+
+    The source branch therefore PROBES for the file instead of assuming a
+    layout: the package dir first (so the zip layout keeps winning), then the
+    repo root, and finally the package dir again so today's behaviour is
+    preserved verbatim when neither has the binary (e.g. before anything has
+    been downloaded).
     """
     if getattr(_sys, "frozen", False):
         # Onefile: _MEIPASS holds whatever the build embedded. The vendored
@@ -63,9 +77,14 @@ def app_dir() -> str:
         return exe_dir if _os.path.isfile(_os.path.join(
             exe_dir, "wintun.dll")) else meipass
     here = _os.path.dirname(_os.path.abspath(__file__))
-    if _os.path.basename(here) == "ui":
-        return _os.path.dirname(here)
-    return here
+    if _os.path.basename(here) != "ui":
+        return here
+    pkg_dir = _os.path.dirname(here)          # the ``tuntop`` package dir
+    for cand in (pkg_dir, _os.path.dirname(pkg_dir)):
+        if _os.path.isfile(_os.path.join(
+                cand, "tun2socks-windows-amd64-v3.exe")):
+            return cand
+    return pkg_dir
 
 from tuntop.routing import (          # noqa: E402, F401
     # The WHOLE surface, not just what this module happens to call today.
@@ -95,6 +114,7 @@ from tuntop.config import defaults as _cfgdef   # noqa: E402
 from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
     VPN_IFACE_RE, LAN_BYPASS_PREFIXES, SWEEP_CHUNK, SWEEP_MAX_WORKERS,
     TUN, TUN4, TUN2, TUN2_IP4, TUN2_IP6, TUNNEL_ALIASES,
+    DEFAULT_SOCKS_PORT, DEFAULT_ENDPOINT_PORT,
 )
 from tuntop.network.routeops import sweeps as _rsweeps   # noqa: E402
 from tuntop.state import (            # noqa: E402
@@ -284,7 +304,6 @@ RESET = "\033[0m"   # [0m clears everything; spans that should keep the
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
-BLUE = "\033[94m"
 CYAN = "\033[96m"
 WHITE = "\033[97m"
 PURPLE = "\033[95m"
@@ -293,8 +312,6 @@ GRAY = "\033[90m"
 # Panel borders ─ light active, heavy inactive
 P_LIGHT   = "\033[38;2;100;140;200m"   # panel border (active)
 P_INACT   = "\033[38;2;60;75;100m"     # panel border (inactive / dim)
-P_ACTIVE  = "\033[38;2;140;190;255m"    # bright accent line
-BG_DARK   = "\033[48;2;15;17;22m"      # subtle bg fill
 
 # ─── Active background (theme-driven) ────────────────────────────────────
 # The terminal's own background shows through every padded space, so the
@@ -1003,7 +1020,7 @@ def _dns_tunnel_verdict(dns, port):
     return False, f"both UDP+TCP failed via {dns}: {msg_udp}"
 
 
-def _https(proxy=False, v6=False, port=10808,
+def _https(proxy=False, v6=False, port=DEFAULT_SOCKS_PORT,
            url="https://www.cloudflare.com/cdn-cgi/trace"):
     cmd = ["curl.exe", "--silent", "--show-error", "--max-time", "15",
            "--output", "NUL", "--write-out", "%{http_code}"]
@@ -1044,6 +1061,15 @@ def _ipv6_tun_verdict(port, url="https://www.cloudflare.com/cdn-cgi/trace"):
         "Where-Object {$_.InterfaceAlias -eq 'wintun' -and "
         "$_.DestinationPrefix -in '::/0','::/1','8000::/1'} | Select-Object -First 1; "
         "if ($r) { Write-Output 'WINTUN_IPV6_PRESENT' } else { Write-Output 'NO_WINTUN_IPV6' }")
+    # `ok` was captured and then ignored. A failed probe (PowerShell wedged,
+    # timeout, Get-NetRoute erroring) puts error text in `out`, so `routed`
+    # was False and this returned a GREEN "IPv6 not routed through Wintun -
+    # expected" - reporting a broken probe as a verified pass, which is the
+    # exact regression the tri-state contract above forbids. Return None
+    # ("could not answer"), the same way _dns_enforcement_check does a few
+    # lines down.
+    if not ok:
+        return None, f"IPv6 route probe failed: {out}"
     routed = 'WINTUN_IPV6_PRESENT' in out
     if not routed:
         return True, ("IPv6 not routed through Wintun (no ::/0 or ::/1 route) - "
@@ -1231,11 +1257,17 @@ def _dns_guard_check(dns4=None, dns6=None, enabled=True):
     try:
         probe_ok, state = _dns_guard.detect(runner=_ps)
     except Exception as e:
-        return False, f"DNS leak-protection probe failed: {e}"
+        # None = "this probe could not answer", NOT a fault. Returning False
+        # here painted a red ✗ on a single transient PowerShell timeout,
+        # incremented the fail counter and flipped the badge to UNHEALTHY -
+        # sending the user hunting for a fault that does not exist, which is
+        # precisely the regression the tri-state contract documented 40 lines
+        # above ("a check that proved nothing is not a fault in your setup").
+        return None, f"DNS leak-protection probe failed: {e}"
     if not probe_ok:
-        return False, ("DNS leak-protection state could not be read"
-                       + (f" ({state.get('error')})" if state.get("error")
-                          else ""))
+        return None, ("DNS leak-protection state could not be read"
+                      + (f" ({state.get('error')})" if state.get("error")
+                         else ""))
     in_force = bool(state.get("ok"))
     if in_force and tunnel_up:
         return True, ("catch-all NRPT rule pins all name resolution to "
@@ -1434,7 +1466,6 @@ def build_checks(ns):
     dns_cfg, dns6_cfg = _cfgdef.resolve_dns_choice(
         getattr(ns, "dns4", None), getattr(ns, "dns6", None))
     dns = dns_cfg or _cfgdef.DNS4       # probe/display fallback
-    dns6 = dns6_cfg or _cfgdef.DNS6     # probe/display fallback
     ep = getattr(ns, "endpoint_port", 443)
     # [V] vless-over-vpn mode: the per-server route checks below are MODE-AWARE.
     over = getattr(ns, "vless_over_vpn", False)
@@ -1637,8 +1668,20 @@ def build_checks(ns):
             for ip in ep4 + ep6:
                 prefix = f"{ip}/32" if ":" not in ip else f"{ip}/128"
                 label = host if host == ip else f"{host} ({ip})"
+                # An ABSENT route must be a FAILURE, not a pass. The old
+                # form piped Get-NetRoute into `% {'routed'}`: with no such
+                # route the cmdlet emits nothing, `%` over an empty collection
+                # emits nothing, PowerShell exits 0, and routing._ps turns
+                # empty output into `(True, "No result")`. So this row was
+                # permanently green whether or not the /32 was ever installed
+                # - and this is the one row that proves traffic actually goes
+                # AROUND the tunnel. A missing bypass means the host's traffic
+                # silently enters the TUN, which is exactly the failure [A]
+                # exists to prevent, while the panel reported all well.
                 checks.append(q(f"Bypass {label}",
-                    f"Get-NetRoute -DestinationPrefix '{prefix}' -ErrorAction SilentlyContinue | % {{'routed'}}"))
+                    f"$r = @(Get-NetRoute -DestinationPrefix '{prefix}' -ErrorAction SilentlyContinue); "
+                    f"if ($r.Count -gt 0) {{ 'routed via ' + $r[0].InterfaceAlias }} "
+                    f"else {{ throw 'no route for {prefix}' }}"))
 
     # Per-server endpoint checks: one set of TCP / route / proxy-loop checks
     # for every configured --server value. In [V] vless-over-vpn mode the
@@ -1987,34 +2030,6 @@ def _spark(values, width, mode=None):
     return ui_text.spark(values, width, mode, USE_UNICODE)
 
 
-def _panel(lines, title=None, width=60, active=True):
-    """Render a panel with box borders."""
-    border = P_ACTIVE if active else P_INACT
-    pad_border = P_LIGHT if active else P_INACT
-    L = []
-
-    sep = BOX_BS * max(1, width - 2)
-    hsep = BOX_MID * max(1, width - 2)
-
-    # Top
-    if title:
-        centre = f" {title} "
-        L.append(f"{pad_border}{BOX_LC}{centre.center(width - 2, BOX_MID)}{BOX_RC}{_R}")
-    else:
-        L.append(f"{pad_border}{BOX_LC}{sep}{BOX_RC}{_R}")
-
-    # Body
-    for row in lines:
-        text = str(row).replace("\033[", "ESC[")  # protect embedded ANSI
-        # Strip ANSI to get visible width
-        visible = len(re.sub(r'\x1b\[[^m]*m', '', str(row)))
-        L.append(f"{pad_border}{BOX_V} {_pad(text, width - 2)} {BOX_V}{_R}")
-
-    # Bottom
-    L.append(f"{pad_border}{BOX_BL}{hsep}{BOX_BS}{BOX_BR}{_R}")
-    return "\n".join(L)
-
-
 # ─── TUI class ──────────────────────────────────────────────────────────────
 
 class _GeoLogSink:
@@ -2145,11 +2160,14 @@ class BTopTui:
         # lifecycle facade the architecture docs always promised. It owns the
         # state-machine graph for start/stop, so the UI handlers below gate
         # their actions through it instead of poking the machine directly.
-        # This class was previously defined and tested but never wired into
-        # the dashboard (the "architecture on paper" gap); the launch/teardown
-        # mechanics still live in launch()/stop() - the manager adds the
-        # legality layer on top, matching how RecoveryEngine wraps the
-        # machine rather than replacing it.
+        # It is constructed BY HAND here, with this class's own launch()/
+        # stop() passed in as the launch/teardown callables, so the legality
+        # layer wraps those mechanics rather than replacing them - the same
+        # way RecoveryEngine wraps the machine instead of taking it over.
+        # No factory module mediates that boundary: this single
+        # construction site is the only place the manager and these
+        # callables are joined, so anything else wanting the same wiring
+        # has to pass its own launch/stop in the same way.
         self.manager = TunnelManager(
             machine=self.tunnel,
             launch=self.launch,          # manager drives the real launcher
@@ -2373,6 +2391,13 @@ class BTopTui:
         self._teardown_lock = threading.Lock()
         self._stopping = threading.Event()   # set while ANY stop/teardown runs
         self._start_after_stop = False       # [S] queued while a stop is running
+        # [T] teardown claim. Set on the UI thread BEFORE the worker is spawned
+        # (the STOPPING state is only set inside _stop_locked, i.e. on the
+        # worker, so two rapid [T] presses both used to pass the check), and
+        # the live handle so [Q]'s wait loop can distinguish "a [T] stop is
+        # in flight" from "something else set _stopping".
+        self._stop_requested = False
+        self._stop_thread = None
 
         # Live-reconfiguration support
         self._iface_cache = None        # cached (interface, gateway) for live bypass-route adds
@@ -2549,40 +2574,6 @@ class BTopTui:
                     except Exception as e:
                         self._blog(f"[!] VPN-arrival re-apply failed: {e}")
             time.sleep(0.2)
-
-    @property
-    def current_speed(self):
-        return self.speed_hist[-1] if self.speed_hist else 0.0
-
-    @property
-    def avg_speed(self):
-        h = self.speed_hist
-        return (sum(h) / len(h)) if h else 0.0
-
-    @property
-    def peak_speed(self):
-        return (max(self.speed_hist)) if self.speed_hist else 0.0
-
-    @property
-    def current_rx(self):
-        return self.rx_hist[-1] if self.rx_hist else 0.0
-
-    @property
-    def current_tx(self):
-        return self.tx_hist[-1] if self.tx_hist else 0.0
-
-    @property
-    def peak_rx(self):
-        return (max(self.rx_hist)) if self.rx_hist else 0.0
-
-    @property
-    def peak_tx(self):
-        return (max(self.tx_hist)) if self.tx_hist else 0.0
-
-    @property
-    def avg_ping(self):
-        s = self.ping_samples
-        return round(sum(s) / len(s)) if s else None
 
     def _on_tunnel_state_change(self, tr):
         """TunnelStateMachine observer: mirror every state transition into
@@ -3334,22 +3325,6 @@ class BTopTui:
         if getattr(self.ns, "vless_over_vpn", False):
             return _get_vpn_ipv6_default(getattr(self.ns, "vpn_interface", None))
         return _get_ipv6_default()
-
-    # Windows loopback pseudo-interface. Used as a "blackhole" next-hop for the
-    # IPv6 fallback below: a /128 pointed here has nowhere real to go, so the
-    # TCP connect fails and Happy Eyeballs falls back to the IPv4 /32.
-    _LOOPBACK_IFACE = "Loopback Pseudo-Interface 1"
-
-    def _ipv6_is_local(self, addr):
-        """True if `addr` is assigned to any local adapter. Safety guard so the
-        IPv6-blackhole fallback never blackholes one of our own addresses."""
-        try:
-            ok, out = _ps(
-                f"@(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue "
-                f"| Where-Object {{$_.IPAddress -eq '{addr}'}}).Count -gt 0")
-            return ok and out.strip().strip('"').lower() in ("true", "1")
-        except Exception:
-            return False
 
     # ── Extra bypass entries: add / remove / resolve (background) ─────────
     #
@@ -5143,7 +5118,7 @@ class BTopTui:
     # cycle ([MONITOR] leak check lines in this log).
 
     def _leak_test(self):
-        port = getattr(self.ns, "port", 10808)
+        port = getattr(self.ns, "port", DEFAULT_SOCKS_PORT)
         if getattr(self, "_leak_running", False):
             self._blog("[*] Leak test already running - one moment...")
             return
@@ -6099,8 +6074,8 @@ class BTopTui:
                 # "the app is frozen": the start never happened unless they
                 # kept retrying blindly.)
                 if getattr(self, "_start_after_stop", False):
-                    self.log_lines.append("[i] Start already queued - the " 
-                                          "tunnel will come up as soon as " 
+                    self.log_lines.append("[i] Start already queued - the "
+                                          "tunnel will come up as soon as "
                                           "the stop finishes.")
                 else:
                     self._start_after_stop = True
@@ -6119,17 +6094,24 @@ class BTopTui:
             return True
         elif key == 't':
             if self.proc and self.proc.poll() is None:
-                if self.tunnel.current is TunnelState.STOPPING:
+                # Claim the teardown on the UI thread, BEFORE spawning. The
+                # STOPPING state is only set inside _stop_locked, which runs
+                # on the worker - so two [T] presses a frame apart both saw
+                # RUNNING and both spawned a teardown worker.
+                if self._stop_requested or self.tunnel.current is TunnelState.STOPPING:
                     self.log_lines.append("[*] Stop already in progress - "
                                           "wait for the tunnel to go STOPPED.")
                     return True
+                self._stop_requested = True
                 self.log_lines.append("[*] Stopping tunnel (press [S] to restart)...")
                 # Teardown runs OFF the UI thread: stop() waits out the helper
                 # (up to ~13s) then sweeps routes / tears down Wintun via
                 # batched PowerShell - doing that inline froze the dashboard
                 # for tens of seconds after every [T] ("program becomes
                 # unresponsive after stop").
-                threading.Thread(target=self._stop_async, daemon=True).start()
+                self._stop_thread = threading.Thread(
+                    target=self._stop_async, daemon=True)
+                self._stop_thread.start()
             return True
         elif key == 'v':
             self._toggle_vless_over_vpn()
@@ -6667,10 +6649,6 @@ class BTopTui:
         def _botw(width, accent=None):
             col = accent if accent else pal["inact"]
             return f"{col}{BOX_BL}{BOX_BS * (width - 2)}{BOX_BR}{_R}"
-
-        def _blankw(width, accent=None):
-            col = accent if accent else pal["light"]
-            return f"{col}{BOX_V}{' ' * (width - 2)}{BOX_V}{_R}"
 
         # ── Status bar (top) ───────────────────────────────────────────
         # Styled like the TUN CONFIG panel: coloured [ STATE ] badge (clickable),
@@ -7975,6 +7953,20 @@ class BTopTui:
         is stranded mid-sequence (helper died between phase markers, so no
         STOPPED/FAILED was ever announced) resets the machine - loudly - and
         retries once: a manual start must never be bricked by stale state."""
+        # LIVENESS GATE, and it has to be here rather than in the [S] handler.
+        # `request_start` is rejected for ANY live start phase (the graph has
+        # no STARTING -> STARTING edge), so without this check a caller that
+        # did not pre-check - the recovery restart, the bypass/port restart
+        # workers, VPN arrival - concluded the machine was "stranded with no
+        # helper process" and force-reset it, then launched a SECOND helper.
+        # Two tun2socks, two Wintun adapters, two installers fighting over the
+        # routing table; self.proc was rebound to the new one, so the orphan
+        # was never killed, never waited, and its reader thread was
+        # generation-superseded so nothing could ever drive it down.
+        if self.proc is not None and self.proc.poll() is None:
+            self._blog(f"[*] Helper already running (PID {self.proc.pid}) - "
+                       "nothing to start. Press [T] to stop it first.")
+            return False
         if self.manager.request_start(verify_immediately=False):
             return True
         current = self.tunnel.current
@@ -8796,7 +8788,10 @@ class BTopTui:
                     lines.append(f"interface {verb} delete route {dp} "
                                  f"{iface_dq}{nh_tok}")
 
-                def _run(_lines=lines, _n=len(chunk)):
+                # Late-binding defaults: this closure is submitted to a pool
+                # and must capture THIS chunk, so the defaults are evaluated
+                # here, inside the loop, on purpose.
+                def _run(_lines=lines, _n=len(chunk)):  # noqa: B008
                     try:
                         fd, path = tempfile.mkstemp(suffix=".txt",
                                                     prefix="geo_sweep_")
@@ -9004,12 +8999,6 @@ class BTopTui:
                          name="geo-download").start()
         return True
 
-    def _shutdown_del_route(self, fam, dest, iface, gw):
-        if fam == "v4":
-            _del_route_v4(dest, iface, gw)
-        else:
-            _del_route_v6(dest, iface, gw)
-
     def _sweep_progress_cb(self, done, total):
         """Live counter for the [Q] checklist while the geo-leftover sweep
         deletes its batches, so the shutdown screen never looks frozen."""
@@ -9060,6 +9049,15 @@ class BTopTui:
         except Exception:
             return False
 
+    def _live_stop_thread(self):
+        """The live [T] teardown worker, or None.
+
+        getattrs rather than reading the attribute directly: several tests
+        build a BTopTui without running __init__.
+        """
+        t = getattr(self, "_stop_thread", None)
+        return t if t is not None else None
+
     def _shutdown_with_progress(self):
         """Run the full route-clearing teardown with a live progress bar and do
         NOT return (and thus do NOT let the app quit) until the routing table is
@@ -9067,14 +9065,34 @@ class BTopTui:
         if self._shutting_down:
             return
         self._shutting_down = True
+        # QUIESCE THE WRITERS FIRST. This path never set `_stopping` and never
+        # cleared `_telemetry_running`, so the bypass resolver kept ticking
+        # through the whole teardown: `_bypass_resolve_tick` guards on
+        # `_stopping` alone, so a [A]/[X]/[R] landing mid-teardown would
+        # install fresh /32s. The verify loop below only counts routes on the
+        # WINTUN adapter, so a direct /32 installed on the PHYSICAL NIC was
+        # invisible to it - the panel said "Routes cleared - safe to quit"
+        # while live routes were sitting there, and loop()'s finally could not
+        # save it either: stop() returns immediately once _cleanup_done is set.
+        self._telemetry_running = False
+        self._stopping.set()
         # [T] pressed seconds ago? Let its stop worker finish FIRST - running
         # two teardowns concurrently is what froze the app ("unresponsive
-        # after stop, can't start or exit").
-        if self._stopping.is_set():
+        # after stop, can't start or exit"). Bounded, so [Q] can never hang
+        # forever behind a slow stop (a large geo table can take minutes).
+        if self._stopping.is_set() and self._live_stop_thread() is not None \
+                and self._live_stop_thread().is_alive():
             self._shutdown_stage = "Waiting for the running stop to finish..."
             self._draw_shutdown()
-            while self._stopping.is_set():
+            deadline = time.time() + 60.0
+            while (self._live_stop_thread() is not None
+                   and self._live_stop_thread().is_alive()
+                   and time.time() < deadline):
                 time.sleep(0.2)
+            if self._live_stop_thread() is not None \
+                    and self._live_stop_thread().is_alive():
+                self._shutdown_stage = ("Stop still running - continuing "
+                                        "cleanup anyway")
         # The [Q] path does NOT go through stop() - pause recovery (this is
         # a user-initiated quit, never a crash to repair) and drive the
         # machine into STOPPING so the UI/telemetry see the teardown phase.
@@ -9137,6 +9155,21 @@ class BTopTui:
             self._draw_shutdown()
             try:
                 fn()
+            except KeyboardInterrupt:
+                # Ctrl+C MUST NOT abort a teardown that is already running.
+                # The console handler is registered for every control event and
+                # returns False, so the default action still raises
+                # KeyboardInterrupt on this thread. `except Exception` does
+                # not catch it, so it used to unwind straight out of here,
+                # skip every remaining step, land in main()'s
+                # `except BaseException`, and print "Interrupted - tunnel and
+                # routes cleaned up" - telling the user everything was removed
+                # while the geo/LAN/host sweeps and the snapshot restore had
+                # never run. A key press cannot abort this loop (it runs
+                # synchronously on the UI thread); Ctrl+C could. Note it and
+                # keep going; the process exits only once the table is verified.
+                self._shutdown_stage = f"{label} (interrupted - continuing)"
+                self._shutdown_items[idx][1] = "fail"
             except Exception as e:
                 self._shutdown_stage = f"{label} (error: {e})"
                 self._shutdown_items[idx][1] = "fail"
@@ -9192,8 +9225,22 @@ class BTopTui:
         self._draw_shutdown()
         time.sleep(0.6)
 
+        # FINAL LEDGER FLUSH. The checklist above swept whatever the ledgers
+        # held at the time it ran; anything appended since (a bypass resolver
+        # tick that had already passed its own guard, a geo worker mid-batch)
+        # is still in the table and in nobody's list. One last pass, after the
+        # quiesce, so the ledgers are provably empty before we call it clear.
+        try:
+            self._cleanup_live_routes()
+        except Exception as e:
+            self._blog(f"[!] Final route flush failed: "
+                       f"{e.__class__.__name__}: {e}")
+
         self._cleanup_done = True
         self.running = False
+        # Release the quiesce so loop()'s finally (which waits on _stopping)
+        # can proceed, and so nothing re-checks a teardown that is over.
+        self._stopping.clear()
         # Every route is verified gone: the machine may now rest.
         self.tunnel.try_transition(TunnelState.STOPPED,
                                    "shutdown complete - routes verified clear")
@@ -9282,6 +9329,11 @@ class BTopTui:
         except Exception as e:
             self._blog(f"[!] Stop failed: {e.__class__.__name__}: {e}")
         finally:
+            # Release the UI-thread teardown claim and drop the handle, so a
+            # later [T] (or [Q]'s wait loop) is not blocked by this finished
+            # worker.
+            self._stop_requested = False
+            self._stop_thread = None
             # [S] pressed while the sweep was running? Launch NOW - the
             # sweep is done, so the start can no longer race it. This is
             # what turns "stop then app ignores [S]" into a real restart.
@@ -9740,8 +9792,11 @@ def _acquire_single_instance():
     """Claim the machine-wide TunTop lock. Returns the mutex handle (keep it
     alive for the process lifetime) or None when another instance holds it.
 
-    A named mutex in the LOCAL namespace, created by whoever gets there
-    first. `GetLastError() == ERROR_ALREADY_EXISTS` is the "someone else is
+    A named mutex in the GLOBAL namespace, created by whoever gets there
+    first. It has to be machine-wide for the same reason the NRPT rule it
+    guards is: a second launch from ANY session must be able to see the
+    running instance, or it tears that instance's pin down out from under it.
+    `GetLastError() == ERROR_ALREADY_EXISTS` is the "someone else is
     here" answer; the handle is then closed immediately so it is not kept
     alive. Any failure (no ctypes, a locked-down kernel, a non-Windows box)
     returns a sentinel instead of blocking the launch: refusing to start
@@ -9819,7 +9874,7 @@ def main():
     epilog=__doc__)
     ap.add_argument("--server", nargs="+", default=["198.51.100.1"],
                     help="VLESS server IP or hostname (repeatable: --server a b)")
-    ap.add_argument("--port", type=int, default=10808, help="SOCKS5 inbound port")
+    ap.add_argument("--port", type=int, default=DEFAULT_SOCKS_PORT, help="SOCKS5 inbound port")
     ap.add_argument("--tun2socks", default=os.path.join(app_dir(), "tun2socks-windows-amd64-v3.exe"))
     ap.add_argument("--no-vpn-bypass", action="store_true")
     ap.add_argument("--dns-policy", choices=["availability", "strict"],
@@ -9851,7 +9906,7 @@ def main():
     ap.add_argument("--proxy2-bypass-ip", action="append", default=[], metavar="HOST_OR_IP",
                     help="IP/hostname to route through the SECOND proxy (repeatable)")
     ap.add_argument("--vpn-interface", default=None)
-    ap.add_argument("--endpoint-port", type=int, default=443)
+    ap.add_argument("--endpoint-port", type=int, default=DEFAULT_ENDPOINT_PORT)
     ap.add_argument("--dns4", default=None, metavar="IP",
                     help="User-chosen IPv4 DNS server. When neither --dns4 nor "
                          "--dns6 is given, the helper applies both of its defaults "
@@ -9888,6 +9943,13 @@ def main():
                          "compatibility - use --ascii to opt out")
     ap.add_argument("--ascii", action="store_true",
                     help="Force plain ASCII glyphs (+/-/#) even if Unicode looks supported")
+    ap.add_argument("--remove-dns-guard", action="store_true",
+                    help="Remove TunTop's DNS-leak-protection NRPT rules and "
+                         "exit (Administrator). Emergency recovery for a "
+                         "machine left with no working name resolution after a "
+                         "hard kill, BSOD or power loss - the catch-all pin "
+                         "survives reboots and points at a tunnel that is no "
+                         "longer there. Does not start or stop the tunnel.")
     ap.add_argument("--bypass-ip", action="append", default=[], metavar="HOST_OR_IP",
                     help="IP address or hostname/domain to bypass the TUN (repeatable)")
     ap.add_argument("--geoip", default=None, metavar="PATH",
@@ -9966,8 +10028,68 @@ def main():
     args.proxy2_server = [_host_from_url(s) or s for s in (args.proxy2_server or [])]
     args.server = [_host_from_url(s) or s for s in (args.server or [])]
 
+    # Say so rather than silently dropping what the user asked for. The second
+    # proxy pipe is switched on by --proxy2-port ALONE, so a
+    # --proxy2-bypass-ip / --proxy2-server without it is dead config: no
+    # warning, no second pipe, and the bypass list still shows the host in the
+    # health panel looking configured. Not a crash, but the user has no way to
+    # learn the rule they wrote is inert.
+    if ((args.proxy2_bypass_ip or args.proxy2_server)
+            and not args.proxy2_port):
+        print("[!] --proxy2-bypass-ip / --proxy2-server were given without "
+              "--proxy2-port, which is what enables the second proxy pipe - "
+              "they are ignored. Add --proxy2-port, or drop those options.")
+
+    # ── Emergency recovery: --remove-dns-guard ────────────────────────────
+    # Handled FIRST, before the profile load, the single-instance lock, the
+    # tunnel and the UI - and deliberately allowed to run WITHOUT the
+    # single-instance check, because the whole point is to fix a machine
+    # where a previous instance was hard-killed and left its catch-all NRPT
+    # pin behind.
+    #
+    # Why this exists: the catch-all rule is a REGISTRY rule under
+    # HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig.
+    # It survives process death, a BSOD, a power cut and every reboot, and it
+    # points all name resolution at the tunnel's resolvers (1.1.1.1 / fd00:
+    # dead:beef::1). With the tunnel gone those addresses are unroutable, so
+    # the machine has no working DNS at all - no web, no captive-portal
+    # login, and no way to download anything. Startup recovery eventually
+    # cleans it, but that means launching TunTop, which is a poor first step
+    # on a machine whose network is down. There was previously no flag and no
+    # documented one-liner for it.
+    if args.remove_dns_guard:
+        if not _admin():
+            sys.exit("[!] --remove-dns-guard needs Administrator (right-click "
+                     "Start_TunTop.bat and choose Run as administrator).")
+        print("[*] Removing TunTop's DNS leak-protection rules...")
+        try:
+            ok, msg = _dns_guard.ensure_removed(force=True)
+        except Exception as e:
+            sys.exit(f"[!] Could not run the removal: "
+                     f"{e.__class__.__name__}: {e}")
+        print(f"[{'+' if ok else '!'}] {msg}")
+        # Confirm from the OS rather than trusting the command's own report.
+        try:
+            probe_ok, state = _dns_guard.detect()
+        except Exception as e:
+            print(f"[!] Final check could not run: {e}")
+            sys.exit(2)
+        if probe_ok and state.get("keys"):
+            sys.exit(f"[!] {state.get('keys')} TunTop DNS rule(s) are still "
+                     "present. Windows may be holding the policy key open - "
+                     "reboot and run this again.")
+        if probe_ok and state.get("effective"):
+            print("[!] A catch-all NRPT rule is STILL in force. It may be a "
+                  "company GPO rule rather than ours; check with "
+                  "Get-DnsClientNrptPolicy -Effective.")
+        print("[+] Name resolution is no longer pinned by TunTop.")
+        if probe_ok:
+            print("[i] Flush the cache with: ipconfig /flushdns")
+        return 0
+
     if not _admin():
-            sys.exit("[!] Run this as Administrator (use Run_Helper.bat).")
+            sys.exit("[!] Run this as Administrator (right-click "
+                     "Start_TunTop.bat and choose Run as administrator).")
 
     # ── Single instance ──────────────────────────────────────────────────
     # TunTop mutates MACHINE-GLOBAL state: the wintun adapter, thousands of
@@ -10088,7 +10210,13 @@ def main():
             # behind exactly like the primary ones, so recovery and the
             # watchdog need them in the sweep list too.
             + [h for h in (getattr(args, "proxy2_bypass_ip", None) or []) if h]
-            + [h for h in (getattr(args, "vpn_server", None) or []) if h]))
+            + [h for h in (getattr(args, "vpn_server", None) or []) if h]
+            # ...and the VPN-EGRESS bypass list ([B] entries, installed via the
+            # VPN default route) - it was MISSING here while the hard-kill
+            # watchdog state and the [Q] cleanup sweep both list it, so a
+            # crash left those /32s behind with no startup recovery ever
+            # matching them: the one host-route class nothing could clean up.
+            + [h for h in (getattr(args, "vpn_bypass_ip", None) or []) if h]))
     try:
             _recovery_actions = startup_recovery.startup_recover(
                 hosts=_startup_hosts, log=lambda m: print(m))

@@ -18,10 +18,15 @@ The feature set for 1.0 is **frozen**. New features land only after 1.0.
 
 A build is **stable** when ALL of the following hold:
 
-1. The full automated suite passes: `py -m pytest tests --ignore=tests/network`
-   (network tests additionally run with `TUNTOP_NET_TESTS=1` on a live box).
-2. Zero undefined names / syntax errors (`py -m pyflakes tuntop` clean of
-   `undefined name` findings).
+1. The full automated suite passes:
+   `python -m unittest discover -s tests -t . -v` (the `network/` tier is
+   skipped unless `TUNTOP_NET_TESTS=1` is set, so CI never touches the live
+   network; run that variant on a real box before a release).
+2. Zero undefined names / syntax errors: `ruff check tuntop tests` and
+   `bandit -q -r tuntop --skip B104` are both clean. Those are the exact
+   invocations CI runs (`ruff`/`bandit` are CI-only tooling, not project
+   dependencies); `ruff.toml` documents the deliberately narrow rule set,
+   and `B104` is skipped because "0.0.0.0" route prefixes are the point.
 3. Every start → stop → start cycle in the TEST-MATRIX scenarios leaves the
    Windows routing table exactly as it was before the first start
    (kill-safe teardown is *verified*, not assumed).
@@ -53,11 +58,21 @@ A build is **stable** when ALL of the following hold:
 - [x] Profiles with import/export; secrets via Windows Credential Manager
       (`config/profiles.py`)
 - [x] `build_release.py` + `TunTop.spec` produce `TunTop.exe` (PyInstaller)
-- [ ] Installer/updater — **post-1.0** (explicitly out of scope for 1.0)
+- [x] In-app release **check** + verified staging (`config/updates.py`) — runs
+      at startup on the packaged `TunTop.exe` only: a GitHub release check
+      over a TLS 1.2 floor with a per-hop GitHub host allow-list, then
+      SHA-256 against the published `checksums.txt`. The verified
+      `TunTop-<version>.exe` is staged next to the running one and picked up
+      on the next manual start — the running exe is never touched or
+      launched. Opt out with `--no-update-check` or `BTOP_NO_UPDATE`.
+- [ ] Silent **installer** — **post-1.0** (still out of scope for 1.0)
 
 ### 3. Visible (live health)
 - [x] btop-style dashboard: throughput graphs, latency, health counter
-- [x] ~30 health probes rendered with fix suggestions (`monitor/health.py`)
+- [x] 46 health probes rendered with fix suggestions (built by
+      `build_checks()` in `ui/dashboard.py`; the suggestions themselves live
+      in `monitor/health.py`) — plus one row per bypass IP, three per extra
+      configured server, and one in `--vless-over-vpn` mode
 - [x] Structured event log (timestamp/severity/component/state) in the UI
       and in diagnostics export (`core/events.py`)
 - [x] Leak test ([L]) — direct vs proxied egress proof

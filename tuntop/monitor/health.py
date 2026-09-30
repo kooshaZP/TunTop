@@ -183,12 +183,6 @@ def overall_status(results: list[tuple]) -> str:
     return "HEALTHY"
 
 
-def _status_symbol(status: str, use_unicode: bool) -> str:
-    if use_unicode:
-        return {"HEALTHY": "\u2713", "UNHEALTHY": "\u2717"}.get(status, "\u25cb")
-    return {"HEALTHY": "OK", "UNHEALTHY": "!!"}.get(status, "~")
-
-
 def format_panel(results: list[tuple], width: int = 60,
                  use_unicode: bool = True) -> list[str]:
     """Render the health results as a list of formatted lines.
@@ -258,7 +252,6 @@ def format_panel(results: list[tuple], width: int = 60,
             if suggestion:
                 # Wrap suggestion at ~56 chars
                 words = suggestion.split()
-                wrapped = []
                 current = "      "
                 for w in words:
                     if len(current) + len(w) + 1 > width - 2:
