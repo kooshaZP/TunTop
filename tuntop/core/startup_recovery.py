@@ -28,10 +28,10 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from tuntop import procidentity
 from tuntop.network import routing
 from tuntop.network.dns import _resolve_cached
 
@@ -77,9 +77,21 @@ def _atomic_write_json(path: str, payload: dict) -> None:
 
 
 def write_marker(pid: int, path: str = MARKER_FILE) -> None:
-    """Mark 'a tunnel is running' (best-effort; never blocks the launch)."""
+    """Mark 'a tunnel is running' (best-effort; never blocks the launch).
+
+    `started` here is the process's CREATION time, not the wall-clock moment
+    the marker was written. That distinction is load-bearing: the watchdog
+    reads this file long after a crash, possibly across a reboot, and decides
+    whether to `taskkill /F /T` a recorded PID. A PID alone is a recycled
+    slot, so the value it can prove nothing; paired with a creation time it
+    proves whether the number still belongs to the same process. The old
+    `time.time()` write could never be compared against anything.
+    """
     try:
-        _atomic_write_json(path, {"pid": int(pid), "started": time.time()})
+        _atomic_write_json(path, {
+            "pid": int(pid),
+            "started": procidentity.process_start_time(pid),
+        })
     except Exception:
         pass
 
@@ -100,12 +112,18 @@ def record_helper(helper_pid: int, path: str = MARKER_FILE) -> None:
     can stop the helper - and through `taskkill /T` its whole process tree,
     tun2socks included - BEFORE sweeping the routes. Without this, a still
     running helper could restart tun2socks or re-assert routes while the
-    watchdog is mid-sweep."""
+    watchdog is mid-sweep.
+
+    The creation time is recorded alongside the PID for the same reason the
+    dashboard's is: `taskkill /F /T` on a bare number is how a watchdog ends
+    up force-killing an unrelated process tree after a reboot handed it the
+    same PID."""
     try:
         data = read_marker(path) or {}
         if int(data.get("pid", 0) or 0) <= 0:
             return                      # no live session marker: nothing to do
         data["helper_pid"] = int(helper_pid)
+        data["helper_started"] = procidentity.process_start_time(helper_pid)
         _atomic_write_json(path, data)
     except Exception:
         pass
@@ -136,6 +154,13 @@ def marker_is_live(path: str = MARKER_FILE) -> Optional[bool]:
     tun2socks, remove its Wintun adapter and sweep its routes on the way
     past. Callers must treat None as LIVE (do not touch) - the cost of
     skipping a needed cleanup is far lower than killing a running tunnel.
+    (`scan` now honours that: it sweeps only on a positive False.)
+
+    IDENTITY, not just liveness: when the marker carries a `started` creation
+    time, a live process whose creation time disagrees is a DIFFERENT process
+    that inherited the number, and the answer is False - not True. Reading
+    only liveness made a recycled PID look like the original session, which
+    skipped the very recovery this record exists to trigger.
     """
     marker = read_marker(path)
     if not marker:
@@ -146,6 +171,11 @@ def marker_is_live(path: str = MARKER_FILE) -> Optional[bool]:
         return None
     if pid <= 0:
         return None
+    if marker.get("started") is not None and \
+            not procidentity.same_process(pid, marker.get("started")):
+        # Proven to be a different process now (or unprovable), so the
+        # recorded session is definitely gone.
+        return False
     if os.name == "nt":
         try:
             import ctypes
@@ -411,13 +441,21 @@ def scan(hosts=None, probes: Optional[Probes] = None,
     was a crash - killed that instance's tun2socks, removed its Wintun
     adapter and swept its routes, leaving the user's live tunnel dead.
     `marker_live` is injectable for tests; defaults to the real probe.
+
+    UNKNOWN is treated as ALIVE, which is what marker_is_live's own docstring
+    demands. `if live:` did the opposite: None is falsy, so every "cannot
+    tell" outcome (no readable pid, an OpenProcess error other than
+    access-denied, any ctypes failure) fell through to the full destructive
+    sweep - the one case the probe's contract says must not touch anything.
+    The check is therefore `live is not False`, so only a POSITIVE "the pid
+    is gone" authorises the sweep.
     """
     p = probes or default_probes()
     findings = StartupFindings(marker=read_marker(marker_path))
     if findings.marker:
         live = marker_live(marker_path) if marker_live else \
             globals()["marker_is_live"](marker_path)
-        if live:
+        if live is not False:
             findings.live_session = int(
                 findings.marker.get("pid", -1) or -1)
             # Nothing this marker points at may be touched.
@@ -462,7 +500,38 @@ def recover(findings: StartupFindings,
     """Clean everything `scan` found. Order matters: kill the orphans
     FIRST (a live tun2socks would re-assert its routes), then tear down
     the adapter, then sweep lingering host routes. Returns the list of
-    actions performed (each one also passed to `log`)."""
+    actions performed (each one also passed to `log`).
+
+    Use recover_ex() when you also need to know whether every step
+    actually succeeded."""
+    return recover_ex(findings, probes=probes, log=log,
+                      progress=progress)[0]
+
+
+def recover_ex(findings: StartupFindings,
+               probes: Optional[Probes] = None,
+               log: Optional[Callable[[str], None]] = None,
+               progress: Optional[Callable[[int, int, str], None]] = None
+               ) -> tuple:
+    """recover(), plus an `ok` flag: True only when EVERY step reported
+    success.
+
+    The cleanup watchdog needs this. It decides whether to retire the crash
+    marker, and the marker is the promise that the next launch will not
+    re-run recovery - so a step that failed has to be able to veto the
+    "system is clean" log line. Previously the only verdict it consulted was
+    the geo/LAN sweeps' return value, and a failed adapter teardown or a
+    refused DNS-guard removal (both of which return their own explicit
+    "the next launch retries" text) still produced a cleared marker.
+
+    What counts as a failure: a step that RAISED, and a step whose probe
+    returned an explicit failure verdict (the DNS guard and the adapter
+    teardown both do). What does NOT: a step that merely reports a COUNT of
+    zero - "0 processes killed" and "0 routes removed" are ambiguous (the
+    leftovers may have exited on their own) and are not evidence of failure.
+    Treating them as failures would make a genuinely clean sweep look dirty
+    and block the marker from ever being retired.
+    """
     p = probes or default_probes()
     log = log or (lambda msg: None)
     actions = []
@@ -474,7 +543,7 @@ def recover(findings: StartupFindings,
                "still running - its tunnel, routes and DNS guard were left "
                "alone; close that window first if you meant to replace it")
         log(f"[*] Recovery: {msg}")
-        return [msg]
+        return [msg], True
 
     tasks = []
     if findings.dns_guard:
@@ -490,6 +559,7 @@ def recover(findings: StartupFindings,
     if findings.host_routes:
         tasks.append(("sweep stale per-host routes", _do_sweep))
 
+    ok = True
     for i, (label, fn) in enumerate(tasks):
         if progress is not None:
             try:
@@ -497,49 +567,52 @@ def recover(findings: StartupFindings,
             except Exception:
                 pass
         try:
-            detail = fn(p, findings)
+            detail, step_ok = fn(p, findings)
         except (Exception, SystemExit) as e:
             # SystemExit matters: the platform probes legitimately call
             # sys.exit() on failure, and a BaseException here would abort
             # every remaining cleanup step AND the caller's startup.
             log(f"[!] Recovery step '{label}' failed: {e}")
-            detail = f"failed: {e}"
+            detail, step_ok = f"failed: {e}", False
+        ok = ok and step_ok
         msg = f"{label}" + (f" - {detail}" if detail else "")
         actions.append(msg)
         log(f"[*] Recovery: {msg}")
-    return actions
+    return actions, ok
 
 
-def _do_kill(p: Probes, f: StartupFindings) -> str:
-    n = p.kill_tun2socks()
-    return f"stopped {n} process(es)"
+def _do_kill(p: Probes, f: StartupFindings):
+    # A count, not a verdict: 0 killed is ambiguous (the orphans may have
+    # exited on their own) and is NOT treated as a failure, because a wrong
+    # "failed" here would block the watchdog from ever retiring the marker.
+    return f"stopped {p.kill_tun2socks()} process(es)", True
 
 
-def _do_dns_guard(p: Probes, f: StartupFindings) -> str:
+def _do_dns_guard(p: Probes, f: StartupFindings):
     """Remove a leftover catch-all NRPT rule. A missing probe (a caller that
     did not supply one) is reported instead of silently passing."""
     fn = getattr(p, "remove_dns_guard", None)
     if not callable(fn):
-        return "no DNS-guard probe available"
+        return "no DNS-guard probe available", False
     removed = fn()
     if removed is True:
-        return "NRPT rule removed (name resolution is unpinned again)"
-    return "removal reported failure - the next launch retries"
+        return "NRPT rule removed (name resolution is unpinned again)", True
+    return "removal reported failure - the next launch retries", False
 
 
-def _do_teardown(p: Probes, f: StartupFindings) -> str:
+def _do_teardown(p: Probes, f: StartupFindings):
     # Report what the probe actually said. Discarding its verdict made a
     # teardown that returned False log "routes and adapter cleared" - the
     # log claimed a clean slate while the adapter and its routes stayed.
     ok = p.teardown_adapter()
     if ok is False:
-        return "removal reported a failure - the next launch retries"
-    return "routes and adapter cleared"
+        return "removal reported a failure - the next launch retries", False
+    return "routes and adapter cleared", True
 
 
-def _do_sweep(p: Probes, f: StartupFindings) -> str:
-    n = p.sweep_host_routes(f.host_routes)
-    return f"removed {n} route(s)"
+def _do_sweep(p: Probes, f: StartupFindings):
+    # A count, not a verdict - same reasoning as _do_kill.
+    return f"removed {p.sweep_host_routes(f.host_routes)} route(s)", True
 
 
 def startup_recover(hosts=None, log=None, marker_path: str = MARKER_FILE,

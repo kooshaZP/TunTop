@@ -121,7 +121,7 @@ def _geoip_parse_cidr(msg):
 def _geoip_cidr_to_str(ip, prefix):
     """Render one CIDR, NORMALISED through ipaddress.
 
-    Two bugs this removes:
+    Three bugs this removes:
       * a missing prefix became 0 -> "1.2.3.4/0" -> 0.0.0.0/0, i.e. the whole
         IPv4 (or IPv6) space routed to the direct egress. A default route is
         never a geoip country range, so it is rejected outright.
@@ -129,6 +129,14 @@ def _geoip_cidr_to_str(ip, prefix):
         while Get-NetRoute and the exit sweeps use the canonical compressed
         form ("2001:db8::/32") - so every IPv6 geo route failed every string
         comparison against the live route table and survived every sweep.
+      * no per-family prefix floor, so an explicit 0.0.0.0/0 or 0.0.0.0/1 in a
+        .dat came out verbatim. The install boundary refuses those, but the
+        SWEEP boundary (dashboard / cleanup_watchdog) deletes on exact-prefix
+        match with no allow-list, and 0.0.0.0/1 + 128.0.0.0/1 are TunTop's own
+        split-defaults - so [R] or exiting removed half of them and the
+        tunnel's traffic fell back to the physical NIC. _MIN_PREFIXLEN now
+        applies here too, which is what makes _normalise_cidr's "single gate,
+        whichever decoder produced it" true.
     """
     if ip is None or prefix is None:
         return None
@@ -147,6 +155,15 @@ def _geoip_cidr_to_str(ip, prefix):
     if not 0 <= plen < maxlen:
         # 0 (and anything out of range) would be a default route: never a
         # country range, and the worst possible thing to install.
+        return None
+    # The per-family floor (_MIN_PREFIXLEN) is enforced HERE as well as in
+    # _normalise_cidr. Without it this decoder accepted e.g. 0.0.0.0/1, which
+    # is one of the split-defaults TunTop installs ITSELF - so the geo sweep
+    # could delete half the tunnel's own default set on [R] or on exit. The
+    # install boundary (_is_routable_bypass_cidr) already refuses these; the
+    # sweep boundary has to refuse them too, and it only sees what this
+    # function emits.
+    if plen < _MIN_PREFIXLEN[4 if len(ip) == 4 else 6]:
         return None
     try:
         return str(ipaddress.ip_network("%s/%d" % (addr, plen), strict=False))
@@ -640,7 +657,23 @@ def _geoip_decode_proto(raw, geoip_cls, code=None, on_progress=None):
                         continue
                 except Exception:
                     continue
-                lst.append("%s/%d" % (addr, cd.prefix))
+                # Through _normalise_cidr, like every other decoder here. This
+                # used to be a raw "%s/%d" append, and `prefix` is
+                # LABEL_OPTIONAL, so a .dat entry with the field OMITTED (which
+                # hand-edited / merged v2rayN databases routinely have) decoded
+                # to 0 and produced "5.6.7.8/0" -> 0.0.0.0/0. The install side
+                # drops that in helper._is_routable_bypass_cidr, but the SWEEP
+                # side is not protected: dashboard._remove_geo_routes_for /
+                # _sweep_geo_leftovers and cleanup_watchdog.sweep_geo_routes
+                # canonicalise with ip_network(strict=False) and hand the
+                # result to _batch_delete_routes, so [R] or quitting deleted the
+                # machine's default route on every interface. The same skip also
+                # let a /1 or /7 entry through the prefix floor, which can match
+                # TunTop's OWN split-default routes (0.0.0.0/1, 128.0.0.1,
+                # ::/1) and delete half the tunnel.
+                c = _normalise_cidr("%s/%d" % (addr, cd.prefix))
+                if c:
+                    lst.append(c)
         if on_progress is not None:
             on_progress(idx + 1, total)
     if on_progress is not None and not total:

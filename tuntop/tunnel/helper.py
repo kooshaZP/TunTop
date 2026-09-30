@@ -606,21 +606,40 @@ def _direct_bypass_egress(ip, fallback=None):
     return physical_egress(fallback)
 
 
-def get_active_windows_vpn_servers():
-    """Return (connection name, server address) pairs for connected Windows VPNs.
+def get_active_windows_vpn_servers(connected_only=True):
+    """Return (connection name, server address) pairs for Windows VPNs.
 
     Get-VpnConnection covers VPNs created in Windows Settings/RAS, including
     PPTP.  Some third-party clients are not exposed by this command; callers
     can use --vpn-server for those.
+
+    `connected_only=False` returns EVERY CONFIGURED profile, connected or not.
+    That is the default the bypass installer must use, and the reason is the
+    chicken-and-egg this parameter exists to break: a Windows VPN's own IKE /
+    L2TP / PPP handshake goes to its `ServerAddress` BEFORE the profile ever
+    reaches ConnectionStatus=Connected. Filtered to connected profiles, that
+    handshake has no /32 bypass, Wintun's 0.0.0.0/1 + 128.0.0.0/1 splits
+    capture it, and the connect attempt dies inside the tunnel with a
+    transport-level RAS error. The re-apply the dashboard triggers on VPN
+    ARRIVAL cannot rescue it - arrival only fires on a transition that a failed
+    attempt never produces - so the user was stuck retrying against a tunnel
+    that guaranteed the failure, with the only escape being to stop TunTop.
+
+    A /32 to a VPN gateway that is not currently dialled is inert, so covering
+    the unconnected profiles costs one active-store route each and changes
+    nothing until that profile is actually used.
     """
-    ps = r"""
-try {
+    status_filter = ("| Where-Object {$_.ConnectionStatus -eq 'Connected'} "
+                     if connected_only else "")
+    ps = f"""
+try {{
     $v = @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) +
          @(Get-VpnConnection -ErrorAction SilentlyContinue)
-    $v | Where-Object {$_.ConnectionStatus -eq 'Connected' -and $_.ServerAddress} |
+    $v{status_filter} |
+        Where-Object {{$_.ServerAddress}} |
         Sort-Object Name, ServerAddress -Unique |
         Select-Object Name, ServerAddress | ConvertTo-Json -Compress
-} catch { exit 0 }
+}} catch {{ exit 0 }}
 """
     d = ps_json(ps)
     if not d:
@@ -628,6 +647,90 @@ try {
     records = d if isinstance(d, list) else [d]
     return [(str(x.get("Name", "Windows VPN")), str(x["ServerAddress"]))
             for x in records if x.get("ServerAddress")]
+
+
+def resolve_vpn_endpoint_physical(server):
+    """Resolve a Windows VPN `ServerAddress` the way the PHYSICAL path would.
+
+    Returns (v4, v6, resolved). `resolved` is False when the answer could not
+    be established, and the caller must then install NO bypass at all - see
+    below for why that is the correct response rather than a failure.
+
+    WHY NOT resolve_all()
+    ----------------------
+    resolve_all() uses socket.getaddrinfo, i.e. the SYSTEM resolver, which
+    while the guard is up is the catch-all NRPT rule: every query goes to the
+    TUNNEL's resolvers. For a VPN gateway that is wrong in both directions. A
+    public FQDN can resolve to a different address set through the tunnel than
+    through the LAN (split horizon, CDN geo), and the bypass route would then
+    pin an address the physical path never uses - so the VPN would still be
+    unable to reach itself. A private corporate FQDN resolves to nothing at
+    all, and no route gets installed.
+
+    So this queries the PHYSICAL adapter's own resolvers directly, which is
+    the only answer that matches where the /32 will actually be installed.
+
+    THE CALLER-IS-RIGHT-BUT-WE-CANNOT-KNOW CASE. If the physical resolver
+    cannot answer, the gateway is only reachable THROUGH the tunnel - a
+    corporate DNS reachable solely over the VPN itself. Installing a physical
+    bypass would be wrong there, and installing nothing reproduces exactly the
+    pre-existing behaviour, which is the correct one for that topology. So
+    `resolved=False` means "leave it alone", not "give up".
+
+    An IP literal short-circuits with NO PowerShell spawn: that is the common
+    case, and it keeps this correct on a machine whose DNS is entirely broken.
+    """
+    host = _host_from_url(str(server or ""))
+    if not host:
+        return [], [], False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return ([str(ip)], [], True) if ip.version == 4 else ([], [str(ip)], True)
+    # The Wintun resolvers are excluded on purpose: they are what the guard
+    # points at, and asking them is the bug this function exists to fix.
+    ps = (
+        _tun_alias_powershell() + _vpn_alias_powershell() + "\n"
+        # Quoted. `$name = vpn.example.com` is a BAREWORD to PowerShell, not a
+        # string - the script would fail at parse or assign nothing, and the
+        # lookup would silently return no addresses, which reads as
+        # "unresolvable" and installs no bypass.
+        "$name = '" + ps_quote(host) + "'\n"
+        "$out = [ordered]@{ v4 = @(); v6 = @() }\n"
+        "$servers = @(Get-DnsClientServerAddress -ErrorAction SilentlyContinue |\n"
+        "    Where-Object { $tunAliases -notcontains $_.InterfaceAlias -and\n"
+        "        $vpnAliases -notcontains $_.InterfaceAlias } |\n"
+        "    ForEach-Object { $_.ServerAddresses } |\n"
+        "    Where-Object { $_ -and $_ -ne '127.0.0.1' -and $_ -ne '::1' } |\n"
+        "    ForEach-Object { [string]$_ } | Sort-Object -Unique)\n"
+        "foreach ($s in $servers) {\n"
+        "    try {\n"
+        "        $a = @(Resolve-DnsName -Name $name -Server $s -DnsOnly "
+        "-ErrorAction SilentlyContinue)\n"
+        "    } catch { $a = @() }\n"
+        "    foreach ($r in $a) {\n"
+        "        $ip = [string]$r.IPAddress\n"
+        "        if (-not $ip) { continue }\n"
+        "        if ($r.Type -eq 'AAAA' -or $ip.Contains(':')) {\n"
+        "            if ($out.v6 -notcontains $ip) { $out.v6 += $ip }\n"
+        "        } elseif ($out.v4 -notcontains $ip) { $out.v4 += $ip }\n"
+        "    }\n"
+        "}\n"
+        "ConvertTo-Json -InputObject @($out) -Compress\n"
+    )
+    try:
+        d = ps_json(ps)
+    except Exception:
+        return [], [], False
+    if not isinstance(d, dict):
+        return [], [], False
+    v4 = [str(x) for x in (d.get("v4") or []) if str(x).strip()]
+    v6 = [str(x) for x in (d.get("v6") or []) if str(x).strip()]
+    if not v4 and not v6:
+        return [], [], False
+    return v4, v6, True
 
 
 def get_vpn_ipv4_default(vpn_interface=None):
@@ -906,8 +1009,16 @@ def preflight_cleanup(tun2socks_path=None):
     ORPHANED Wintun PnP device node (see remove_stale_wintun_devices).
 
     tun2socks_path: the --tun2socks path this run is about to use. Orphan
-    kills are OWNERSHIP-SCOPED (vendored binary name or exactly this path),
-    so a tun2socks.exe another tool is running is never terminated."""
+    kills are OWNERSHIP-SCOPED by delegation to tuntop.network.procguard
+    (the single shared implementation, which applies the name PLUS a
+    TunTop-controlled location test), so a tun2socks.exe another tool is
+    running is never terminated. This body used to run its own inline
+    PowerShell filter instead, matching the vendored file name with
+    `-like '*tun2socks-windows-amd64-v3.exe'` - ANYWHERE on disk, with no
+    location half at all. That is the exact regression procguard exists to
+    prevent: the vendored name is also the upstream xjasonlyu release asset
+    name, so a user's own upstream install (or v2rayN's vendored copy) in
+    any directory was taskkill /F /T'd on every single helper start."""
     print("[*] Checking for leftover state from a previous run...")
     # Both pipes: the primary 'wintun' and (when a previous run used
     # --proxy2-port) the secondary 'wintun2'. Removing state for an adapter
@@ -917,19 +1028,19 @@ def preflight_cleanup(tun2socks_path=None):
     run_ps(f"Get-NetRoute -InterfaceAlias '{TUN2}' -ErrorAction SilentlyContinue | "
            "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue")
 
-    _, out, _ = run_ps(
-        "Get-CimInstance Win32_Process "
-        "-Filter \"Name LIKE 'tun2socks%'\" -ErrorAction SilentlyContinue | "
-        "Where-Object { ($_.ExecutablePath -and "
-        "($_.ExecutablePath -like '*tun2socks-windows-amd64-v3.exe')) -or "
-        f"($_.ExecutablePath -eq '{ps_quote(tun2socks_path or '')}') }} | "
-        "Select-Object -ExpandProperty ProcessId")
-    pids = [p for p in out.split() if p.strip().isdigit()]
-    if pids:
-        print(f"[*] Stopping leftover TunTop tun2socks process(es): "
-              f"{', '.join(pids)}")
-        for pid in pids:
-            run(["taskkill", "/F", "/T", "/PID", pid])
+    # ONE shared ownership implementation. preflight runs BEFORE this run's
+    # tun2socks is spawned, so there is no Popen handle to record: rules 2
+    # and 3 (configured path / vendored name in a TunTop directory) are the
+    # whole test. procguard never raises - a broken probe kills nothing.
+    try:
+        from tuntop.network.procguard import kill_own
+        killed = kill_own(tun2socks_path=tun2socks_path,
+                          log=lambda m: print(m))
+    except Exception as e:
+        print(f"[*] orphan tun2socks scan skipped: "
+              f"{e.__class__.__name__}: {e}")
+        killed = 0
+    if killed:
         time.sleep(1)
 
     run_ps(f"Remove-NetAdapter -Name '{TUN}' -Force -Confirm:$false -ErrorAction SilentlyContinue")
@@ -2045,17 +2156,28 @@ def override_vpn_routes(vpn_iface, skip_ips):
                 ipaddress.ip_address(host)
             except ValueError:
                 continue
-            # Save the VPN's original route so cleanup can restore it if needed.
-            # _raw_add_route adds our Wintun override WITHOUT deleting the VPN
-            # route; the lower effective metric then wins and the VPN route is
-            # left intact (persistent store preserved).
-            with _vpn_saved_lock:
-                vpn_saved_routes.append(
-                    (fam, prefix, vpn_iface,
-                     str(r.get("NextHop", "") or ""),
-                     int(r.get("RouteMetric", 1) or 1)))
+            # Receipt AFTER a confirmed install. This used to append the
+            # saved-route tuple BEFORE calling _raw_add_route, so a failed add
+            # left a restore receipt for a route that was never installed. That
+            # mattered because _live_set_vpn_shadow() treats a non-empty
+            # vpn_saved_routes as "already shadowed" and returns True without
+            # retrying: one transient add failure latched the shadow off for
+            # the rest of the session, and the VPN's /32s kept escaping the
+            # tunnel with every TunTop health row still green.
             if _raw_add_route(fam, prefix, TUN, gw, metric=1):
                 vpn_override_routes.append((fam, prefix, TUN, gw))
+                with _vpn_saved_lock:
+                    vpn_saved_routes.append(
+                        (fam, prefix, vpn_iface,
+                         str(r.get("NextHop", "") or ""),
+                         int(r.get("RouteMetric", 1) or 1)))
+            else:
+                # Explicitly keep the two ledgers in lockstep: no install, no
+                # receipt. The caller's "already shadowed" check then stays
+                # honest and a later pass can still shadow this prefix.
+                print(f"[*] VPN-override add failed for {prefix} on "
+                      f"{vpn_iface} - not shadowed, will retry on the next "
+                      "self-heal.", flush=True)
 
 
 # ── Live [V]/[Y] mode switching (dashboard -> running helper) ───────────────
@@ -2162,12 +2284,18 @@ def _live_set_vpn_shadow(active):
 
 def _live_apply_vpn_bypass_routes(enable):
     """Install (enable) or remove (disable) the Windows-VPN endpoint bypass
-    routes. Mirrors the startup logic (resolve connected VPNs' ServerAddress
-    values, /32 + /128 via the physical egress). Returns log lines."""
+    routes. Mirrors the startup logic (resolve configured VPNs' ServerAddress
+    values, /32 + /128 via the physical egress). Returns log lines.
+
+    `connected_only=False` is load-bearing, not a loosening: see
+    get_active_windows_vpn_servers(). A profile that is not connected yet is
+    exactly the one whose gateway the user is about to dial, and its handshake
+    is what the Wintun default captures when no /32 exists. Resolving through
+    the physical resolver is load-bearing for the same reason."""
     lines = []
     args = _live_mode.get("args")
     if enable:
-        src = get_active_windows_vpn_servers()
+        src = get_active_windows_vpn_servers(connected_only=False)
         if args is not None and getattr(args, "vpn_server", None):
             src = src + [("manual VPN server", s) for s in args.vpn_server]
         v4n, v6n, seen = [], [], set()
@@ -2176,10 +2304,14 @@ def _live_apply_vpn_bypass_routes(enable):
             if not key or key in seen:
                 continue
             seen.add(key)
-            ep4, ep6 = resolve_all_safe(server, label=f"VPN endpoint {server}")
-            if ep4 is None and ep6 is None:
+            ep4, ep6, got = resolve_vpn_endpoint_physical(server)
+            if not got:
                 lines.append(f"[!] Could not resolve VPN endpoint "
-                             f"'{name}' ({server}) - skipped.")
+                             f"'{name}' ({server}) through the PHYSICAL "
+                             "adapter - skipped. If that gateway is only "
+                             "reachable through the tunnel this is correct; "
+                             "otherwise pass its address with "
+                             "--vpn-server.")
                 continue
             v4n.extend(x for x in (ep4 or []) if x not in v4n)
             v6n.extend(x for x in (ep6 or []) if x not in v6n)
@@ -4925,7 +5057,15 @@ def main():
     # A Windows VPN's control/data connection has to remain on the physical
     # network. Otherwise the 0/0 Wintun route captures it and disconnects the
     # VPN.  Resolve before altering routes so DNS itself is not redirected.
-    vpn_servers = [] if args.no_vpn_bypass else get_active_windows_vpn_servers()
+    #
+    # EVERY CONFIGURED profile, not just the connected ones: the handshake to a
+    # not-yet-connected profile's gateway is captured by the Wintun splits on
+    # the very first attempt, and the arrival re-apply cannot rescue an attempt
+    # that failed (see get_active_windows_vpn_servers). Resolved through the
+    # PHYSICAL resolver, because a split-horizon corporate name answered by the
+    # tunnel's resolvers yields an address set the physical path never uses.
+    vpn_servers = [] if args.no_vpn_bypass else \
+        get_active_windows_vpn_servers(connected_only=False)
     if not args.no_vpn_bypass:
         vpn_servers.extend(("manual VPN server", server) for server in args.vpn_server)
     elif args.vpn_server:
@@ -4954,21 +5094,31 @@ def main():
     if vpn_servers:
         print("[*] Resolving Windows VPN endpoint bypasses...")
     for name, server in vpn_servers:
-        key = server.strip().lower()
+        key = str(server).strip().lower()
         if not key or key in seen_vpn_servers:
             continue
         seen_vpn_servers.add(key)
-        try:
-            ep4, ep6 = resolve_all(server)
-        except SystemExit as e:
-            # Do not drop the whole system tunnel merely because a stale VPN
-            # profile cannot resolve. A currently connected VPN normally has
-            # a resolvable ServerAddress.
-            print(f"[!] Could not resolve VPN endpoint '{name}' ({server}): {e}")
+        ep4, ep6, got = resolve_vpn_endpoint_physical(server)
+        if not got:
+            # Do not drop the whole system tunnel because one VPN profile could
+            # not be resolved. Not an error either: a gateway that only the
+            # tunnel's resolvers can answer is only reachable through the
+            # tunnel, and pinning it to the physical adapter would be wrong.
+            print(f"[!] Could not resolve VPN endpoint '{name}' ({server}) "
+                  "through the physical adapter - no bypass installed (pass "
+                  "--vpn-server <ip> if it must be pinned).")
             continue
         vpn_v4.extend(x for x in ep4 if x not in vpn_v4)
         vpn_v6.extend(x for x in ep6 if x not in vpn_v6)
         print(f"    {name}: {server} -> {', '.join(ep4 + ep6)}")
+    if vpn_servers:
+        # Say what the pre-connect bypass is for. Otherwise a route to a VPN
+        # the user is not connected to looks like a leak of intent, and the
+        # operator has no way to know it is what makes the FIRST connect
+        # attempt reach its gateway outside the TUN.
+        print(f"[*] Pre-connect bypass armed for {len(vpn_v4) + len(vpn_v6)} "
+              "Windows VPN endpoint(s) (connected or not) - a Windows VPN can "
+              "now reach its own gateway without riding the tunnel.")
 
     tun_proc = start_tun2socks_pipe(TUN, TUN4, TUN6, args.port,
                                     args.tun2socks, _ACTIVE_DNS4, _ACTIVE_DNS6)

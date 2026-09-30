@@ -38,6 +38,27 @@ update the matrix row instead of opening a duplicate issue.
   expect a clean DEGRADED state with a readable reason, not a hang.
 - **DNS failures**: DoH fallback exists; total DNS loss should show
   RESOLVING → FAILED with a retry, never a silent stuck STARTING.
+- **Force-killed helper, server /32 left on a DIFFERENT adapter (1.0.51,
+  known residual gap)**: `_final_host_route_sweep` deletes the leftover
+  per-host bypass `/32`s and `/128`s, and it is deliberately *scoped* — an
+  unscoped `Remove-NetRoute -DestinationPrefix '<ip>/32'` removes that prefix
+  on **every** interface, which is how 1.0.41 came to delete a corporate VPN
+  client's pinned `/32` for the same server. The scope is the union of the
+  tunnel adapters, every interface in the dashboard's own live-route ledgers,
+  and the **current** physical v4/v6 egress. What that cannot reach is a `/32`
+  left on an adapter alias we no longer resolve: switch from Wi-Fi to Ethernet
+  and Windows keeps the old adapter alive, and a force-killed helper's server
+  `/32` on "Wi-Fi" is outside the scope while "Wi-Fi" is not the current
+  egress. The same switch that leaves the route behind usually removes the
+  route too, so this is narrow — but it is real, and it is **not** fixed
+  rather than fixed unsafely. A genuine fix needs the route ledger to survive
+  the process (today `RouteLedger` is in-memory only), so the crash path can
+  name the exact `(dest, iface)` the helper installed. **Workaround:** if a
+  server's `/32` survives a hard kill and an adapter change, delete it by hand
+  in an elevated console —
+  `Get-NetRoute -DestinationPrefix '<server-ip>/32'` then
+  `Remove-NetRoute -DestinationPrefix '<server-ip>/32' -Confirm:$false` —
+  after checking the InterfaceAlias is not a VPN you still need.
 - **DNS leak guard (1.0.40)**: the catch-all NRPT rule makes system name
   resolution depend on the tunnel, which is fail-closed by design. Three
   consequences to expect: (a) an internal/LAN-only name that only the
@@ -71,7 +92,16 @@ update the matrix row instead of opening a duplicate issue.
   routing table, the geo routes and the DNS guard on the next launch. Since
   1.0.41 it also refuses to run while a dashboard is still alive, and it
   re-reads the session marker immediately before its first destructive step so
-  a relaunch inside the grace period is not torn down.
+  a relaunch inside the grace period is not torn down. **1.0.51:** the
+  watchdog's own table read was inheriting an 8-second timeout while the
+  `netsh` deletes beside it were allowed 120 and 180, so on a machine left
+  with thousands of geo routes — the case the watchdog exists for — the read
+  timed out, the sweep removed nothing, and the marker was kept. It now uses
+  the same fast text dump (90 s) the dashboard uses. If a crash cleanup is
+  ever reported incomplete again, the reason is written to
+  `.cleanup_watchdog.log` and the crash marker is deliberately **kept**; the
+  next launch re-runs the whole recovery rather than assuming the system is
+  clean.
 - **Run from source AND from the exe**: the two use different persistent
   directories (the package dir vs. the exe dir) for the control file, profile
   store, geoip default, crash log and diagnostics. A `[N]` DNS change made

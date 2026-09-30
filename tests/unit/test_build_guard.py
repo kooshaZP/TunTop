@@ -11,6 +11,7 @@ All filesystem access is redirected to a temp dir; no PyInstaller, no
 PowerShell, no real AV involved.
 """
 import importlib.util
+import inspect
 import os
 import sys
 import tempfile
@@ -168,6 +169,264 @@ class TestGuardExeSurvivesQuarantine(unittest.TestCase):
         with mock.patch.object(br.time, "sleep", self._av([exe], [0])), \
                 mock.patch.object(br, "_AV_HELP", ""):
             self.assertIsNone(br._guard_exe(exe, "9.9.9", timeout=1.0))
+
+
+class TestOnedirIsTheDefault(unittest.TestCase):
+    """1.0.51: the self-extracting onefile is no longer the default.
+
+    The bootloader unpacks an unsigned payload to a temp dir on every start -
+    the profile Defender's ML model keys on. A local 1.0.50 build was
+    quarantined as Trojan:Win32/Bearfoos.A!ml mid-session, parent and four
+    children, which turned a documented risk into a reproducible one.
+    """
+
+    def _parse(self, argv):
+        return br.build_parser().parse_args(argv)
+
+    def test_build_exe_defaults_to_onedir(self):
+        sig = inspect.signature(br.build_exe)
+        self.assertIs(sig.parameters["onedir"].default, True,
+                      "build_exe() still defaults to the onefile layout that "
+                      "gets quarantined")
+
+    def test_no_flag_means_onedir(self):
+        self.assertFalse(self._parse([]).onefile)
+
+    def test_onefile_is_an_explicit_opt_out(self):
+        self.assertTrue(self._parse(["--onefile"]).onefile)
+
+    def test_contradictory_flags_are_rejected_not_silently_resolved(self):
+        """--onefile --onedir has no correct interpretation. Picking one
+        quietly is how a user ends up shipping the layout they were trying to
+        avoid."""
+        with self.assertRaises(SystemExit):
+            self._parse(["--onefile", "--onedir"])
+
+    def test_onedir_flag_still_parses_so_old_instructions_work(self):
+        """--onedir was documented in the README, FAQ and release notes for
+        1.0.50. It must remain a valid no-op rather than start erroring."""
+        args = self._parse(["--onedir"])
+        self.assertTrue(args.onedir)
+
+    def test_the_spec_reads_onedir_through_the_env_var_not_a_cli_flag(self):
+        """--onedir/--onefile are MAKESPEC options; PyInstaller rejects them
+        next to a .spec file, so the choice has to travel in the environment.
+        A regression here is a build that silently produces the wrong layout.
+        """
+        src = inspect.getsource(br.build_exe)
+        self.assertIn('env["TUNTOP_SPEC_ONEDIR"] = "1"', src)
+        self.assertIn('cmd.append(spec)', src)
+
+
+class TestOnedirArtifactIsPublishable(unittest.TestCase):
+    """The onedir artifact is a DIRECTORY. A directory is not a release asset
+    and `certutil -hashfile` cannot hash a folder name - so it has to be zipped
+    for download AND digested for checksums, or the one claim users are told to
+    verify silently vanishes for exactly the artifact that replaced the
+    quarantined exe."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+        self._p_d = mock.patch.object(br, "DIST", os.path.join(self.root, "dist"))
+        self._p_d.start()
+        self.addCleanup(self._p_d.stop)
+
+    def _tree(self):
+        base = os.path.join(self.root, "dist", "TunTop")
+        os.makedirs(os.path.join(base, "_internal"), exist_ok=True)
+        for rel, data in (("TunTop.exe", b"exe"),
+                          ("_internal/python312.dll", b"dll"),
+                          ("_internal/__pycache__/m.pyc", b"pyc")):
+            p = os.path.join(base, rel.replace("/", os.sep))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(data)
+        return base
+
+    def test_build_exe_returns_a_FILE_not_the_onedir_directory(self):
+        """A regression found by actually running the build, not by the unit
+        tests: build_exe() was made to return the onedir FOLDER, and
+        main() passed that straight to _guard_exe(), which tests each copy
+        with os.path.isfile(). Every copy read as missing, so a perfectly
+        healthy onedir build printed the AV-quarantine help and exited 1.
+        _guard_exe watches ONE file, so this must be a file."""
+        src = inspect.getsource(br.build_exe)
+        self.assertIn('print("  * onedir artifact: " + exe)', src)
+        self.assertIn("return exe", src)
+        self.assertNotIn("return os.path.dirname(exe)", src)
+
+    def test_a_built_onedir_exe_survives_the_guard(self):
+        """End of the regression above: _guard_exe on a real onedir exe must
+        return it, not the quarantine message."""
+        with tempfile.TemporaryDirectory() as d:
+            dist = os.path.join(d, "dist")
+            exe = os.path.join(dist, "TunTop", "TunTop.exe")
+            os.makedirs(os.path.dirname(exe))
+            with open(exe, "wb") as f:
+                f.write(b"payload")
+            with mock.patch.object(br, "DIST", dist), \
+                    mock.patch.object(br, "ROOT", d), \
+                    mock.patch.object(br.time, "sleep"):
+                got = br._guard_exe(exe, "9.9.9", timeout=2.0, protect=False)
+        self.assertEqual(got, exe)
+
+    def test_the_zip_keeps_the_top_level_folder(self):
+        """Users extract and run TunTop/TunTop.exe. Flattening the tree would
+        scatter _internal/ across the extraction dir and the app would not
+        start."""
+        import zipfile
+        base = self._tree()
+        z = br.zip_onedir(base, "1.0.51")
+        self.assertTrue(os.path.isfile(z))
+        with zipfile.ZipFile(z) as zf:
+            names = zf.namelist()
+        self.assertIn("TunTop/TunTop.exe", names)
+        self.assertIn("TunTop/_internal/python312.dll", names)
+
+    def test_the_zip_keeps_pycache_that_the_app_requires(self):
+        """EXCLUDE_PATTERNS is SOURCE-tree hygiene and must NOT be applied to
+        PyInstaller output: _internal/ legitimately contains __pycache__ and
+        compiled modules, and filtering them yields a zip that installs and
+        then fails to start."""
+        import zipfile
+        base = self._tree()
+        z = br.zip_onedir(base, "1.0.51")
+        with zipfile.ZipFile(z) as zf:
+            self.assertTrue(any("__pycache__" in n for n in zf.namelist()))
+
+    def test_a_missing_folder_yields_no_artifact_rather_than_an_empty_zip(self):
+        self.assertIsNone(br.zip_onedir(os.path.join(self.root, "nope"),
+                                        "1.0.51"))
+
+    def test_dir_digest_is_stable_and_order_independent(self):
+        base = self._tree()
+        first = br.dir_digest(base)
+        second = br.dir_digest(base)
+        self.assertEqual(first, second)
+        self.assertEqual(first[2], 3)          # three files
+        self.assertEqual(first[1], len(b"exe") + len(b"dll") + len(b"pyc"))
+
+    def test_dir_digest_changes_when_any_file_changes(self):
+        base = self._tree()
+        before = br.dir_digest(base)
+        with open(os.path.join(base, "_internal", "python312.dll"), "wb") as f:
+            f.write(b"tampered")
+        self.assertNotEqual(before, br.dir_digest(base))
+
+    def test_dir_digest_changes_when_a_file_is_added(self):
+        base = self._tree()
+        before = br.dir_digest(base)
+        with open(os.path.join(base, "leftover.pyc"), "wb") as f:
+            f.write(b"stale")
+        self.assertNotEqual(before, br.dir_digest(base),
+                            "a stale file from a previous build would ship "
+                            "inside the published hash")
+
+    def test_a_directory_artifact_gets_a_checksum_line(self):
+        """The regression this whole class exists for: write_checksums gated
+        on os.path.isfile, so the onedir tree was skipped SILENTLY and
+        checksums.txt promised less than the release page offered."""
+        base = self._tree()
+        cs = br.write_checksums("1.0.51", [base])
+        text = open(cs, encoding="utf-8").read()
+        self.assertIn("TunTop/", text)
+        self.assertIn("3 files", text)
+        digest = br.dir_digest(base)[0]
+        self.assertIn(digest, text)
+
+    def test_the_checksum_line_says_the_zip_is_what_to_hash(self):
+        base = self._tree()
+        text = open(br.write_checksums("1.0.51", [base]), encoding="utf-8").read()
+        self.assertIn("zip", text.lower())
+
+
+class TestExclusionIsNarrowedAndDeprioritised(unittest.TestCase):
+    def test_the_repo_root_is_not_excluded_by_default(self):
+        """A root exclusion tells Defender to stop watching every file ever
+        written in the working tree. dist/ is the only path a build writes.
+
+        Compared as QUOTED paths, not substrings: DIST is ROOT + '\\dist', so
+        a plain substring test passes no matter which one is passed.
+        """
+        with mock.patch.object(br.subprocess, "run",
+                               return_value=mock.Mock(stdout="")) as r:
+            br.try_defender_exclusion()
+        ps = r.call_args[0][0][-1]
+        self.assertIn(f"'{br.DIST}'", ps)
+        self.assertNotIn(f"'{br.ROOT}'", ps,
+                         "the repo root is excluded - Defender will now ignore "
+                         "every future file written in the working tree")
+
+    def test_the_av_help_leads_with_the_layout_fix(self):
+        """The recovery text used to recommend an AV exclusion FIRST, before
+        the option that needs no AV configuration at all."""
+        self.assertLess(br._AV_HELP.index("BEST FIX"),
+                        br._AV_HELP.index("LAST RESORT"))
+        self.assertIn("--onefile", br._AV_HELP)
+
+
+class TestStaleArtifactsNeverShip(unittest.TestCase):
+    """dist/ accumulates artifacts from every previous build. Two of them are
+    actively dangerous to leave next to a fresh release."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+        self.dist = os.path.join(self.root, "dist")
+        os.makedirs(self.dist, exist_ok=True)
+        self._p_d = mock.patch.object(br, "DIST", self.dist)
+        self._p_d.start()
+        self.addCleanup(self._p_d.stop)
+
+    def _onefile_cleanup(self):
+        """The cleanup branch of build_exe, without running PyInstaller."""
+        return br._clean_onedir_output()
+
+    def test_a_stale_onefile_is_removed(self):
+        """A previous release's self-extracting dist/TunTop.exe is the exact
+        artifact that gets quarantined, it is the larger of the two files
+        called TunTop.exe, and nothing in dist/ says which belongs to the
+        current release. A user grabbing the wrong one gets the problem this
+        change exists to remove."""
+        stale = os.path.join(self.dist, "TunTop.exe")
+        with open(stale, "wb") as f:
+            f.write(b"onefile from a previous release")
+        self._onefile_cleanup()
+        self.assertFalse(os.path.isfile(stale))
+
+    def test_a_stale_onedir_tree_is_removed(self):
+        """PyInstaller's COLLECT merges into an existing directory, so a file
+        dropped from the spec survives into the new build - and the whole
+        directory is digested as part of the release artifact, so it would ship
+        INSIDE the published hash with no way to tell it was not in the
+        build."""
+        tree = os.path.join(self.dist, "TunTop", "_internal")
+        os.makedirs(tree)
+        with open(os.path.join(tree, "leftover.pyd"), "wb") as f:
+            f.write(b"stale")
+        self._onefile_cleanup()
+        self.assertFalse(os.path.isdir(os.path.join(self.dist, "TunTop")))
+
+    def test_the_onefile_opt_out_keeps_its_own_artifact(self):
+        """--onefile rebuilds dist/TunTop.exe, so the cleanup must be scoped to
+        the onedir path. Deleting it unconditionally would make the opt-out
+        layout unbuildable."""
+        stale = os.path.join(self.dist, "TunTop.exe")
+        with open(stale, "wb") as f:
+            f.write(b"current onefile")
+        br._clean_onedir_output(onedir=False)
+        self.assertTrue(os.path.isfile(stale))
+
+    def test_a_locked_stale_file_does_not_fail_the_build(self):
+        stale = os.path.join(self.dist, "TunTop.exe")
+        with open(stale, "wb") as f:
+            f.write(b"locked")
+        with mock.patch.object(br.os, "remove", side_effect=PermissionError(32)):
+            self._onefile_cleanup()   # must not raise
+        self.assertTrue(os.path.isfile(stale))
 
 
 if __name__ == "__main__":

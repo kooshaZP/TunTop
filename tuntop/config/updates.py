@@ -62,7 +62,7 @@ if hasattr(ssl, "TLSVersion"):
 
 
 class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse a 30x that leaves the expected hosts.
+    """Refuse a 30x that leaves the expected hosts or downgrades to http.
 
     urlopen() installs the DEFAULT redirect handler, which follows a 302 to
     ANY host and ANY scheme. check_latest() verified the URLs it was GIVEN
@@ -71,15 +71,33 @@ class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
     was treated as the release asset. The checksums file came over the same
     redirectable transport, so it validated the redirector's copy too.
 
+    The SCHEME half was checked only after the fact: _fetch re-validates
+    resp.url, so an http:// hop was caught before any byte was used - but
+    only once the plaintext request had already left the machine, and only
+    if the response carried a usable URL. A 30x to ``http://github.com/...``
+    was accepted by this handler, which is what its own docstring said it
+    refused. checksums.txt arrives from the same release, so the SHA-256
+    only proves the bytes were not corrupted in transit: an attacker who can
+    answer for the release can answer for both files and the checksum will
+    agree. Requiring https here is what makes the host allow-list mean
+    something.
+
     Re-raise instead of following, so the caller sees the real failure.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         try:
-            host = urllib.parse.urlsplit(newurl).hostname or ""
+            parts = urllib.parse.urlsplit(newurl)
+            scheme = (parts.scheme or "").lower()
+            host = parts.hostname or ""
         except ValueError:
             raise urllib.error.HTTPError(
                 newurl, code, f"malformed redirect target: {msg}",
+                headers, fp)
+        if scheme != "https":
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"refusing redirect that is not https ({scheme or 'no scheme'})",
                 headers, fp)
         if host.lower() not in _ALLOWED_HOSTS:
             raise urllib.error.HTTPError(

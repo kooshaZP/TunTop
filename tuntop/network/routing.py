@@ -113,12 +113,13 @@ def _teardown_wintun():
     """Best-effort teardown of stale tunnel state: removes routes from BOTH
     tunnel adapters (the primary 'wintun' and, when a previous run used
     --proxy2-port, the secondary 'wintun2') and force-kills every orphaned
-    tun2socks process THAT TUNTOP OWNS (identity-checked by
-    tuntop.network.procguard: exact configured binary path or the
-    exact configured binary path or the distinctive vendored file name - a
-    generic tun2socks.exe another tool runs is never touched). A crash
-    mid-session with proxy2 active otherwise leaves the second adapter and
-    its routes behind for the next launch."""
+    tun2socks process THAT TUNTOP OWNS (decided by tuntop.network.procguard:
+    a recorded PID, the exact configured binary path, or the distinctive
+    vendored file name IN A TUNTOP-CONTROLLED DIRECTORY - a generic
+    tun2socks.exe another tool runs, and an upstream-named binary installed
+    elsewhere, are both never touched). A crash mid-session with proxy2 active
+    otherwise leaves the second adapter and its routes behind for the next
+    launch."""
     try:
         for adapter in TUNNEL_ALIASES:
             _ps(f"Get-NetRoute -InterfaceAlias '{adapter}' -ErrorAction SilentlyContinue | "
@@ -651,7 +652,15 @@ def _del_route_scoped(dest, fam, known_ifaces=()):
     in use, or hit a transient CIM error) returns (False, False) - the caller
     still learns the route is not gone from `removed`, which is the flag it
     acts on, and it must not be told "a foreign route is in the way" when
-    the route is ours."""
+    the route is ours.
+
+    A FAILED closing probe is a leftover too, and is reported the same way.
+    `leftover` used to be built only from a successful `Get-NetRoute`, so a
+    timeout / access-denied / missing PowerShell left it empty and the
+    function returned (True, False) - "removed, and nothing foreign" - the
+    exact success verdict its own docstring says must not be produced
+    without evidence. `removed` is only allowed to be True when the table
+    was actually read."""
     if fam not in ("v4", "v6"):
         return False, False
     fam_ps = "IPv4" if fam == "v4" else "IPv6"
@@ -668,8 +677,11 @@ def _del_route_scoped(dest, fam, known_ifaces=()):
         f"$r = Get-NetRoute -DestinationPrefix '{dest_q}' -AddressFamily {fam_ps} "
         f"-ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceAlias "
         f"-Unique; if ($r) {{ $r -join '|' }} else {{ 'none' }}")
+    if not ok:
+        # Cannot prove the route is gone, so do not claim it is.
+        return False, False
     leftover = []
-    if ok and out and out.strip() != "none" and out.strip() != "No result":
+    if out and out.strip() != "none" and out.strip() != "No result":
         leftover = [a for a in out.strip().split("|") if a]
     foreign = [a for a in leftover
                if a.lower() not in [c.lower() for c in candidates]]

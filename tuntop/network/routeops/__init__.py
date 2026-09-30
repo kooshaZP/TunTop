@@ -12,13 +12,18 @@ Two halves:
     cleanup, the startup recovery and the detached watchdog. ONE
     implementation of the matching rules instead of four drifting copies.
 
+results.py holds the two outcome types: RouteResult for a single platform
+operation and SweepResult for a leftover sweep (found / removed / trustworthy),
+which is what lets a teardown report FAILURE instead of always claiming success.
+
 No Windows calls happen in this package: everything here is pure logic the
 platform callers drive.
 """
 from tuntop.network.routeops.ledger import RouteLedger, RouteReceipt
-from tuntop.network.routeops.results import RouteResult, unwrap
+from tuntop.network.routeops.results import RouteResult, SweepResult, unwrap
 from tuntop.network.routeops import sweeps
 
 __all__ = [
-    "RouteLedger", "RouteReceipt", "RouteResult", "unwrap", "sweeps",
+    "RouteLedger", "RouteReceipt", "RouteResult", "SweepResult", "unwrap",
+    "sweeps",
 ]

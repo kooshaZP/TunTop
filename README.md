@@ -183,16 +183,18 @@ Right-click `Run_Helper.ps1` → **Run with PowerShell** → confirm the UAC pro
 
 Press **[S]** to start the tunnel, **[C]** to run a health scan, **[L]** for a leak test.
 
-### Running the standalone `TunTop.exe` (no Python needed)
+### Running the standalone build (no Python needed)
 
-1. **Download** `TunTop.exe` (and `checksums.txt`) from the
-   [latest release](https://github.com/kooshaZP/TunTop/releases/latest) into any
-   folder — `Desktop\TunTop\` for example. The exe already contains
-   `tun2socks` and `wintun.dll`; nothing else is bundled, and Python is **not**
-   required.
-2. **(Optional) verify it:** `certutil -hashfile TunTop.exe SHA256` and compare
-   with `checksums.txt`.
-3. **Run it:** double-click `TunTop.exe` → confirm the **UAC prompt** (the
+1. **Download** `TunTop-<version>-x64-standalone.zip` (and `checksums.txt`)
+   from the [latest release](https://github.com/kooshaZP/TunTop/releases/latest)
+   and extract it to any folder — `Desktop\TunTop\` for example. The archive
+   contains `TunTop\TunTop.exe` plus its support files; the exe already embeds
+   `tun2socks` and `wintun.dll`, and Python is **not** required.
+2. **(Optional) verify it:** `certutil -hashfile TunTop-<version>-x64-standalone.zip
+   SHA256` and compare with `checksums.txt`. That is the one hash users can
+   check directly — `checksums.txt` also carries a *content* digest for the
+   extracted `TunTop/` folder, which is what the zip is made of.
+3. **Run it:** double-click `TunTop\TunTop.exe` → confirm the **UAC prompt** (the
    dashboard manages routes and a TUN adapter, so admin is mandatory). A
    btop-style dashboard opens. Missing files are fetched automatically on
    first start (tun2socks / wintun if somehow absent, and the **geoip**
@@ -200,8 +202,18 @@ Press **[S]** to start the tunnel, **[C]** to run a health scan, **[L]** for a l
 4. **Point it at your proxy** — the dashboard asks for a SOCKS5 inbound at
    `127.0.0.1:10808` (the v2rayN default). Start that proxy client first.
 5. **Press `[S]`** — the tunnel comes up: Wintun adapter, routes, DNS. The
-   header badge flips to **RUNNING**. Press **[C]** for a health scan and
-   **[L]** for a leak test.
+    header badge flips to **RUNNING**. Press **[C]** for a health scan and
+    **[L]** for a leak test.
+
+> **Why a zip and not a single exe?** Until 1.0.50 the release shipped one
+> self-extracting `TunTop.exe`. That layout unpacks an unsigned payload to a
+> temp directory on every start, which is the behaviour profile Defender's ML
+> model keys on — a local 1.0.50 build was quarantined mid-session as
+> `Trojan:Win32/Bearfoos.A!ml`, parent exe and four child processes. The
+> folder layout is the same application with no self-extraction, so there is
+> nothing to flag and no reason to add an antivirus exclusion. If you need a
+> single file to hand around, `python build_release.py --with-exe --onefile`
+> still builds the old one deliberately.
 
 #### Changing servers and settings live (no restart)
 
@@ -278,17 +290,21 @@ then the graph — and the help footer is only removed as the last resort.
 TunTop is a single-maintainer project. Here is exactly what you are accepting
 when you run it, and what has / has not been verified:
 
-- **The exe is unsigned and self-extracting.** It requires Administrator and
-  rewrites the routing table — the same behavior profile AV/ML models flag.
-  We make **no claim** that antivirus false positives are resolved; they may
-  still occur. The `TunTop-x64.zip` / source route avoids self-extraction
-  entirely: run from source with Python, or use the zip (verified below)
-  instead of the bare onefile exe if your AV is aggressive.
+- **The exe is unsigned.** It requires Administrator and rewrites the routing
+  table — a behaviour profile AV/ML models flag, which is why the release ships
+  the **folder** build rather than a self-extracting single exe (see *Why a zip
+  and not a single exe?* above). We make **no claim** that antivirus false
+  positives are resolved; they may still occur. The `TunTop-x64.zip` / source
+  route avoids a frozen build entirely: run from source with Python, or use the
+  zip instead of the standalone build if your AV is aggressive. **We do not
+  recommend adding an antivirus exclusion** — a folder exclusion stops
+  Defender watching every future file written under it, and this is a tool that
+  rewrites the host's routing table and DNS.
 - **What you CAN verify:** every published release ships `checksums.txt`; the
   CI workflow builds the exe from the tagged commit and the SHA-256 you
-  compute locally (`certutil -hashfile TunTop.exe SHA256`) proves the bytes
-  match what CI produced. That proves integrity (no tampering in transit),
-  **not** safety — the difference matters.
+  compute locally (`certutil -hashfile TunTop-<version>-x64-standalone.zip
+  SHA256`) proves the bytes match what CI produced. That proves integrity (no
+  tampering in transit), **not** safety — the difference matters.
 - **Auto-download trust model:** the vendored `tun2socks.exe` / `wintun.dll`
   are checked against SHA-256 pins that live IN THE REPO
   (`tuntop/core/integrity.py`) — the expected hash does not come from the
@@ -372,8 +388,8 @@ intended behaviour in the voice of a delivered one.**
 | A geo CIDR can never be a default route | verified | prefix floor `/8` v4, `/16` v6 — at parse time *and* at the install boundary | broad ranges are dropped and logged, not installed |
 | A hostile `geoip.dat` cannot execute code | verified | cache is JSON, never pickle; re-validated on every read | — |
 | DNS leak guard removed on a clean exit | verified | `cleanup()` phase ordering; failures reported and retried next launch | `[!] DNS leak guard removal failed` names the locked state |
-| DNS leak guard removed after a **crash / BSOD / power loss** | **not enforced** | no crash handler; the NRPT rule is a registry entry that survives reboot | **run `python -m tuntop.ui.dashboard --remove-dns-guard`** — see below |
-| DNS leak guard never has a window with no rule | verified | the new rule is written under a temp key and swapped in before stale keys are swept | — |
+| DNS leak guard removed after a **crash / BSOD / power loss** | verified | a one-shot `AtStartup` Task Scheduler task (`TunTop-DnsGuard-Removal`, SYSTEM/Highest) armed by `install()` **before** the rule is written; it runs as SYSTEM before any logon, clears the rule, the record and the cache, then deletes itself | if the task could not be armed, the `[C]` row says **NOT crash-safe**; run `--remove-dns-guard` |
+| DNS leak guard never has a window with no rule | verified | the catch-all's five values are written **in place** — `New-Item -Force` opens the key, so the rule is never absent; a partial write keeps the previous (still-tunnel) server list | — |
 | `--dns-guard-exempt corp.example` exempts the whole subtree | verified | namespaces normalised to NRPT suffix-match form | — |
 | A second `[T]` press does not start a second teardown | verified | the teardown is claimed on the UI thread before the worker spawns | — |
 | A start never launches a second helper | verified | `_managed_start` checks `self.proc` before the force-reset | — |
@@ -399,6 +415,20 @@ These cannot be covered by the CI matrix and are worth knowing:
   unreliable — the routes themselves install correctly.
 - **Administrator really is required.** TunTop rewrites the machine routing
   table; launch it with `Start_TunTop.bat` (or `Run_Helper.ps1`).
+- **The boot cleanup task needs Task Scheduler.** `TunTop-DnsGuard-Removal` is
+  registered as a scheduled task, so a machine (or a policy) with Task Scheduler
+  disabled gets no crash protection — and the `[C]` row says **NOT crash-safe**
+  rather than leaving you to find out. `--remove-dns-guard` is the manual path.
+  The task is registered *while the rule is live* and deletes itself at the
+  first boot that follows, so it never outlives the guard; `Get-ScheduledTask
+  -TaskName TunTop-DnsGuard-Removal` should show nothing on a machine that was
+  cleanly shut down.
+- **A VPN with a private `ServerAddress` hostname still needs an exemption.**
+  TunTop resolves the gateway through the physical adapter, so the *bypass route*
+  is right. But the *Windows VPN client* resolves that name through the system
+  resolver, and the catch-all DNS guard owns the system resolver while the
+  tunnel is up. Pass `--dns-guard-exempt corp.example` for a private corporate
+  domain. A public FQDN needs nothing.
 
 ## If something goes wrong
 
@@ -407,10 +437,20 @@ power loss, *End Task* in Task Manager) while a tunnel is up: the DNS
 leak-protection rule survives as a registry entry and keeps every name pointed
 at a resolver that no longer answers.
 
+**Since 1.0.51 that self-heals.** While the rule is installed, TunTop registers
+a one-shot scheduled task `TunTop-DnsGuard-Removal` that runs as SYSTEM at the
+next startup — before anyone logs in — removes the rule, the install record and
+the DNS cache, and then deletes itself. You do not have to do anything; the
+machine is already fixed by the time you sit down at it.
+
+You only need the manual path when the task could not be armed, which the `[C]`
+health row tells you plainly (**"NOT crash-safe"**) and `[D]` confirms:
+
 ```powershell
-# From an Administrator PowerShell, in the repo folder. Removes TunTop's
-# NRPT rules and exits. Use the MODULE form - `python tuntop/ui/dashboard.py`
-# puts tuntop/ui/ on sys.path and dies with "No module named 'tuntop'".
+# From an Administrator PowerShell, in the repo folder. Removes TunTop's NRPT
+# rules, its install record AND its boot cleanup task, then exits. Use the
+# MODULE form - `python tuntop/ui/dashboard.py` puts tuntop/ui/ on sys.path
+# and dies with "No module named 'tuntop'".
 python -m tuntop.ui.dashboard --remove-dns-guard
 ipconfig /flushdns
 
@@ -425,7 +465,8 @@ would then be a company GPO rule rather than ours. Check with
 
 | Symptom | Cause | What to do |
 |---|---|---|
-| No name resolution after a crash or reboot | stale catch-all NRPT rule | `python -m tuntop.ui.dashboard --remove-dns-guard` (or `.\TunTop.exe --remove-dns-guard`) |
+| No name resolution after a crash or reboot | a boot cleanup task that could not be armed (the `[C]` row said NOT crash-safe) | `python -m tuntop.ui.dashboard --remove-dns-guard` (or `.\TunTop.exe --remove-dns-guard`) |
+| A Windows VPN refuses to connect while the tunnel is up | the VPN's gateway has no bypass, so the handshake is captured by the TUN | restart the tunnel; 1.0.51 arms a pre-connect bypass for every configured profile. If its `ServerAddress` is a **private hostname**, add `--dns-guard-exempt <your-corp-domain>` — the Windows VPN client resolves it through the guard |
 | Dashboard will not start, claims another instance is running | stale single-instance lock after a kill | close any `TunTop`/`tun2socks` process, then relaunch |
 | Tunnel up but every app is dead | the origin server's route was captured by the TUN | `[T]` then `[S]`; the `[L]` row names the endpoint |
 | Some sites work and others don't after connecting a VPN | split-tunnel conflict | `[T]`, connect the VPN, then `[S]` — or use `[V]` |

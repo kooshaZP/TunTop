@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 
 import os as _os
 import sys as _sys
@@ -117,6 +118,7 @@ from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
     DEFAULT_SOCKS_PORT, DEFAULT_ENDPOINT_PORT,
 )
 from tuntop.network.routeops import sweeps as _rsweeps   # noqa: E402
+from tuntop.network.routeops import SweepResult          # noqa: E402
 from tuntop.state import (            # noqa: E402
     TunnelState, TunnelStateMachine,
 )
@@ -179,6 +181,16 @@ def _user_dir() -> str:
 # vanish (the classic "it crashes when I try to open it" symptom, which is
 # usually really "it crashed and closed before I could read why").
 CRASH_LOG = os.path.join(_user_dir(), "TunTop_crash.log")
+
+# Windows console control-event codes (wincon.h). The console-close handler is
+# registered for ALL of them, and it returns False so the default action still
+# runs - which means it runs on a plain Ctrl+C too, on a process that then
+# CARRIES ON. Distinguishing the fatal events from the raising ones is what
+# lets the handler know whether to keep or release its teardown claim.
+# (signal.CTRL_BREAK_EVENT is unrelated and stays namespaced as `signal.`.)
+CTRL_CLOSE_EVENT = 2
+CTRL_LOGOFF_EVENT = 5
+CTRL_SHUTDOWN_EVENT = 6
 
 # Where a downloaded geoip database lands when none is configured ([W] key /
 # missing-file auto-download on start). Next to the package so it survives
@@ -1269,11 +1281,25 @@ def _dns_guard_check(dns4=None, dns6=None, enabled=True):
                       + (f" ({state.get('error')})" if state.get("error")
                          else ""))
     in_force = bool(state.get("ok"))
+    # The one-shot boot task is what removes a rule that survives a BSOD or a
+    # power cut. It is reported as DETAIL, never as its own row: the health
+    # counters must not shift, and a guard that is in force IS working right
+    # now. Silently omitting this is what let the row stay "not enforced" for
+    # so long - the operator had no way to learn the rule would outlive a
+    # crash on their machine specifically.
+    boot_note = ""
+    if in_force and not state.get("boot"):
+        boot_note = (". WARNING: NOT crash-safe - the one-shot startup task "
+                     f"({_dns_guard.BOOT_TASK_NAME}) is not registered, so a "
+                     "BSOD or power cut would leave every program on this "
+                     "machine resolving names through a dead tunnel until "
+                     "TunTop is launched again (or you run --remove-dns-guard)")
     if in_force and tunnel_up:
         return True, ("catch-all NRPT rule pins all name resolution to "
                       f"{state.get('servers') or ', '.join(resolvers)} - "
                       "Windows cannot query a physical adapter's resolver in "
-                      "parallel" + _unguarded_adapters_note())
+                      "parallel" + boot_note
+                      + _unguarded_adapters_note())
     if in_force and not tunnel_up:
         return False, ("a STALE DNS-guard rule is still installed with no "
                        "tunnel up - every program on this machine is "
@@ -2027,7 +2053,195 @@ def _bar(frac, width, full=None, empty=None, gradient=True):
 
 def _spark(values, width, mode=None):
     """Gradient sparkline (see ui_text.spark)."""
-    return ui_text.spark(values, width, mode, USE_UNICODE)
+    return ui_text.spark(values, width, USE_UNICODE, mode)
+
+
+def _ctrl_event_is_fatal(ct) -> bool:
+    """True when a console control event ends this process.
+
+    The console-close handler is registered for ALL control events and returns
+    False, so the default action always runs. That default is fatal for a
+    window close (the OS kills us ~5s later) but merely RAISES for Ctrl+C /
+    Ctrl+Break, leaving the process alive - and the teardown claim the handler
+    took has to be handed back in that case, or the app is left permanently
+    unusable (see _ctrl's finally block)."""
+    try:
+        return int(ct) in (CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+                           CTRL_SHUTDOWN_EVENT)
+    except (TypeError, ValueError):
+        return False       # unknown code: assume survivable, do not wedge
+
+
+def _crash_owns_teardown(app) -> bool:
+    """True when the CALLING thread is the one holding `app`'s teardown lock.
+
+    main()'s crash handler calls app.stop(), and stop() re-acquires
+    `_teardown_lock` - a plain, non-reentrant Lock. A crash raised INSIDE a
+    teardown is the common case (the [Q] checklist draws, restores the
+    snapshot and runs netsh batches while holding it), so the crashing thread
+    is normally the holder: re-acquiring is an instant self-deadlock, the
+    crash handler hangs, and the process is killed with every route still
+    installed. When this is True the handler must go straight to the
+    idempotent destructive steps instead."""
+    owner = getattr(app, "_in_teardown", None)
+    return owner is not None and owner == threading.get_ident()
+
+
+def _record_thread_crash(args, blog=None, crash_log=None,
+                         log_lines=None) -> None:
+    """The threading.excepthook body: persist a dead daemon thread's traceback.
+
+    There was no hook at all, and ~15 daemon threads run here (telemetry, VPN
+    poll, bypass resolver, gw-geo-repoint, geo download, the helper's stdout
+    reader, the startup watchdog). An unhandled exception in any of them went
+    to that thread's stderr - nothing at all on a windowed/frozen build - and
+    could never reach main()'s `except BaseException`, which only sees the
+    MAIN thread. The visible symptom was a subsystem that had quietly stopped
+    working: during a teardown a dead worker skips its share of the cleanup
+    while the checklist still ticks a green ✔. The recovery engine wraps its
+    own worker for the same reason (core/recovery.py _run_attempt).
+
+    `log_lines` is a direct fallback, and it is not optional politeness:
+    BTopTui._blog() swallows its own exceptions on purpose (it must never break
+    the UI frame), so a crash INSIDE it is indistinguishable from success - a
+    caller that only wrapped `blog(...)` in try/except believes it notified the
+    panel every time it did not. Appending to the panel's own list cannot fail
+    that way.
+    """
+    name = getattr(getattr(args, "thread", None), "name", None) or "?"
+    try:
+        tb = "".join(traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback))
+    except Exception:
+        tb = f"{getattr(args, 'exc_type', '?')}: " \
+             f"{getattr(args, 'exc_value', '?')}\n"
+    path = crash_log or CRASH_LOG
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} thread "
+                    f"'{name}' crashed ---{chr(10)}{tb}")
+    except Exception:
+        pass
+    try:
+        etype = getattr(args, "exc_type", None)
+        msg = (f"[!] Background thread '{name}' crashed: "
+               f"{getattr(etype, '__name__', etype)}: "
+               f"{getattr(args, 'exc_value', '')}")
+    except Exception:
+        # Never return here: a formatting failure must not swallow the
+        # notification, which is the whole point of the hook.
+        msg = f"[!] Background thread '{name}' crashed."
+    if blog is not None:
+        try:
+            blog(msg)
+            return
+        except Exception:
+            pass
+    if log_lines is not None:
+        try:
+            log_lines.append(msg)
+        except Exception:
+            pass
+
+
+class _TeardownGuard:
+    """`_teardown_lock` + the `_in_teardown` ownership record (see
+    BTopTui._teardown_guard). Written as a class rather than
+    @contextlib.contextmanager so there is no generator to keep alive across
+    the teardown, and so __enter__/__exit__ stay trivial to reason about when
+    the thing being guarded is what is crashing."""
+
+    __slots__ = ("_app", "_lock")
+
+    def __init__(self, app):
+        self._app = app
+        self._lock = app._teardown_lock
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._app._in_teardown = threading.get_ident()
+        return self._app
+
+    def __exit__(self, *exc):
+        self._app._in_teardown = None
+        self._lock.release()
+        return False       # never swallow
+
+
+# ─── netsh -f batch machinery (shared by the add and delete sides) ───────────
+#
+# Both batch helpers used to own their own tempfile/subprocess/netsh-output
+# code, and they disagreed: the ADD side counted `Ok.` / `already exists` out of
+# the script's output while the DELETE side threw the output and the return code
+# away and reported `len(chunk)`. netsh exits 0 even when an individual line
+# fails, so a chunk size is not a removal count - which is how a half-failed
+# sweep came to be indistinguishable from a clean one. One implementation, one
+# verdict.
+
+def _netsh_batch_result(lines, add=False, timeout=180):
+    """Run one `netsh -f` batch of `lines`. Returns (confirmed, ran).
+
+    `confirmed` - how many lines netsh answered with a SUCCESS token. For an
+    add that is `Ok.` or `already exists`; for a delete, `Ok.`. Anything else
+    is a per-line failure netsh reports while still exiting 0.
+    `ran`       - whether the batch actually executed at all: a non-zero exit
+                  code, or NO output whatsoever (which means the script file was
+                  never read), means the batch did not happen. This is the flag
+                  that must veto a "clean" report.
+    Never raises: a batch that cannot run reports (0, False).
+    """
+    try:
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="tuntop_batch_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            try:
+                proc = subprocess.run(["netsh", "-f", path],
+                                      capture_output=True, timeout=timeout,
+                                      creationflags=subprocess.CREATE_NO_WINDOW)
+            except subprocess.TimeoutExpired:
+                return 0, False
+            out = ((proc.stdout or b"").decode("utf-8", "replace")
+                   + (proc.stderr or b"").decode("utf-8", "replace"))
+            if proc.returncode != 0 or not out.strip():
+                return 0, False
+            confirmed = 0
+            for ln in out.splitlines():
+                s = ln.strip()
+                if s == "Ok." or (add and "already exists" in s):
+                    confirmed += 1
+            return confirmed, True
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+    except Exception:
+        return 0, False
+
+
+def _netsh_batches(chunks, worker, max_workers=SWEEP_MAX_WORKERS):
+    """Run `worker(chunk)` for each chunk, CONCURRENTLY, up to max_workers.
+
+    `chunks` are lists of netsh script lines. Every worker is best-effort and
+    must not raise: a batch that cannot run is the caller's problem to detect
+    through its own (confirmed, ran) accounting, not an exception out of here.
+    """
+    if not chunks:
+        return
+    if len(chunks) == 1:
+        try:
+            worker(chunks[0])
+        except Exception:
+            pass
+        return
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(len(chunks), max_workers))) as ex:
+        futs = [ex.submit(worker, c) for c in chunks]
+        for _f in concurrent.futures.as_completed(futs):
+            pass
+
+
 
 
 # ─── TUI class ──────────────────────────────────────────────────────────────
@@ -2389,6 +2603,14 @@ class BTopTui:
         # behind the worker) - the user-visible result was "after stopping,
         # the app is unresponsive and I can't start it again or exit".
         self._teardown_lock = threading.Lock()
+        # Which thread (if any) currently OWNS the teardown. The lock alone
+        # cannot answer that - it is not reentrant, and the crash handler in
+        # main() has to know whether re-acquiring it would be an instant
+        # self-deadlock. Set by _teardown_guard() around every acquisition.
+        self._in_teardown = None
+        # Newest gateway target waiting for the in-flight live-geo re-point to
+        # finish (see _start_geo_repoint - it coalesces, it does not drop).
+        self._gw_geo_pending = None
         self._stopping = threading.Event()   # set while ANY stop/teardown runs
         self._start_after_stop = False       # [S] queued while a stop is running
         # [T] teardown claim. Set on the UI thread BEFORE the worker is spawned
@@ -2409,6 +2631,12 @@ class BTopTui:
         # to the end so they survive), so the dedup actually holds.
         self._seen_conns = {}
         self._conn_poll_ts = 0
+        # Kill-on-close Job Object handle for this run's helper (and, by
+        # inheritance, its tun2socks). None until the first launch, and None
+        # FOREVER if the kernel refuses one - see _create_kill_on_close_job.
+        # The handle is deliberately never closed while the app runs: closing
+        # it is itself the kill trigger.
+        self._helper_job = None
         # Per-destination rate limit for [net] lines: an app that opens a new
         # short-lived connection every couple of seconds (torrent/uTP, download
         # managers, telemetry) used to put one log line per 5s poll into the
@@ -2730,8 +2958,14 @@ class BTopTui:
                 not (self.proc and self.proc.poll() is None):
             self.tunnel.try_transition(TunnelState.STOPPING,
                                        "helper process is gone")
-            self.tunnel.try_transition(TunnelState.STOPPED,
-                                       "helper process is gone")
+            # Same rule as the reader's stdout-EOF path: a teardown that is
+            # ALREADY running owns the final transition, and it publishes
+            # STOPPED only after its sweeps have finished. Reaching STOPPED
+            # from this read would report "system clean" for a teardown that
+            # has not run yet.
+            if not self._stopping.is_set() and not self._shutting_down:
+                self.tunnel.try_transition(TunnelState.STOPPED,
+                                           "helper process is gone")
             st = self.tunnel.current
         return st.value
 
@@ -4336,7 +4570,24 @@ class BTopTui:
         matching what a fresh start in the new mode would install. Runs on
         a worker thread (every route op is a PowerShell hop). VPN-tagged
         and proxy2-target entries are mode-independent and left alone, as
-        are the geo routes (separate list, own egress rule)."""
+        are the geo routes (separate list, own egress rule).
+
+        BATCHED. This used to loop per route: a scoped delete, a
+        RouteTransaction add, the transaction's verify probe and - because
+        these are /32 host routes - its `shadow()` table probe. That is four
+        PowerShell process spawns PER BYPASS ENTRY, on every [A]/[N]/[V] live
+        apply and on every gateway change. _reroute_live_geo_rows right next
+        to this function is batched for exactly this reason and its own
+        docstring says the per-route path "would take minutes".
+
+        Batching gives up the transaction's per-op rollback. What replaces it
+        is the same ordering _reroute_live_geo_rows relies on: add the
+        replacements FIRST, and only if netsh accepted all of them, delete the
+        old rows. A short add count means nothing is claimed and the old rows
+        stay tracked, so [Q] still removes what is actually in the table."""
+        del_rows = []
+        add_rows = []
+        track = []
 
         def _worker():
             try:
@@ -4362,7 +4613,6 @@ class BTopTui:
                        else _get_ipv6_default())
                 eg4 = (v4d[0], v4d[1]) if v4d else None
                 eg6 = (v6d[0], v6d[1]) if v6d else None
-                moved = 0
                 for fam, dest, iface, gw in rows:
                     new = eg4 if fam == "v4" else eg6
                     if not new:
@@ -4370,29 +4620,33 @@ class BTopTui:
                     if (str(new[0]).lower() == str(iface).lower()
                             and str(new[1] or "") == str(gw or "")):
                         continue    # already on the right egress
+                    add_rows.append((dest, new[0], new[1], 1, False))
+                    track.append((fam, dest, iface, gw, new))
+                if not add_rows:
+                    return
+                added = int(self._batch_add_routes(add_rows) or 0)
+                if added != len(add_rows):
+                    # Do not claim partial replacements: the old rows stay
+                    # tracked, so the exit sweep still removes them.
+                    self._blog(
+                        f"[!] Re-pointed 0/{len(add_rows)} live bypass "
+                        f"route(s) to the new egress ({'Windows VPN' if over else 'physical adapter'}); "
+                        "old entries remain tracked.")
+                    return
+                for fam, dest, iface, gw, new in track:
+                    nh = gw if gw and gw not in ("0.0.0.0", "::") else ""
+                    del_rows.append((dest, iface, nh))
+                self._batch_delete_routes(del_rows)
+                moved = 0
+                for fam, dest, iface, gw, new in track:
                     try:
-                        _del_route_scoped(dest, fam, [iface] if iface else [])
-                    except Exception:
-                        pass
-                    try:
-                        txn = RouteTransaction(log=self._blog)
-                        if fam == "v4":
-                            txn.add_v4(dest, new[0], new[1], metric=1)
-                        else:
-                            txn.add_v6(dest, new[0], new[1], metric=1)
-                        result = txn.commit()
-                        ok = result.ok
-                    except Exception:
-                        ok = False
-                    if ok:
-                        try:
-                            idx = self._live_bypass_added.index(
-                                (fam, dest, iface, gw))
-                            self._live_bypass_added[idx] = (
-                                fam, dest, new[0], new[1])
-                        except ValueError:
-                            pass
+                        idx = self._live_bypass_added.index(
+                            (fam, dest, iface, gw))
+                        self._live_bypass_added[idx] = (
+                            fam, dest, new[0], new[1])
                         moved += 1
+                    except ValueError:
+                        pass
                 if moved:
                     self._blog(
                         f"[*] Re-pointed {moved} live bypass route(s) to the "
@@ -4403,6 +4657,7 @@ class BTopTui:
                            f"{e.__class__.__name__}: {e}")
 
         threading.Thread(target=_worker, daemon=True).start()
+
 
     def _reroute_live_geo_rows(self, old_iface, new_iface, new_gw):
         """Re-point the geo routes THIS dashboard installed live ([R]/[F]
@@ -4527,20 +4782,49 @@ class BTopTui:
                        f"failed: {e.__class__.__name__}: {e}")
         # Live geo rows: batched re-point on a worker (can be thousands).
         if old_iface and new_iface:
-            if getattr(self, "_gw_geo_repoint_active", False):
-                return
-            self._gw_geo_repoint_active = True
+            self._start_geo_repoint(old_iface, new_iface, new_gw)
 
-            def _worker():
-                try:
-                    self._reroute_live_geo_rows(old_iface, new_iface, new_gw)
-                except Exception as e:
-                    self._blog(f"[!] Live geo re-point after gateway change "
-                               f"failed: {e.__class__.__name__}: {e}")
-                finally:
-                    self._gw_geo_repoint_active = False
-            threading.Thread(target=_worker, daemon=True,
-                             name="gw-geo-repoint").start()
+    def _start_geo_repoint(self, old_iface, new_iface, new_gw):
+        """Start (or QUEUE) a live-geo re-point to `new_gw`.
+
+        The re-point is a batched netsh install of up to a few thousand routes,
+        so it can still be running when the NEXT gateway change arrives. The
+        handler used to `return` in that case, which silently DISCARDED the
+        new target: the in-flight worker was moving the routes to the
+        now-superseded gateway, and nothing was left to move them onto the
+        one that replaced it. The country's traffic then stayed pinned to a
+        dead gateway for the rest of the session - a second Wi-Fi switch during
+        one re-point was enough, and the only recovery was to quit and start
+        again.
+
+        So coalesce instead of drop: the newest target wins, and the worker
+        drains it before it exits. Repeated changes collapse to one extra pass
+        rather than one queued pass each."""
+        target = (str(old_iface), str(new_iface), str(new_gw or ""))
+        if getattr(self, "_gw_geo_repoint_active", False):
+            self._gw_geo_pending = target
+            return
+        self._gw_geo_repoint_active = True
+
+        def _worker():
+            cur = target
+            try:
+                while cur is not None:
+                    self._reroute_live_geo_rows(*cur)
+                    # Take the newest target that arrived while we were busy.
+                    # Under no lock, but a lost update here is at worst one
+                    # missed re-point - the same failure the old code had on
+                    # every change - and a lock would only buy ordering, which
+                    # the assignment order already gives.
+                    cur = getattr(self, "_gw_geo_pending", None)
+                    self._gw_geo_pending = None
+            except Exception as e:
+                self._blog(f"[!] Live geo re-point after gateway change "
+                           f"failed: {e.__class__.__name__}: {e}")
+            finally:
+                self._gw_geo_repoint_active = False
+        threading.Thread(target=_worker, daemon=True,
+                         name="gw-geo-repoint").start()
 
     def _on_vpn_arrived(self):
         """A Windows VPN just CONNECTED (telemetry noticed the transition).
@@ -5194,7 +5478,8 @@ class BTopTui:
         else:
             lines.append(f"install record: resolvers={record.get('resolvers')} "
                          f"exempt={record.get('exempt')} "
-                         f"since={record.get('since')}")
+                         f"since={record.get('since')} "
+                         f"boot_armed={record.get('boot_armed')}")
         try:
             probe_ok, state = _dns_guard.detect(runner=_ps)
         except Exception as e:
@@ -5203,6 +5488,16 @@ class BTopTui:
             lines.append(f"rules: {state.get('keys')} key(s), "
                          f"effective={state.get('effective')}, "
                          f"servers={state.get('servers')!r}")
+            # Reported from the OS, not from the record: the record says what we
+            # INTENDED at install time, this says what is true now. A GPO
+            # refresh, a manual schtasks /delete or a task that already fired
+            # at a boot all leave the two disagreeing, and the disagreeing case
+            # is the one that leaves a machine without DNS.
+            lines.append(
+                f"boot cleanup task {_dns_guard.BOOT_TASK_NAME}: "
+                + ("ARMED (a crash/BSOD will clear the rule at next boot)"
+                   if state.get("boot") else
+                   "NOT ARMED (a crash/BSOD would leave the rule behind)"))
         else:
             lines.append(f"NRPT probe failed: {state.get('error')}")
         try:
@@ -7937,6 +8232,51 @@ class BTopTui:
                 self.stop()
             self._restore_console_mode()
 
+    def _teardown_guard(self):
+        """Context manager: take `_teardown_lock` and record that THIS thread
+        owns the teardown (`_in_teardown`).
+
+        Every acquisition goes through here so the crash handler in main() can
+        tell "another thread is mid-teardown, wait for it" from "I am the
+        thread that crashed while holding it" - and the second case must not
+        re-acquire, because the lock is a plain, non-reentrant `Lock` and
+        doing so deadlocks the only code left that could clean anything up.
+        """
+        return _TeardownGuard(self)
+
+    def _cleanup_after_helper_exit(self):
+        """The helper died; put the SYSTEM back the way it was.
+
+        Deliberately NOT stop(): _stop_locked pauses the recovery engine,
+        which would cancel a restart that is already pending. This runs the
+        same destructive sweeps, under the same `_stopping` / `_teardown_lock`
+        serialisation, so it can never overlap a [T] teardown, a [Q] shutdown
+        or a recovery restart's own stop() - the loser waits and returns.
+
+        The machine's state is left alone: the reader has already published
+        it, and only a teardown owner may set STOPPED. Never raises - this is
+        the last owner of the system's state and must not die part-way."""
+        if self._cleanup_done:
+            return
+        if self._stopping.is_set():
+            with self._teardown_guard():
+                pass          # an owner is already doing exactly this
+            return
+        self._stopping.set()
+        try:
+            self.logs.put("[*] Helper exited - cleaning up leftover routes, "
+                          "adapter and DNS guard...")
+            with self._teardown_guard():
+                self._run_teardown_sweeps()
+        except Exception as e:
+            try:
+                self.logs.put(f"[!] Post-exit cleanup failed: "
+                              f"{e.__class__.__name__}: {e}")
+            except Exception:
+                pass
+        finally:
+            self._stopping.clear()
+
     def _managed_start(self):
         """Start the tunnel through the Core layer (TunnelManager) - the
         UI -> Core -> Windows path the architecture prescribes. The manager
@@ -7966,6 +8306,24 @@ class BTopTui:
         if self.proc is not None and self.proc.poll() is None:
             self._blog(f"[*] Helper already running (PID {self.proc.pid}) - "
                        "nothing to start. Press [T] to stop it first.")
+            return False
+        # TEARDOWN GATE, and it must come BEFORE request_start, not after it.
+        # The post-failure check it replaced could only ever run when
+        # request_start FAILED - and during a teardown the reader thread may
+        # already have published STOPPED (the machine is only claimed
+        # STOPPED by the teardown owner now, but STOPPED is also simply where
+        # a crash leaves it), so STOPPED -> STARTING is a legal edge,
+        # request_start SUCCEEDS, and the guard was skipped. A [S], a
+        # recovery restart or a bypass restart then launched a fresh helper
+        # while the previous session's sweep was still deleting routes and
+        # re-creating the pre-session snapshot over the new ones.
+        # _stopping is the authoritative signal: every teardown owner
+        # (stop(), _stop_async's worker, the [Q] shutdown) sets it BEFORE any
+        # destructive step and clears it only after the last one.
+        if self._stopping.is_set() or self.tunnel.current is TunnelState.STOPPING:
+            self._blog(f"[i] Start rejected - teardown in progress "
+                       f"({self.tunnel.state_name}). Press [S] again once "
+                       "it finishes.")
             return False
         if self.manager.request_start(verify_immediately=False):
             return True
@@ -8100,6 +8458,25 @@ class BTopTui:
                 # CREATE_NO_WINDOW alone keeps a piped child console-free
                 # (the exact pattern every other TunTop spawn uses).
                 creationflags=subprocess.CREATE_NO_WINDOW)
+            # TIE tun2socks TO THE HELPER'S LIFETIME. The helper is a plain
+            # parent, so killing it used to leave tun2socks running - still
+            # holding the Wintun adapter, its routes and the traffic path,
+            # while the UI said STOPPED. Job membership is inherited by
+            # children, so a kill-on-close job makes the OS reap the whole
+            # tree the moment the dashboard process dies, for any reason,
+            # with no cleanup code needing to run at all.
+            #
+            # The handle is stored on the instance and never closed early -
+            # closing it IS the kill trigger. One job is reused for every
+            # helper this run launches, so a recovery restart does not leave
+            # the previous helper holding a job we have forgotten about.
+            if self._helper_job is None:
+                self._helper_job = _create_kill_on_close_job()
+            if self._helper_job is not None and not _assign_to_job(
+                    self._helper_job, self.proc):
+                self.logs.put("[*] Helper lifetime guard unavailable (job "
+                              "assignment refused) - teardown falls back to "
+                              "the explicit sweeps.")
             # The helper is alive: the machine leaves STOPPED and walks the
             # start sequence from here (VERIFYING on "[+] TUNNEL ACTIVE",
             # RUNNING on the START SEQUENCE COMPLETE marker - see _read).
@@ -8274,9 +8651,47 @@ class BTopTui:
                 # recovery log name the real cause instead of a bare exit.
                 exit_reason = (getattr(self, "_helper_exit_reason", "")
                                or "helper process exited")
-                self.tunnel.try_transition(TunnelState.STOPPING, exit_reason)
-                self.tunnel.try_transition(TunnelState.STOPPED, exit_reason)
+                # Claiming STOPPED is only ours to do when NO teardown owns
+                # this transition. _stop_locked sets STOPPING and then spends
+                # seconds in the live-route cleanup, the wintun teardown, the
+                # exit sweep and the route-snapshot restore - and this EOF
+                # fires the instant the helper's stdout closes, i.e. in the
+                # middle of all of it. STOPPING -> STOPPED is a legal edge, so
+                # the reader used to publish "STOPPED = system clean" while
+                # the previous session's sweep was still deleting routes and
+                # re-creating the pre-session table, which is how a [S], a
+                # recovery restart or a bypass restart could launch a new
+                # helper into a teardown that was still running. Let the
+                # teardown owner publish the final state.
+                teardown_owns = (self._stopping.is_set()
+                                 or self._shutting_down
+                                 or self._cleanup_done)
+                if not teardown_owns:
+                    self.tunnel.try_transition(TunnelState.STOPPING, exit_reason)
+                    self.tunnel.try_transition(TunnelState.STOPPED, exit_reason)
                 self._helper_exit_reason = ""
+                # And this reader must not leave the machine clean-looking
+                # with nothing cleaned. A dead helper can leave its tun2socks
+                # orphaned, the Wintun adapter up and the catch-all DNS rule
+                # installed. Only the recovery engine's restart ever cleaned
+                # that, because it calls stop() first - and it has no incident
+                # to act on when the helper simply exits without printing a
+                # failure marker at all. With --no-auto-recover, or once
+                # recovery has given up, or on a markerless exit, NOTHING ran:
+                # stale routes, the adapter and the DNS pin survived until [Q]
+                # or the next launch while the UI said STOPPED.
+                #
+                # Unconditional, and safe to be unconditional, because
+                # _cleanup_after_helper_exit does the sweeps WITHOUT pausing
+                # recovery: pausing would cancel the very restart that is
+                # already queued, turning a self-healing crash into a stopped
+                # tunnel. If recovery does restart, its own stop() sees the
+                # teardown in flight, waits on the same lock and returns -
+                # the sweeps are idempotent either way.
+                if not teardown_owns and not self._shutting_down:
+                    threading.Thread(target=self._cleanup_after_helper_exit,
+                                     name="post-exit-cleanup",
+                                     daemon=True).start()
             threading.Thread(target=_read, daemon=True).start()
             # Watchdog: fires even when the helper produces zero output (hung
             # on a netsh/PowerShell call).  Checks every 5 s; if the helper
@@ -8325,18 +8740,81 @@ class BTopTui:
                                        f"helper launch failed: {e}")
             self.log_lines.append(f"[!] Failed to launch: {e}")
 
+    def _host_sweep_scope(self):
+        """The interface aliases the last-resort host-route sweep may delete on.
+
+        A bare `Remove-NetRoute -DestinationPrefix '<dest>'` removes that
+        prefix on EVERY interface, and a corporate VPN client pins a /32 for
+        the same server (routing.py documents this at length). So the sweep has
+        to be scoped - but scoping it to the TUN adapters alone is not enough,
+        because that is NOT where these routes are installed: the helper adds
+        the server and bypass /32s to the RESOLVED EGRESS (helper.py add_v4()
+        calls at the /32-install sites all pass the physical/VPN egress, not
+        TUN). Scoped to [TUN, TUN2] the sweep could never remove the very
+        leftovers it exists for, which is why "my servers are still in the
+        routing table after Alt+F4" survived the fix.
+
+        So: the tunnel adapters, plus every interface this process is already
+        tracking a live route on (our own ledgers - exact by construction),
+        plus the current physical egress resolved fresh. An unrelated VPN
+        client is a DIFFERENT alias, so it is still out of reach.
+
+        Known residual gap: a /32 left on an adapter alias we no longer resolve
+        (a Wi-Fi -> Ethernet switch where Windows kept the old adapter). An
+        unscoped delete would close it and re-open the VPN breakage; that trade
+        is not worth it, so the gap is documented instead
+        (docs/KNOWN-ISSUES.md).
+        """
+        scope = {TUN, TUN2}
+        for lst in (getattr(self, "_live_geo_added", None),
+                    getattr(self, "_live_bypass_added", None)):
+            for row in (lst or ()):
+                # (fam, dest, iface, gw) ledger rows.
+                try:
+                    alias = str(row[2]).strip()
+                except (TypeError, IndexError):
+                    continue
+                if alias:
+                    scope.add(alias)
+        cached = getattr(self, "_iface_cache", None)
+        if cached:
+            try:
+                if str(cached[0]).strip():
+                    scope.add(str(cached[0]).strip())
+            except (TypeError, IndexError):
+                pass
+        # The current physical egress - one extra PowerShell call, and it is
+        # the interface a force-killed helper would have used most recently.
+        for getter in (_get_ipv4_default, _get_ipv6_default):
+            try:
+                got = getter()
+            except Exception:
+                continue
+            try:
+                if got and str(got[0]).strip():
+                    scope.add(str(got[0]).strip())
+            except (TypeError, IndexError):
+                continue
+        return sorted(a for a in scope if a)
+
     def _final_host_route_sweep(self):
         """Last-resort exit sweep: remove any leftover per-host bypass route
         (/32 + /128) for the VLESS servers and every configured bypass entry,
-        regardless of which interface/gateway they were installed through.
+        on any interface this session could have used (see _host_sweep_scope:
+        the tunnel adapters, our own ledgers, and the current physical egress).
 
         This catches the one case the layered cleanup above cannot: the helper
-        child had to be FORCE-killed (hung >13s), so its own Python atexit
-        cleanup never ran and its startup bypass routes are still in the table.
-        One batched PowerShell call, idempotent (removing an absent prefix is
-        silently ignored)."""
+        child had to be FORCE-killed (hung past the stop timeout), so its own
+        Python atexit cleanup never ran and its startup bypass routes are still
+        in the table. One batched PowerShell call, idempotent (removing an
+        absent prefix is silently ignored). Returns True when the batch ran.
+
+        It used to return nothing, so `except: pass` over a failed PowerShell
+        call was indistinguishable from a sweep that had cleared everything.
+        """
         hosts = []
-        hosts += list(self.endpoint_v4) + list(self.endpoint_v6)
+        hosts += list(getattr(self, "endpoint_v4", None) or []) \
+            + list(getattr(self, "endpoint_v6", None) or [])
         for h in (list(getattr(self.ns, "bypass_ip", []) or [])
                   + list(getattr(self.ns, "server", []) or [])
                   # proxy2 second-hop and Windows-VPN endpoint bypasses also
@@ -8354,17 +8832,24 @@ class BTopTui:
                 if ip not in ips:
                     ips.append(ip)
         if not ips:
-            return
-        # Statement builder is the shared rule (routeops.sweeps). SCOPED to
-        # the tunnel adapter: an unscoped `Remove-NetRoute -DestinationPrefix
-        # '<dest>'` removes that prefix on EVERY interface, so this crashed
-        # helper's sweep also deleted a corporate VPN client's /32 for the
-        # same server - the "our routes disappear, the VPN's stay" report.
-        stmts = _rsweeps.host_route_stmts(ips, aliases=[TUN, TUN2])
+            return True   # nothing to remove is trivially "it ran"
+        # Statement builder is the shared rule (routeops.sweeps), and it is
+        # SCOPED: an unscoped `Remove-NetRoute -DestinationPrefix '<dest>'`
+        # removes that prefix on EVERY interface, so this crashed helper's sweep
+        # also deleted a corporate VPN client's /32 for the same server - the
+        # "our routes disappear, the VPN's stay" report. The scope is widened
+        # beyond the tunnel adapters (which never held these routes) but stays
+        # a fixed alias list, so an unrelated VPN adapter is still untouched.
+        stmts = _rsweeps.host_route_stmts(ips, aliases=self._host_sweep_scope())
+        if not stmts:
+            return True
         try:
-            _ps("\n".join(stmts))
-        except Exception:
-            pass
+            ok, _out = _ps("\n".join(stmts))
+            return bool(ok)
+        except Exception as e:
+            self._blog(f"[!] Endpoint host-route sweep failed: "
+                       f"{e.__class__.__name__}: {e}")
+            return False
 
     def _cleanup_live_routes(self):
         """Remove every route THIS dashboard process installed live: the geoip
@@ -8376,7 +8861,11 @@ class BTopTui:
         Routes are deleted in BATCHED netsh -f scripts (see
         _batch_delete_routes) - the old one-PowerShell-call-per-route loop
         made quitting after a geo re-apply take many minutes, which is exactly
-        what the [X]-close/accidental-exit path hit too."""
+        what the [X]-close/accidental-exit path hit too.
+
+        Returns a SweepResult. It used to return nothing at all, so a batch
+        that never ran was indistinguishable from one that deleted everything -
+        and the crash marker was retired on that basis."""
         rows = []
         for lst in (self._live_geo_added, self._live_bypass_added):
             for _fam, dest, iface, gw in lst:
@@ -8384,20 +8873,32 @@ class BTopTui:
                 rows.append((dest, iface, nh))
         self._live_geo_added = []
         self._live_bypass_added = []
-        if rows:
-            try:
-                self._batch_delete_routes(rows)
-            except Exception:
-                # Fall back to the per-route path if the batch machinery is
-                # unavailable for any reason.
-                for dest, iface, nh in rows:
-                    try:
-                        if ":" in dest:
-                            _del_route_v6(dest, iface, nh)
-                        else:
-                            _del_route_v4(dest, iface, nh)
-                    except Exception:
-                        pass
+        if not rows:
+            return SweepResult.clean(0, 0)
+        try:
+            result = self._batch_delete_routes(rows)
+        except Exception as e:
+            # Fall back to the per-route path if the batch machinery is
+            # unavailable for any reason.
+            for dest, iface, nh in rows:
+                try:
+                    if ":" in dest:
+                        _del_route_v6(dest, iface, nh)
+                    else:
+                        _del_route_v4(dest, iface, nh)
+                except Exception:
+                    pass
+            return SweepResult.failed(len(rows), f"batch delete raised: {e}")
+        # A batch that ran but confirmed fewer removals than we asked for means
+        # some routes are still installed. Say so - the teardown's verdict
+        # depends on it.
+        if isinstance(result, SweepResult) and not result.ok:
+            return result
+        if int(result or 0) < len(rows):
+            return SweepResult.failed(
+                len(rows), f"only {int(result or 0)} of {len(rows)} "
+                           f"live route(s) confirmed removed")
+        return result
 
     def _dump_route_table(self):
         """One-shot dump of the live routing table as dicts
@@ -8545,30 +9046,21 @@ class BTopTui:
                          f"{nh_tok} metric={int(metric or 0)} store={store}")
         chunks = [lines[i:i + self._SWEEP_CHUNK]
                   for i in range(0, len(lines), self._SWEEP_CHUNK)]
+        # CONCURRENT, like _batch_delete_routes. This used to run its chunks in
+        # a plain sequential loop while the delete side used a 6-worker pool, so
+        # restoring a snapshot that re-adds hundreds of rows cost one netsh
+        # process at a time on the exit path - the one moment the user is
+        # waiting. Disjoint prefixes cannot collide.
         ok = 0
-        for chunk in chunks:
-            fd, path = tempfile.mkstemp(suffix=".txt", prefix="snap_add_")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write("\n".join(chunk))
-                try:
-                    result = subprocess.run(["netsh", "-f", path],
-                                            capture_output=True, timeout=180,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
-                    out = (result.stdout or b"")
-                    if isinstance(out, bytes):
-                        out = out.decode("utf-8", "replace")
-                    for ln in out.splitlines():
-                        s = ln.strip()
-                        if s == "Ok." or "already exists" in s:
-                            ok += 1
-                except Exception:
-                    pass
-            finally:
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
+        lock = threading.Lock()
+
+        def _run(chunk):
+            nonlocal ok
+            confirmed, _ran = _netsh_batch_result(chunk, add=True)
+            with lock:
+                ok += confirmed
+
+        _netsh_batches(chunks, _run)
         return ok
 
     def _restore_route_snapshot(self):
@@ -8591,14 +9083,16 @@ class BTopTui:
         deleted = added = 0
         if to_delete:
             try:
-                deleted = self._batch_delete_routes(to_delete)
+                # int() so this reads the same whether the batch helper hands
+                # back a SweepResult or a bare count.
+                deleted = int(self._batch_delete_routes(to_delete) or 0)
             except Exception:
                 deleted = 0
         if to_add:
             try:
-                added = self._batch_add_routes([
+                added = int(self._batch_add_routes([
                     (r["dest"], r["iface"], r["nh"], r["metric"],
-                     r["persistent"]) for r in to_add])
+                     r["persistent"]) for r in to_add]) or 0)
             except Exception:
                 added = 0
         return (deleted, added)
@@ -8642,18 +9136,35 @@ class BTopTui:
         self._geo_sweep_cidrs_val = cidrs
         return cidrs
 
-    def _leftover_geo_routes(self):
+    def _leftover_geo_routes(self, rows=None):
         """Live routes whose DestinationPrefix exactly matches one of the
         --geoip-code country CIDRs (i.e. bypass routes that should have been
         removed but are still installed - on ANY interface/gateway). The
         matching rule lives in tuntop.network.routeops.sweeps (one copy for
-        the dashboard, the watchdog and startup recovery)."""
-        victims = _rsweeps.geo_victims(self._dump_route_table(),
-                                       self._geo_sweep_cidrs())
+        the dashboard, the watchdog and startup recovery).
+
+        `rows` is an already-dumped live routing table to match against, so a
+        caller that needs this AND _sweep_lan_leftovers pays for one read, not
+        two."""
+        table = rows if rows is not None else self._dump_route_table()
+        victims = _rsweeps.geo_victims(table, self._geo_sweep_cidrs())
         return [{"DestinationPrefix": dp, "InterfaceAlias": alias,
                  "NextHop": nh} for dp, alias, nh in victims]
 
-    def _sweep_lan_leftovers(self):
+    def _geo_victim_rows(self, rows=None):
+        """_leftover_geo_routes as the (dest, alias, next_hop) tuples the
+        batch delete helpers take. The verify loop uses this to delete exactly
+        the rows it just measured, instead of re-dumping and re-matching the
+        whole table to remove the one route that is left."""
+        out = []
+        for r in self._leftover_geo_routes(rows=rows):
+            dp = str(r.get("DestinationPrefix")).replace("'", "")
+            alias = str(r.get("InterfaceAlias", "") or "").replace("'", "")
+            nh = str(r.get("NextHop", "") or "").replace("'", "")
+            out.append((dp, alias, nh))
+        return out
+
+    def _sweep_lan_leftovers(self, rows=None):
         """Last-resort exit sweep for the helper's LAN bypass routes
         (10/8, 172.16/12, 192.168/16, ... via the physical adapter). The
         helper removes them in its own cleanup (they are in added_routes),
@@ -8668,38 +9179,48 @@ class BTopTui:
         Those are ours from a previous network - after switching Wi-Fi the
         current-gateway match misses them and they keep blackholing LAN
         traffic. Windows' own on-link routes (nh 0.0.0.0/On-link) and any
-        other interface's routes are never touched. Returns how many were
-        removed."""
+        other interface's routes are never touched. Returns a SweepResult.
+
+        `rows` is an already-dumped live routing table to match against. It
+        exists so a teardown pays for ONE table read instead of one per sweep:
+        every call site that runs this next to _sweep_geo_leftovers shares a
+        single dump, which is safe because the two victim sets are disjoint
+        (geo CIDRs are public country ranges, LAN_BYPASS_PREFIXES are RFC1918)
+        so a geo delete can never remove a row the LAN match would have found.
+        """
         try:
             def_gw = _get_ipv4_default()
             if not def_gw:
-                return 0
+                return SweepResult.failed(0, "no IPv4 default route")
             iface, gw = str(def_gw[0]), str(def_gw[1])
             # Victim selection is the SHARED rule (routeops.sweeps) - the
             # same copy the watchdog uses; prefixes come from
             # tuntop.config.defaults (single source).
-            raw = _rsweeps.lan_victims(self._dump_route_table(), iface, gw,
+            table = rows if rows is not None else self._dump_route_table()
+            raw = _rsweeps.lan_victims(table, iface, gw,
                                        prefixes=LAN_BYPASS_PREFIXES)
-            rows = []
+            dels = []
             for dp, alias, nh in raw:
                 if nh in ("0.0.0.0", "::", "On-link", ""):
                     # On-link: ours when it equals the current gateway's
                     # iface; keep the original current-gw semantics.
-                    rows.append((dp, alias, ""))
+                    dels.append((dp, alias, ""))
                     continue
                 if nh == gw:
-                    rows.append((dp, alias, ""))
+                    dels.append((dp, alias, ""))
                     continue
                 # Real next-hop that is NOT the current gateway on the same
                 # adapter: a stale pin from a previous network - ours,
                 # deleted next-hop-exact so foreign routes survive.
-                rows.append((dp, alias, nh))
-            if not rows:
-                return 0
-            self._batch_delete_routes(rows)
-            return len(rows)
-        except Exception:
-            return 0
+                dels.append((dp, alias, nh))
+            if not dels:
+                return SweepResult.clean(0, 0)
+            return self._batch_delete_routes(dels)
+        except Exception as e:
+            # Was `return 0`, which a caller could not tell from "found
+            # nothing" - and that is how a sweep that never ran was reported
+            # as a clean table.
+            return SweepResult.failed(0, f"{e.__class__.__name__}: {e}")
 
     def _sweep_dns_guard(self):
         """Drop the DNS leak-guard NRPT rule (see tuntop/network/dns_guard.py).
@@ -8718,7 +9239,7 @@ class BTopTui:
             return False
         return bool(ok)
 
-    def _sweep_geo_leftovers(self, progress=None):
+    def _sweep_geo_leftovers(self, progress=None, rows=None):
         """Last-resort exit sweep for HELPER-installed geoip country-bypass
         routes. The helper removes its own routes in cleanup() when it exits
         cleanly, but if it had to be force-killed (hung > timeout) its Python
@@ -8732,17 +9253,18 @@ class BTopTui:
         match DestinationPrefixes exactly against those CIDRs client-side, and
         batch-delete every match by interface + next-hop, so only leftover
         bypass routes are touched - never a VPN's own routes.
-        Returns how many leftover routes were found/removed."""
-        leftovers = []
-        for r in self._leftover_geo_routes():
-            dp = str(r.get("DestinationPrefix")).replace("'", "")
-            alias = str(r.get("InterfaceAlias", "") or "").replace("'", "")
-            nh = str(r.get("NextHop", "") or "").replace("'", "")
-            leftovers.append((dp, alias, nh))
+
+        Returns a SweepResult. This used to return the number of rows it
+        FOUND and call it a removal count, and returned 0 both when there was
+        nothing to remove and when the whole thing had raised - so a sweep
+        that removed nothing looked exactly like a clean table.
+
+        `rows` is an already-dumped live routing table to match against (see
+        _leftover_geo_routes)."""
+        leftovers = self._geo_victim_rows(rows=rows)
         if not leftovers:
-            return 0
-        self._batch_delete_routes(leftovers, progress=progress)
-        return len(leftovers)
+            return SweepResult.clean(0, 0)
+        return self._batch_delete_routes(leftovers, progress=progress)
 
     def _batch_delete_routes(self, leftovers, progress=None):
         """Delete route tuples [(dest_prefix, iface_alias, next_hop), ...] in
@@ -8752,69 +9274,71 @@ class BTopTui:
         took many minutes. Batched scripts run hundreds of deletes per netsh
         process, in parallel, finishing in seconds. Disjoint prefixes cannot
         collide, and each script runs from a temp file (no command-line
-        length limit)."""
+        length limit).
+
+        Returns a SweepResult. `found` is what we asked netsh to delete,
+        `removed` is what netsh CONFIRMED (`Ok.` lines in the batch output -
+        netsh exits 0 even when an individual line fails, so the chunk size was
+        never a removal count), and `ok` is False when a batch never ran. That
+        verdict is what the teardown needs: it is the difference between "the
+        table is clean" and "we think it is clean", and only the first one may
+        retire the crash marker.
+        """
         if not leftovers:
-            return 0
-        # Concurrent netsh -f batches - the SAME fast path the installer uses.
-        # The old Remove-NetRoute-per-prefix scripts cost ~50-100ms per route
-        # (minutes for a few thousand leftovers even in parallel); plain
-        # `netsh interface ipv4|ipv6 delete route` lines batch hundreds per
-        # process, matching load speed. Disjoint prefixes cannot collide, and
-        # each script runs from a temp file (no command-line length limit).
+            return SweepResult.clean(0, 0)
         chunks = [leftovers[i:i + self._SWEEP_CHUNK]
                   for i in range(0, len(leftovers), self._SWEEP_CHUNK)]
-        done = [0]
+        state = {"removed": 0, "done": 0, "failed": 0}
         lock = threading.Lock()
 
         def _report():
             if progress:
                 try:
-                    progress(done[0], len(leftovers))
+                    # ROUTES covered, not routes confirmed removed: a partial
+                    # failure would leave the bar short and the shutdown screen
+                    # looking wedged forever. The shortfall is reported through
+                    # `removed`/`ok` instead, which is where a caller can act.
+                    progress(state["done"], len(leftovers))
                 except Exception:
                     pass
 
-        _report()   # announce the total before anything completes
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(len(chunks), self._SWEEP_WORKERS)) as ex:
-            futs = []
-            for chunk in chunks:
-                lines = []
-                for dp, alias, nh in chunk:
-                    verb = "ipv6" if ":" in dp else "ipv4"
-                    iface_dq = '"' + alias.replace('"', '') + '"'
-                    nh_tok = ""
-                    if nh and nh not in ("0.0.0.0", "::"):
-                        nh_tok = f" {nh}"
-                    lines.append(f"interface {verb} delete route {dp} "
-                                 f"{iface_dq}{nh_tok}")
+        def _run(chunk):
+            lines = []
+            for dp, alias, nh in chunk:
+                verb = "ipv6" if ":" in dp else "ipv4"
+                iface_dq = '"' + str(alias).replace('"', '') + '"'
+                nh_tok = ""
+                if nh and nh not in ("0.0.0.0", "::"):
+                    nh_tok = f" {nh}"
+                lines.append(f"interface {verb} delete route {dp} "
+                             f"{iface_dq}{nh_tok}")
+            confirmed, ran = _netsh_batch_result(lines, add=False)
+            with lock:
+                state["done"] += len(chunk)
+                if ran:
+                    state["removed"] += confirmed
+                else:
+                    state["failed"] += len(chunk)
 
-                # Late-binding defaults: this closure is submitted to a pool
-                # and must capture THIS chunk, so the defaults are evaluated
-                # here, inside the loop, on purpose.
-                def _run(_lines=lines, _n=len(chunk)):  # noqa: B008
-                    try:
-                        fd, path = tempfile.mkstemp(suffix=".txt",
-                                                    prefix="geo_sweep_")
-                        try:
-                            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                                f.write("\n".join(_lines))
-                            subprocess.run(["netsh", "-f", path],
-                                           capture_output=True, timeout=180,
-                                           creationflags=subprocess.CREATE_NO_WINDOW)
-                        finally:
-                            try:
-                                os.unlink(path)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    with lock:
-                        done[0] += _n
-                    _report()
-                futs.append(ex.submit(_run))
-            for _f in concurrent.futures.as_completed(futs):
-                pass
-        return len(leftovers)
+        _report()   # announce the total before anything completes
+        _netsh_batches(chunks, _run, max_workers=self._SWEEP_WORKERS)
+        _report()
+        if state["failed"]:
+            return SweepResult.failed(
+                len(leftovers),
+                f"{state['failed']} of {len(leftovers)} route(s) in a batch "
+                f"that did not run; {state['removed']} removed")
+        removed = state["removed"]
+        if removed < len(leftovers):
+            # Every batch ran, but netsh answered fewer lines with "Ok." than
+            # we asked it to delete - a per-line refusal, reported in its
+            # output while it still exits 0. Those routes are still installed,
+            # so this is NOT clean.
+            return SweepResult.failed(
+                len(leftovers),
+                f"netsh confirmed only {removed} of {len(leftovers)} "
+                f"route(s) removed")
+        return SweepResult.clean(len(leftovers), removed)
 
     def _remove_geo_routes_for(self, cidrs):
         """Batch-remove every live route whose DestinationPrefix is in `cidrs`
@@ -8873,16 +9397,119 @@ class BTopTui:
             self._blog(f"[!] Could not pre-clean old geo routes: {e}")
             return 0, 0
 
+    def _verify_routes_clear(self, rows=None):
+        """The one place that answers "is OUR traffic still routed by us?".
+
+        Returns (clear, detail) from a single live-table read: routes on either
+        tunnel adapter, geo-bypass routes matching --geoip-code, and LAN-bypass
+        routes on the current physical adapter. This is deliberately a
+        VERIFICATION and not a sum of what the sweeps said they removed - netsh
+        reports per-line failures in its output and still exits 0, so only
+        looking at the table afterwards can tell a clean teardown from an
+        optimistic one.
+
+        `rows` lets a caller that has already read the table pass it in, so a
+        teardown pays for ONE read per verification pass instead of three
+        (the old verify loop spawned two PowerShell processes just to count
+        wintun routes and a third for the geo dump, up to six times).
+        """
+        table = rows if rows is not None else self._dump_route_table()
+        wintun = 0
+        for r in table:
+            if _is_tun_iface(r.get("InterfaceAlias", "")):
+                wintun += 1
+        geo = len(self._geo_victim_rows(rows=table))
+        lan = 0
+        try:
+            def_gw = _get_ipv4_default()
+            if def_gw:
+                lan = len(_rsweeps.lan_victims(
+                    table, str(def_gw[0]), str(def_gw[1]),
+                    prefixes=LAN_BYPASS_PREFIXES))
+        except Exception:
+            lan = 0
+        detail = (f"{wintun} wintun"
+                  + (f", {geo} geoip" if geo else "")
+                  + (f", {lan} LAN" if lan else "") + " route(s) left")
+        return (wintun == 0 and geo == 0 and lan == 0), detail
+
     def _exit_route_sweep(self):
-        """Run all last-resort sweeps idempotently; never raises."""
-        for sweep in (self._cleanup_live_routes,
-                      self._sweep_geo_leftovers,
-                      self._sweep_lan_leftovers,
-                      self._final_host_route_sweep):
+        """Run all last-resort sweeps idempotently; never raises. Returns True
+        when the table is verified clear of our routes.
+
+        Returns a verdict, and it is a LOAD-BEARING one: _atexit_all uses it to
+        decide whether the crash marker may be retired. It used to return
+        nothing at all while every sweep inside it swallowed its own
+        exceptions, so `cleanup_ok` downstream was always True and a failed
+        cleanup was reported to the watchdog and the next launch as a clean
+        exit - the exact opposite of what the watchdog's own `sweeps_ok` veto
+        checks for.
+
+        Three pieces of evidence, used for three different questions:
+
+        * a sweep that RAISED - a hard failure. We no longer know what it would
+          have removed, so we cannot claim the table is clean.
+        * the host-route sweep's own verdict - a hard failure. It is the one
+          step the verification below cannot see (it checks wintun/geo/LAN
+          rows, not per-host /32s).
+        * the VERIFICATION read - authoritative for everything else. A sweep
+          reporting not-ok is evidence, not proof: netsh refuses individual
+          lines while exiting 0, and a route that was already gone does not
+          answer "Ok." either. If the table says none of ours is left, the
+          table wins.
+
+        One route-table read is shared by the geo and LAN sweeps (their victim
+        sets are disjoint, so neither can hide a row from the other).
+        """
+        raised = False
+        try:
+            live = self._cleanup_live_routes()
+        except Exception as e:
+            raised = True
+            live = None
+            self._blog(f"[!] Live-route cleanup failed: "
+                       f"{e.__class__.__name__}: {e}")
+        if live is not None and not live.ok:
+            self._blog(f"[!] Live-route cleanup incomplete: {live.err}")
+        table = None
+        try:
+            table = self._dump_route_table()
+        except Exception:
+            table = None
+        for sweep, kwargs in ((self._sweep_geo_leftovers, {"rows": table}),
+                              (self._sweep_lan_leftovers, {"rows": table})):
             try:
-                sweep()
-            except Exception:
-                pass
+                res = sweep(**kwargs)
+            except Exception as e:
+                raised = True
+                self._blog(f"[!] Exit sweep {getattr(sweep, '__name__', sweep)}"
+                           f" failed: {e.__class__.__name__}: {e}")
+                continue
+            # A sweep that returned a bare count (an older caller, a test
+            # double) carries no verdict - only a SweepResult can.
+            if isinstance(res, SweepResult) and not res.ok and res.err:
+                self._blog(f"[!] {getattr(sweep, '__name__', sweep)}: {res.err}")
+        try:
+            host_ok = bool(self._final_host_route_sweep())
+        except Exception as e:
+            raised = True
+            host_ok = False
+            self._blog(f"[!] Endpoint host-route sweep failed: "
+                       f"{e.__class__.__name__}: {e}")
+        if raised or not host_ok:
+            return False
+        # Authoritative check: look at the table, do not trust the summaries.
+        try:
+            clear, detail = self._verify_routes_clear()
+        except Exception as e:
+            self._blog(f"[!] Could not verify the route table: "
+                       f"{e.__class__.__name__}: {e}")
+            return False
+        if not clear:
+            self._blog(f"[!] Routes may still be present after the exit sweep: "
+                       f"{detail}")
+            return False
+        return True
 
     # ── [Q] shutdown with progress bar ───────────────────────────────────────
     # Pressing [Q] must clear every route and only THEN let the app quit. We run
@@ -9022,9 +9649,19 @@ class BTopTui:
         _teardown_wintun()
 
     @staticmethod
-    def _count_wintun_routes():
+    def _count_wintun_routes(rows=None):
         """Routes on BOTH tunnel adapters (wintun + optional wintun2) - the
-        shutdown progress verifies the second pipe's routes are gone too."""
+        shutdown progress verifies the second pipe's routes are gone too.
+
+        With an already-dumped table this costs NOTHING. It used to spawn two
+        PowerShell processes per call (one per adapter) and the [Q] verify loop
+        called it up to six times, so counting two numbers cost a dozen process
+        spawns; _verify_routes_clear now does this from the single table read
+        the verify pass already performs. The standalone path (no `rows`) is
+        kept for callers that genuinely have no table in hand."""
+        if rows is not None:
+            return sum(1 for r in rows
+                       if _is_tun_iface(r.get("InterfaceAlias", "")))
         total = 0
         for _adapter in ("wintun", "wintun2"):
             ok, out = _ps(
@@ -9133,15 +9770,30 @@ class BTopTui:
         # force-killed/hung helper the shutdown sequence had to kill.
         tasks.append(("Removing the DNS leak-guard rule",
                       self._sweep_dns_guard))
+        # ONE live-table read, shared by the geo and LAN sweeps. Their victim
+        # sets are disjoint (public country CIDRs vs RFC1918), so a geo delete
+        # cannot hide a row from the LAN match, and this saves a second full
+        # Get-NetRoute walk - seconds on a few-thousand-route geo table.
+        _shared = {"rows": None}
+
+        def _shared_table():
+            if _shared["rows"] is None:
+                _shared["rows"] = self._dump_route_table()
+            return _shared["rows"]
+
         tasks.append(("Sweeping leftover geoip country routes",
                       lambda: self._sweep_geo_leftovers(
-                          progress=self._sweep_progress_cb)))
+                          progress=self._sweep_progress_cb,
+                          rows=_shared_table())))
         tasks.append(("Sweeping leftover LAN bypass routes",
-                      self._sweep_lan_leftovers))
+                      lambda: self._sweep_lan_leftovers(
+                          rows=_shared_table())))
         tasks.append(("Sweeping endpoint host bypass routes",
                       self._final_host_route_sweep))
         tasks.append(("Restoring the pre-session route table",
                       self._restore_route_snapshot))
+        # MUST stay last: the verify row is addressed positionally
+        # (verify_idx = len(tasks) - 1) when the result is recorded below.
         tasks.append(("Verifying routes are clear",
                       lambda: None))
 
@@ -9154,7 +9806,7 @@ class BTopTui:
             self._shutdown_progress = idx / total
             self._draw_shutdown()
             try:
-                fn()
+                res = fn()
             except KeyboardInterrupt:
                 # Ctrl+C MUST NOT abort a teardown that is already running.
                 # The console handler is registered for every control event and
@@ -9174,7 +9826,13 @@ class BTopTui:
                 self._shutdown_stage = f"{label} (error: {e})"
                 self._shutdown_items[idx][1] = "fail"
             else:
-                if self._shutdown_items[idx][1] == "run":
+                # A step that reports it could NOT finish must not show a ✔.
+                # The sweeps used to return a bare count that nobody read, so a
+                # netsh batch that never ran still ticked green.
+                if isinstance(res, SweepResult) and not res.ok:
+                    self._shutdown_items[idx][1] = "fail"
+                    self._shutdown_stage = f"{label} ({res.err or 'incomplete'})"
+                elif self._shutdown_items[idx][1] == "run":
                     self._shutdown_items[idx][1] = "ok"
             self._shutdown_progress = (idx + 1) / total
             self._draw_shutdown()
@@ -9182,36 +9840,42 @@ class BTopTui:
         # Final verification: keep tearing down until the route table is truly
         # empty and tun2socks is dead. This is what guarantees the app never
         # quits while routes are still lingering (the "clear and clean" part).
+        #
+        # ONE table read per attempt answers every question this loop asks
+        # (wintun rows, geo rows, LAN rows). It used to be THREE reads: two
+        # PowerShell processes inside _count_wintun_routes, one per adapter,
+        # plus a full Get-NetRoute dump for the geo count - up to six times.
         verify_idx = len(tasks) - 1
         geo_left = 0
+        leftover = 0
         for attempt in range(6):
-            leftover = self._count_wintun_routes()
-            if attempt == 0:
-                # First pass: count-only geo leftovers (no sweep/delete).
-                # Dumps the table once.
-                geo_left = len(self._leftover_geo_routes())
-            elif geo_left > 0 or leftover > 0:
-                # Only re-dump/re-sweep when the prior pass removed > 0 geo
-                # routes or wintun routes still remain - otherwise the table is
-                # unchanged and another full dump is pure overhead (seconds on a
-                # few-thousand-route geo table, just to confirm zero rows).
-                geo_left = self._sweep_geo_leftovers()
-            if leftover == 0 and geo_left == 0 and not self._tun2socks_running():
+            table = self._dump_route_table()
+            leftover = self._count_wintun_routes(rows=table)
+            measured = self._geo_victim_rows(rows=table)
+            geo_left = len(measured)
+            if geo_left == 0 and leftover == 0 and not self._tun2socks_running():
                 break
             self._shutdown_stage = (
                 f"Verifying routes are clear... ({leftover} wintun"
                 + (f", {geo_left} geoip" if geo_left else "")
                 + f" left, retry {attempt + 1})")
-            # Only re-run _teardown_wintun when something is still present;
-            # skip the redundant kill when the prior pass reported 0 wintun + 0
-            # geo and only looped because tun2socks was still being torn down.
-            if leftover > 0 or geo_left > 0 or self._tun2socks_running():
+            # Delete EXACTLY the rows just measured instead of re-running the
+            # whole sweep, which re-dumped and re-matched the entire table to
+            # remove the one route that was left.
+            if measured:
+                try:
+                    self._batch_delete_routes(measured)
+                except Exception:
+                    pass
+            if leftover > 0 or self._tun2socks_running():
                 try:
                     _teardown_wintun()
                 except Exception:
                     pass
             time.sleep(0.4)
-        if leftover == 0 and geo_left == 0 and not self._tun2socks_running():
+        verified_clean = (leftover == 0 and geo_left == 0
+                          and not self._tun2socks_running())
+        if verified_clean:
             self._shutdown_items[verify_idx][1] = "ok"
             self._shutdown_stage = "Routes cleared - safe to quit."
         else:
@@ -9223,7 +9887,13 @@ class BTopTui:
                 f"rerun to clean up.")
         self._shutdown_progress = 1.0
         self._draw_shutdown()
-        time.sleep(0.6)
+        # The 600ms beat only ever existed so the "safe to quit" screen could be
+        # read before the process went away. On a VERIFIED CLEAN exit there is
+        # nothing to read and nothing to act on - the user asked to quit - so
+        # spending 600ms of their time on it is pure latency. Keep the beat for
+        # the warning screen, which the user does have to act on.
+        if not verified_clean:
+            time.sleep(0.6)
 
         # FINAL LEDGER FLUSH. The checklist above swept whatever the ledgers
         # held at the time it ran; anything appended since (a bypass resolver
@@ -9368,23 +10038,35 @@ class BTopTui:
         # atexit racing the worker - used to double-run the PowerShell sweeps
         # and freeze the app. Instead: mark, serialise, and re-check.
         if self._stopping.is_set():
-            with self._teardown_lock:
+            with self._teardown_guard():
                 pass    # wait for the in-flight teardown to finish
             return
         self._stopping.set()
         try:
-            with self._teardown_lock:
+            with self._teardown_guard():
                 self._stop_locked()
         finally:
             self._stopping.clear()
 
-    def _stop_locked(self):
-        # User-initiated stop: pause recovery FIRST so the machine's walk
-        # down (STOPPING/STOPPED) is never mistaken for a crash to repair.
-        self.recovery.pause("stop requested")
-        # Announce teardown on the machine (no-op if the helper-exit path in
-        # _read already claimed STOPPING/STOPPED - try_transition ignores it).
-        self.tunnel.try_transition(TunnelState.STOPPING, "stop requested")
+    def _run_teardown_sweeps(self):
+        """The destructive half of a teardown, with no opinion about state.
+
+        Stop the helper (if it is somehow still up), remove every route this
+        dashboard process added live (geo bypass + [A] bypass-IP), tear the
+        wintun adapters down, sweep whatever the helper left behind if it had
+        to be force-killed, and finally re-create the pre-session route
+        snapshot so the table matches what it was before the session.
+
+        Shared by _stop_locked (a user teardown) and
+        _cleanup_after_helper_exit (a dead helper nobody will restart), which
+        differ ONLY in whether recovery is paused and whether the state
+        machine is driven - the destructive steps must not be allowed to
+        drift apart between them.
+
+        Returns True when the table was verified clear afterwards. It used to
+        return nothing while every step inside it swallowed its own failures,
+        so "Tunnel stopped" was printed over an unrouted table.
+        """
         if self.proc and self.proc.poll() is None:
             try:
                 self.logs.put("[*] Stopping helper...")
@@ -9398,20 +10080,41 @@ class BTopTui:
                     self.proc.wait(timeout=5)
                 except Exception:
                     self.proc.kill()
-        # Remove every route this dashboard process added live (geo bypass +
-        # [A] bypass-IP). The helper cleans its own startup routes on exit.
+        # The helper cleans its own startup routes on exit; these are the ones
+        # THIS process added while it ran. _exit_route_sweep runs the same
+        # pass again as belt-and-braces (it also covers a helper that had to be
+        # force-killed, whose own cleanup never ran), and this early call keeps
+        # the ordering: our own live routes go BEFORE the adapters are torn
+        # down, so the snapshot restore below diffs against a settled table.
         self._cleanup_live_routes()
         _teardown_wintun()
-        # Belt-and-braces: also clear anything the helper may have left behind
-        # if it had to be force-killed (its own cleanup never ran then).
-        self._exit_route_sweep()
+        ok = self._exit_route_sweep()
         # Final guarantee for the [T] path: the table matches the pre-session
         # snapshot (re-creates anything the session removed/modified).
         try:
             self._restore_route_snapshot()
         except Exception:
             pass
+        return ok
+
+    def _stop_locked(self):
+        # User-initiated stop: pause recovery FIRST so the machine's walk
+        # down (STOPPING/STOPPED) is never mistaken for a crash to repair.
+        self.recovery.pause("stop requested")
+        # Announce teardown on the machine (no-op if the helper-exit path in
+        # _read already claimed STOPPING/STOPPED - try_transition ignores it).
+        self.tunnel.try_transition(TunnelState.STOPPING, "stop requested")
+        clean = self._run_teardown_sweeps()
+        if not clean:
+            try:
+                self.logs.put(
+                    "[!] Some routes may still be installed - the exit sweep "
+                    "could not clear the table. Press [S] to start again, or "
+                    "rerun TunTop if this persists.")
+            except Exception:
+                pass
         self.tunnel.try_transition(TunnelState.STOPPED, "teardown complete")
+        return clean
 
     def _schedule_bypass_restart(self, reason):
         """Apply a changed --bypass-ip list by fully restarting the tunnel
@@ -9839,6 +10542,117 @@ def _acquire_single_instance():
         return _UNLOCKED
 
 
+def _create_kill_on_close_job():
+    """A Job Object configured to kill everything in it when its last handle
+    closes. Returns the handle (keep it alive for the process lifetime), or
+    None when one could not be created.
+
+    THE POINT: nothing in TunTop tied tun2socks to the helper's lifetime.
+    The helper spawned tun2socks as a plain child, so killing the helper left
+    tun2socks running - still holding the Wintun adapter, still holding its
+    routes, still carrying traffic through the proxy - while the dashboard
+    reported STOPPED. Every force-kill path hit this: the startup-hang
+    watchdog (`self.proc.kill()`, no sweep at all), a close-the-window
+    teardown that had to terminate, and any crash of the helper itself.
+
+    A Job Object is the kernel's own answer: membership is inherited by
+    children, and JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE means the OS terminates
+    the whole tree the moment the last handle to the job goes away - which
+    happens automatically when the dashboard process dies, for ANY reason,
+    including a hard kill of the dashboard itself. No cleanup code has to
+    run for the guarantee to hold.
+
+    Fails SOFT. Returns None (and the caller carries on) when ctypes is
+    unavailable, we are not on Windows, or the kernel refuses - nested jobs
+    are a possibility if the dashboard was itself launched from inside a
+    job. Refusing to start the tunnel because a lifetime guard could not be
+    installed would be a far worse outcome than running without it.
+    """
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        k32 = ctypes.windll.kernel32
+    except Exception:
+        return None
+    try:
+        k32.CreateJobObjectW.restype = ctypes.c_void_p
+        k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
+        k32.SetInformationJobObject.restype = ctypes.c_int
+        k32.SetInformationJobObject.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                                ctypes.c_void_p, ctypes.c_uint)
+        k32.AssignProcessToJobObject.restype = ctypes.c_int
+        k32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    except Exception:
+        return None
+    try:
+        handle = k32.CreateJobObjectW(None, None)
+        if not handle:
+            return None
+        # JOBOBJECT_EXTENDED_LIMIT_INFORMATION = 9. The struct is laid out
+        # explicitly: BasicLimitInformation first, then the four IO counters
+        # and the four pointer-sized fields. Only LimitFlags matters here, so
+        # the rest are left zeroed - a job with no other limits behaves like a
+        # plain grouping.
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in
+                        ("ReadOperationCount", "WriteOperationCount",
+                         "OtherOperationCount", "ReadTransferCount",
+                         "WriteTransferCount", "OtherTransferCount")]
+
+        class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32)]
+
+        class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(
+                ctypes.c_void_p(handle), 9, ctypes.byref(info),
+                ctypes.sizeof(info)):
+            k32.CloseHandle(ctypes.c_void_p(handle))
+            return None
+        return handle
+    except Exception:
+        return None
+
+
+def _assign_to_job(job, proc):
+    """Put `proc` (a live Popen) into the kill-on-close job. Best-effort:
+    returns True only when the kernel confirmed it.
+
+    `proc._handle` is the Popen's process handle, which is how CPython's own
+    `Popen.terminate()` reaches the process - no extra OpenProcess needed.
+    """
+    if not job or proc is None:
+        return False
+    try:
+        k32 = ctypes.windll.kernel32
+        handle = getattr(proc, "_handle", None)
+        if not handle:
+            return False
+        return bool(k32.AssignProcessToJobObject(ctypes.c_void_p(job),
+                                                 ctypes.c_void_p(handle)))
+    except Exception:
+        return False
+
+
 def main():
     # ── Frozen child-process dispatch (PyInstaller onefile) ──────────────
     # The tunnel helper and the cleanup watchdog run as SEPARATE processes,
@@ -9953,12 +10767,15 @@ def main():
     ap.add_argument("--ascii", action="store_true",
                     help="Force plain ASCII glyphs (+/-/#) even if Unicode looks supported")
     ap.add_argument("--remove-dns-guard", action="store_true",
-                    help="Remove TunTop's DNS-leak-protection NRPT rules and "
-                         "exit (Administrator). Emergency recovery for a "
-                         "machine left with no working name resolution after a "
-                         "hard kill, BSOD or power loss - the catch-all pin "
-                         "survives reboots and points at a tunnel that is no "
-                         "longer there. Does not start or stop the tunnel.")
+                    help="Remove TunTop's DNS-leak-protection NRPT rules, its "
+                         "install record and its one-shot boot cleanup task, "
+                         "then exit (Administrator). The backstop for a "
+                         "machine whose startup task could not be armed (a "
+                         "disabled Task Scheduler, a non-elevated install): a "
+                         "hard kill, BSOD or power loss otherwise leaves the "
+                         "catch-all pin in place across reboots, pointing at a "
+                         "tunnel that is no longer there. Does not start or "
+                         "stop the tunnel.")
     ap.add_argument("--bypass-ip", action="append", default=[], metavar="HOST_OR_IP",
                     help="IP address or hostname/domain to bypass the TUN (repeatable)")
     ap.add_argument("--geoip", default=None, metavar="PATH",
@@ -10091,6 +10908,17 @@ def main():
             print("[!] A catch-all NRPT rule is STILL in force. It may be a "
                   "company GPO rule rather than ours; check with "
                   "Get-DnsClientNrptPolicy -Effective.")
+        # The boot task is the OTHER half of a clean removal: a rule with no
+        # task is harmless, but a task with no rule is clutter that re-fires on
+        # every future boot until it self-deletes. Say which state we ended in
+        # rather than assuming - uninstall() reports a disarm failure in its own
+        # message, and this is where the operator is actually reading it.
+        if probe_ok and state.get("boot"):
+            print(f"[!] The boot cleanup task "
+                  f"{_dns_guard.BOOT_TASK_NAME} is still registered; it is "
+                  "harmless (it runs once, finds no rule and deletes itself) "
+                  f"but you can drop it now with: Unregister-ScheduledTask "
+                  f"-TaskName {_dns_guard.BOOT_TASK_NAME}")
         print("[+] Name resolution is no longer pinned by TunTop.")
         if probe_ok:
             print("[i] Flush the cache with: ipconfig /flushdns")
@@ -10355,13 +11183,27 @@ def main():
             if app is not None:
                 # Full sweep (live routes + geo leftovers + host routes): even
                 # if [Q]'s own teardown was skipped somehow, nothing lingers.
-                app._exit_route_sweep()
+                # The sweep's VERDICT is the answer, not "it did not raise":
+                # _exit_route_sweep used to return nothing while swallowing
+                # every exception internally, so this branch was reachable
+                # with cleanup_ok = True even when the netsh batches never
+                # ran - and the marker below was retired over a table that
+                # still carried every route, telling the watchdog and the
+                # next launch that the system was clean.
+                cleanup_ok = bool(app._exit_route_sweep())
                 # And the final guarantee: the table matches the pre-session
                 # snapshot (re-creates entries the session removed/modified).
                 app._restore_route_snapshot()
-            cleanup_ok = True
+            else:
+                # No app (failed before BTopTui existed): nothing was routed,
+                # so there is nothing to clear. That IS a clean exit.
+                cleanup_ok = True
         except Exception as e:
+            cleanup_ok = False
             print(f"[!] Route cleanup on exit failed: {e}")
+        if not cleanup_ok:
+            print("[!] Cleanup was not verified - leaving the crash marker in "
+                  "place so the cleanup watchdog / next launch finish the job.")
         try:
             _teardown_wintun()
         except Exception:
@@ -10425,6 +11267,21 @@ def main():
             # after this handler returns).
             if app is None:
                 return False
+            # Console control-event codes (wincon.h). This handler is
+            # registered for ALL of them, not just the close, and it always
+            # returns False so the default action still happens.
+            ct = int(ct or 0)
+            # CTRL_CLOSE_EVENT is fatal - the OS kills us ~5s later, so the
+            # shutdown stays claimed and there is nothing to un-wedge.
+            # CTRL_C_EVENT / CTRL_BREAK_EVENT instead raise KeyboardInterrupt
+            # on the main thread and the process CARRIES ON, so this handler
+            # must give `_shutting_down` back or the app is left permanently
+            # wedged: it is only ever cleared in __init__, and every interactive
+            # path gates on it ([Q] returns at once, [S]/[A]/[T]/[F] no-op), so
+            # a single Ctrl+C used to turn the dashboard into something that
+            # could only be killed from Task Manager - which is exactly the
+            # "crash" the watchdog then had to clean up after.
+            fatal = _ctrl_event_is_fatal(ct)
             # SERIALIZE with the app's own teardown paths. A [Q] checklist
             # (or [T] worker) may be mid-teardown right now: two concurrent
             # teardowns used to fight over the route table - and worse, two
@@ -10444,7 +11301,7 @@ def main():
             # work - mark the shutdown as owned so its checklist no-ops.
             app._shutting_down = True
             try:
-                with app._teardown_lock:
+                with app._teardown_guard():
                     try:
                         # Fresh sidecar FIRST so the detached watchdog sees the
                         # latest live state even if we are killed mid-sweep.
@@ -10521,6 +11378,15 @@ def main():
                         pass
             finally:
                 app._stopping.clear()
+                if not fatal:
+                    # This event does not kill us - hand the shutdown claim
+                    # back so the dashboard stays usable after a Ctrl+C that
+                    # happened to arrive while it was already closing down.
+                    # (Setting it False here is safe even mid-[Q]: the [Q]
+                    # thread owns `_shutting_down` for its own duration and
+                    # sets `_cleanup_done` when it finishes, and every other
+                    # owner re-claims the flag before it does any work.)
+                    app._shutting_down = False
             return False
         wf = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint32)
         # Keep the function pointer alive in module state so Python's GC can't
@@ -10532,6 +11398,25 @@ def main():
         pass
 
     app = None
+
+    def _thread_crashed(args):
+        """threading.excepthook -> _record_thread_crash (module level, so the
+        behaviour is unit-testable; see its docstring for why there is a hook
+        at all)."""
+        blog = log_lines = None
+        try:
+            if app is not None:
+                blog = app._blog
+                log_lines = app.log_lines
+        except Exception:
+            blog = log_lines = None
+        _record_thread_crash(args, blog=blog, log_lines=log_lines)
+
+    try:
+        threading.excepthook = _thread_crashed
+    except Exception:
+        pass
+
     try:
         app = BTopTui(args)
         # The update check already ran in the startup block above; anything
@@ -10548,8 +11433,13 @@ def main():
         try:
             _n = app._sweep_geo_leftovers()
             if _n:
-                print(f"[*] Removed {_n} leftover geoip route(s) from a "
-                      "previous run - the fresh start is clean.")
+                # .removed, not the result: the sweep now reports what netsh
+                # CONFIRMED it deleted, where it used to report the number of
+                # rows it found and let the message call that a removal.
+                print(f"[*] Removed {_n.removed} leftover geoip route(s) from "
+                      "a previous run - the fresh start is clean.")
+            elif not _n.ok:
+                print(f"[!] Leftover geo route sweep incomplete: {_n.err}")
         except Exception as _e:
             print(f"[!] Leftover geo route sweep skipped: {_e}")
         # Same story for LAN bypass routes pinned to a gateway that no longer
@@ -10559,8 +11449,10 @@ def main():
         try:
             _n = app._sweep_lan_leftovers()
             if _n:
-                print(f"[*] Removed {_n} leftover LAN bypass route(s) from a "
-                      "previous run - the fresh start is clean.")
+                print(f"[*] Removed {_n.removed} leftover LAN bypass route(s) "
+                      "from a previous run - the fresh start is clean.")
+            elif not _n.ok:
+                print(f"[!] Leftover LAN route sweep incomplete: {_n.err}")
         except Exception as _e:
             print(f"[!] Leftover LAN route sweep skipped: {_e}")
         app.launch()
@@ -10578,7 +11470,39 @@ def main():
         tb = traceback.format_exc()
         try:
             if app is not None:
-                app.stop()
+                # A crash INSIDE a teardown is the common case here, and that is
+                # the one app.stop() could not survive: it takes `_teardown_lock`
+                # (a plain, non-reentrant Lock), and the crashing thread is
+                # usually the one already HOLDING it - _draw_shutdown,
+                # _restore_route_snapshot and every netsh batch all run inside
+                # that `with`. Re-acquiring it is an instant self-deadlock, so
+                # the crash handler hung and the process was killed with every
+                # route still installed - turning a recoverable bug into the
+                # "routing is still on my system" case the watchdog exists for.
+                # Detect it and go straight to the destructive steps, which are
+                # idempotent and need no lock.
+                if _crash_owns_teardown(app):
+                    print("[!] Crashed during teardown - finishing the "
+                          "cleanup directly (the teardown lock is held by "
+                          "this thread).")
+                    try:
+                        app._cleanup_live_routes()
+                    except Exception:
+                        pass
+                    try:
+                        _teardown_wintun()
+                    except Exception:
+                        pass
+                    try:
+                        app._sweep_dns_guard()
+                    except Exception:
+                        pass
+                    try:
+                        app._exit_route_sweep()
+                    except Exception:
+                        pass
+                else:
+                    app.stop()
                 app._restore_console_mode()
         except Exception:
             pass

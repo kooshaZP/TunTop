@@ -9,6 +9,7 @@ is mocked. Run:
 
     python -m unittest tests.unit.test_correctness_pass -v
 """
+import ipaddress
 import os
 import unittest
 from unittest import mock
@@ -22,6 +23,39 @@ from tuntop.tunnel import helper as H
 # ═══════════════════════════════════════════════════════════════════════
 # 1.4  Geoip is DATA, and a country range is never a default route
 # ═══════════════════════════════════════════════════════════════════════
+
+def _varint(value):
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _wire_entry(country, cidrs):
+    """Hand-encode one GeoIPList entry - the v2ray .dat wire format, with no
+    google.protobuf anywhere.
+
+    The pure fallback is the ONLY decoder that runs on a host where protobuf is
+    missing, so a regression in it is invisible to every test that builds its
+    input through the protobuf descriptors: such a test would need protobuf
+    installed AND would only ever exercise the fast path. The layout here is
+    exactly what `_geoip_parse_entry` reads: entry field 1 = country_code,
+    entry field 2 = CIDR{country field 1 = ip bytes, field 2 = prefix}; a
+    prefix of None OMITS field 2 from the wire entirely.
+    """
+    inner = _varint((1 << 3) | 2) + _varint(len(country)) + country.encode()
+    for ip, prefix in cidrs:
+        body = _varint((1 << 3) | 2) + _varint(len(ip)) + ip
+        if prefix is not None:
+            body += _varint((2 << 3) | 0) + _varint(prefix)
+        inner += _varint((2 << 3) | 2) + _varint(len(body)) + body
+    return _varint((1 << 3) | 2) + _varint(len(inner)) + inner
+
 
 class TestGeoPrefixFloor(unittest.TestCase):
     """`/0` rejection was six hardcoded strings; a range this broad installs at
@@ -57,6 +91,53 @@ class TestGeoPrefixFloor(unittest.TestCase):
         for cidr in ("", "not-a-cidr", "1.2.3.4.5/24", "999.0.0.0/8", None):
             with self.subTest(cidr=cidr):
                 self.assertFalse(H._is_routable_bypass_cidr(cidr))
+
+    def test_pure_decoder_enforces_the_v4_floor(self):
+        """The pure-fallback .dat parser emitted a /0 and a /1 verbatim, so on a
+        host WITHOUT `google.protobuf` (the only configuration that runs this
+        decoder) `0.0.0.0/1` and `128.0.0.0/1` - TunTop's OWN split-defaults -
+        reached the sweep. Install drops them, but `dashboard._remove_geo_
+        routes_for` / `_sweep_geo_leftovers` and `cleanup_watchdog.
+        sweep_geo_routes` delete on exact-prefix match with no allow-list, so
+        `[R]` or exiting removed half the tunnel's default set and the traffic
+        silently fell back to the physical NIC. /8 is the floor and must
+        survive: the check must not eat real data."""
+        raw = _wire_entry("cn", [(b"\x00\x00\x00\x00", 0), (b"\x00\x00\x00\x00", 1),
+                                 (b"\x80\x00\x00\x00", 1), (b"\x01\x00\x00\x00", 7),
+                                 (b"\x01\x02\x03\x00", 24), (b"\x0a\x00\x00\x00", 8)])
+        self.assertEqual(geoip._geoip_decode_pure(raw, "cn")["cn"],
+                         ["1.2.3.0/24", "10.0.0.0/8"])
+
+    def test_pure_decoder_enforces_the_v6_floor(self):
+        """`8000::/1` is the other half of TunTop's IPv6 split-default
+        (::/0 + ::/1 + 8000::/1), so the same sweep exposure applies with
+        `_MIN_PREFIXLEN[6] == 16` as the boundary: ::/1 and 8000::/1 out,
+        2400::/16 - genuinely a single country - in."""
+        raw = _wire_entry("cn", [(b"\x00" * 16, 0), (b"\x80\x00" + b"\x00" * 14, 1),
+                                 (b"\x00" * 16, 15),
+                                 (b"\x24\x00" + b"\x00" * 14, 16),
+                                 (b"\x20\x01\x0d\xb8" + b"\x00" * 12, 32)])
+        self.assertEqual(geoip._geoip_decode_pure(raw, "cn")["cn"],
+                         ["2400::/16", "2001:db8::/32"])
+
+    def test_pure_decoder_and_normalise_cidr_agree_on_every_prefix(self):
+        """The floor must live in BOTH decoders, not one. Which validation a
+        .dat gets must not depend on whether `google.protobuf` happens to import
+        on the user's machine - that is a security decision varying by
+        environment. `_geoip_cidr_to_str` is the pure path's gate and used to
+        apply no floor at all; this walks both gates over every in-range prefix
+        length so the two cannot drift apart again. (/32 itself is excluded: this
+        decoder requires plen < maxlen, so it is stricter there than
+        `_normalise_cidr`, which accepts a /32 - unrelated to the floor.)"""
+        for plen in range(0, 32):
+            with self.subTest(prefix=plen):
+                cidr = geoip._geoip_cidr_to_str(b"\x01\x02\x03\x04", plen)
+                text = f"1.2.3.4/{plen}"
+                if plen < geoip._MIN_PREFIXLEN[4]:
+                    self.assertIsNone(cidr, f"pure decoder kept {text}")
+                    self.assertIsNone(geoip._normalise_cidr(text), text)
+                else:
+                    self.assertEqual(cidr, geoip._normalise_cidr(text), text)
 
 
 class TestGeoJsonDecodeIsValidated(unittest.TestCase):
@@ -135,6 +216,148 @@ class TestGeoDiskCacheIsRevalidated(unittest.TestCase):
             with self.subTest(payload=payload):
                 self._write(payload)
                 self.assertIsNone(geoip._geo_disk_load(self._src, "cn"))
+
+
+class TestGeoProtoDecodeIsValidated(unittest.TestCase):
+    """`_geoip_decode_proto` is the ONE decoder that appended `"%s/%d" % (addr,
+    cd.prefix)` with no `_normalise_cidr` call, so it skipped the prefix floor
+    and the canonicalisation every other decoder in the file is gated by.
+
+    Why this branch needs its own class: it only runs when
+    `google.protobuf` imports, i.e. exactly the PRODUCTION configuration. The
+    pure fallback this file's other geoip tests exercise was never the code
+    that was broken, and on a machine without protobuf the fast path is dead
+    code - so without these tests the hole is invisible on any dev box that
+    has not installed protobuf, and live on every real one.
+
+    The failure it pins: `prefix` is LABEL_OPTIONAL, so a .dat entry with the
+    field OMITTED decodes to 0. Install is protected by
+    `helper._is_routable_bypass_cidr`, but the SWEEP is not -
+    `dashboard._remove_geo_routes_for` / `_sweep_geo_leftovers` and
+    `cleanup_watchdog.sweep_geo_routes` canonicalise with
+    `ip_network(strict=False)` and pass the result to `_batch_delete_routes`,
+    so `[R]` or quitting ran `netsh interface ipv4 delete route 0.0.0.0/0` and
+    dropped the machine's default route on every interface, with no error.
+    `--geoip` takes a user file and hand-edited / merged v2rayN databases are
+    normal, so one omitted field was enough."""
+
+    @staticmethod
+    def _cls():
+        """The real v2fly descriptor, or None when protobuf is unavailable."""
+        try:
+            return geoip._build_v2fly_descriptors()
+        except Exception:
+            return None
+
+    def _build(self, cidrs, code="CN"):
+        """Serialise a minimal GeoIPList. `cidrs` is [(ip_bytes, prefix)] where
+        prefix=None means the field is OMITTED from the wire entirely."""
+        cls = self._cls()
+        if cls is None:
+            self.skipTest("google.protobuf is not importable, so the protobuf "
+                          "fast path cannot be constructed on this host")
+        msg = cls()
+        entry = msg.entry.add()
+        entry.country_code = code
+        for ip, prefix in cidrs:
+            c = entry.cidr.add()
+            c.ip = ip
+            if prefix is not None:
+                c.prefix = prefix
+        return msg.SerializeToString()
+
+    def _decode(self, cidrs, code="CN"):
+        return geoip._geoip_decode_proto(self._build(cidrs, code), self._cls(), "cn")
+
+    def test_prefix_less_cidr_is_dropped_not_turned_into_slash_zero(self):
+        # The exact repro: a CIDR message carrying no `prefix` at all. Before
+        # the fix this appended "5.6.7.8/0", which every consumer then
+        # canonicalised to 0.0.0.0/0 and deleted.
+        out = self._decode([(b"\x01\x02\x03\x00", 24), (b"\x05\x06\x07\x08", None)])
+        self.assertEqual(out.get("cn"), ["1.2.3.0/24"])
+        for cidr in out.get("cn", []):
+            self.assertNotEqual(ipaddress.ip_network(cidr, strict=False).prefixlen, 0,
+                                 f"{cidr} canonicalised to a default route")
+
+    def test_v6_prefix_less_cidr_is_dropped_not_turned_into_slash_zero(self):
+        # The 16-byte form of the same hole: the pure fallback rejects it too,
+        # but a ::/0 that slipped through deletes the IPv6 default route.
+        v6 = b"\x20\x01\x0d\xb8" + b"\x00" * 12
+        out = self._decode([(v6, None)])
+        self.assertNotIn("::/0", out.get("cn", []))
+        self.assertEqual(out.get("cn"), [])
+
+    def test_v4_wider_than_the_prefix_floor_is_dropped(self):
+        # /1 and /7 are below _MIN_PREFIXLEN[4] == 8. 0.0.0.0/1 and 128.0.0.1
+        # are TunTop's OWN split-defaults: an entry this broad in a .dat makes
+        # the sweep delete half the tunnel's default set.
+        for prefix in (0, 1, 2, 3, 7):
+            with self.subTest(prefix=prefix):
+                out = self._decode([(b"\x00\x00\x00\x00", prefix)])
+                self.assertEqual(out.get("cn"), [])
+
+    def test_v6_wider_than_the_prefix_floor_is_dropped(self):
+        # 8000::/1 is the other half of TunTop's IPv6 split-default; the
+        # floor for v6 is /16.
+        for prefix in (0, 1, 2, 3, 15):
+            with self.subTest(prefix=prefix):
+                out = self._decode([(b"\x20\x00" + b"\x00" * 14, prefix)])
+                self.assertEqual(out.get("cn"), [])
+
+    def test_ordinary_ranges_survive_and_are_canonicalised(self):
+        # Canonicalisation matters as much as the floor: Get-NetRoute reports
+        # the compressed string, so a non-canonical "1.2.3.4/24" installed as
+        # 1.2.3.0/24 and then failed every identity comparison against the
+        # live route table forever - surviving every sweep (CHANGELOG 1.0.41).
+        v6 = bytes.fromhex("20010db8" + "00" * 12)
+        out = self._decode([(b"\x01\x02\x03\x04", 24), (v6, 32)])
+        self.assertEqual(out["cn"], ["1.2.3.0/24", "2001:db8::/32"])
+
+    def test_fast_path_agrees_with_the_pure_fallback(self):
+        """Two decoders, one policy: the same bytes must decode identically
+        through both, whichever one this host happens to run.
+
+        The real-world failure this pins: `_geoip_decode_pure`'s gate was
+        `_geoip_cidr_to_str`, which rejected plen == 0 and out-of-range but
+        applied no per-family floor, so for the same bytes it emitted
+        `0.0.0.0/1` where the fast path emitted nothing. Which validation a .dat
+        got therefore depended on whether `google.protobuf` imported - a
+        security-relevant decision varying by environment. On a host without
+        protobuf, `0.0.0.0/1` and `128.0.0.0/1` (TunTop's OWN split-defaults,
+        which `dashboard._remove_geo_routes_for` / `_sweep_geo_leftovers` and
+        `cleanup_watchdog.sweep_geo_routes` delete on exact-prefix match with no
+        allow-list) were removed on `[R]` or on exit, and the tunnel's traffic
+        silently fell back to the physical NIC. The `/1` and `/7` cases below
+        are that regression; they used to be excluded here because the two
+        paths provably diverged."""
+        if self._cls() is None:
+            self.skipTest("google.protobuf is not importable, so the protobuf "
+                          "fast path cannot be constructed on this host")
+        v6 = bytes.fromhex("20010db8" + "00" * 12)
+        cases = [
+            ("prefix-less v4", [(b"\x01\x02\x03\x00", 24), (b"\x05\x06\x07\x08", None)],
+             ["1.2.3.0/24"]),
+            ("prefix-less v6", [(v6, None), (v6, 32)], ["2001:db8::/32"]),
+            ("ordinary", [(b"\x01\x02\x03\x04", 24), (v6, 32)],
+             ["1.2.3.0/24", "2001:db8::/32"]),
+            # 0.0.0.0/1 + 128.0.0.0/1 are the split-defaults; below the /8 floor.
+            ("v4 /1 beside a real range",
+             [(b"\x00\x00\x00\x00", 1), (b"\x80\x00\x00\x00", 1),
+              (b"\x01\x02\x03\x04", 24)], ["1.2.3.0/24"]),
+            ("v4 /7 beside a real range",
+             [(b"\x01\x00\x00\x00", 7), (b"\x01\x02\x03\x04", 24)], ["1.2.3.0/24"]),
+            # 8000::/1 is the IPv6 half; the v6 floor is /16.
+            ("v6 /1 beside a real range",
+             [(b"\x80\x00" + b"\x00" * 14, 1), (v6, 32)], ["2001:db8::/32"]),
+        ]
+        for label, cidrs, expected in cases:
+            with self.subTest(case=label):
+                raw = self._build(cidrs)
+                fast = geoip._geoip_decode_proto(raw, self._cls(), "cn")
+                pure = geoip._geoip_decode_pure(raw, "cn")
+                self.assertEqual(fast.get("cn", []), expected)
+                self.assertEqual(pure.get("cn", []), expected)
+                self.assertEqual(fast, pure)
 
 
 class TestGeoFloorIsPinnedInBothLayers(unittest.TestCase):
@@ -220,6 +443,24 @@ class TestNoDoubleSlashInEmbeddedPowerShell(unittest.TestCase):
         joined = "\n".join(scripts)
         self.assertIn("$vpnAliases", joined,
                       "the IPv6 fallback lost its VPN exclusion")
+
+    def test_dns_guard_scripts_carry_no_slash_comments(self):
+        """Every PowerShell the DNS guard emits, including the 1.0.51 boot-task
+        scripts. The boot arm script in particular is a single long line per
+        statement, which is exactly the shape that invites a `//` to be typed
+        by mistake - and a parse error there is invisible until the machine
+        boots and the rule survives the crash it was meant to clear."""
+        scripts = {
+            "install": dns_guard.install_script(["8.8.8.8"], [".local"]),
+            "uninstall": dns_guard.uninstall_script(),
+            "detect": dns_guard.detect_script(),
+            "arm_boot_cleanup": dns_guard.arm_boot_cleanup_script(),
+            "disarm_boot_cleanup": dns_guard.disarm_boot_cleanup_script(),
+            "boot_cleanup_action": dns_guard.boot_cleanup_action(),
+            "foreign_resolvers": dns_guard.foreign_resolvers_script(),
+        }
+        for label, s in scripts.items():
+            self._assert_no_slash_comments(s, f"dns_guard.{label}")
 
 
 class TestPsQuoteIsSingleSourced(unittest.TestCase):
@@ -924,24 +1165,68 @@ class TestGeoDownloaderTransport(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 3b  The guard must not open a leak window on every re-assert
+# 3b  The live catch-all rule must never be deleted, not even briefly
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestGuardWritesBeforeItDeletes(unittest.TestCase):
-    """install_script deleted every TunTop-* key FIRST, so on every self-heal,
-    [N] DNS change and VPN-shadow pass there was a window with no rule at all -
-    i.e. exactly the leak the guard exists to close, reopened on a schedule
-    the tunnel itself drives."""
+    """install_script must keep a catch-all rule installed CONTINUOUSLY.
 
-    def test_the_live_rule_is_written_before_the_stale_sweep(self):
+    Two implementations got this wrong, in order:
+
+    1. It deleted every TunTop-* key FIRST and only then wrote the
+       replacement, so on every self-heal, [N] DNS change and VPN-shadow pass
+       there was a window with no rule at all - i.e. exactly the leak the guard
+       exists to close, reopened on a schedule the tunnel itself drives.
+    2. It staged the replacement under `TunTop-Match.new` and then did
+       `Remove-Item` on the LIVE key followed by `Move-Item`. That narrowed
+       the window to the two statements between them and nothing more - the
+       delete was load-bearing for the swap, because `Move-Item -Force`
+       cannot overwrite an existing directory - so the gap survived the fix
+       and the README row claiming it was "verified" was untrue.
+
+    The current script writes the five values IN PLACE onto `TunTop-Match`,
+    which `New-Item -Force` opens whether or not it exists. The rule is
+    therefore never absent, only ever refreshed.
+    """
+
+    def test_the_live_catch_all_key_is_never_removed(self):
         s = dns_guard.install_script(["8.8.8.8"], [".local"])
-        write_at = s.find("New-ItemProperty -Path $matchNew")
-        sweep_at = s.find("Remove-Item -Recurse -Force -ErrorAction "
-                          "SilentlyContinue", write_at)
-        self.assertGreater(write_at, 0, "the new key is never written")
-        self.assertGreater(sweep_at, write_at,
-                           "the stale sweep still runs before the new rule "
-                           "is in place")
+        for gone in ("Remove-Item -Path $k",
+                     "Move-Item -Path $matchNew",
+                     "$matchNew",
+                     "TunTop-Match.new"):
+            self.assertNotIn(gone, s,
+                             f"the swap-based install is back ({gone!r}): the "
+                             "live catch-all is deleted before its "
+                             "replacement exists, which is a leak window on "
+                             "every re-assert")
+
+    def test_values_are_written_in_place_onto_the_live_key(self):
+        s = dns_guard.install_script(["8.8.8.8"], [".local"])
+        self.assertIn(f"$k = Join-Path $root '{dns_guard.MATCH_KEY}'", s)
+        self.assertIn("New-Item -Path $k -Force", s)
+        for name in ("Version", "Name", "GenericDNSServers",
+                     "ConfigOptions", "Comment"):
+            self.assertIn(f"New-ItemProperty -Path $k -Name '{name}'", s,
+                          f"the {name} value is no longer written in place")
+
+    def test_the_stale_sweep_never_candidates_the_live_key(self):
+        """The sweep is retained - it is what deletes a stale exemption key,
+        and what clears a .new left by a pre-1.0.51 run - but it must exclude
+        the rule that was just written, or a refresh deletes its own pin."""
+        s = dns_guard.install_script(["8.8.8.8"], [".local"])
+        sweep = s.split("Get-ChildItem -Path $root", 1)[1]
+        self.assertIn(f"-ne '{dns_guard.MATCH_KEY}'", sweep)
+        self.assertIn(f"-ne '{dns_guard.EXEMPT_LOCAL_KEY}'", sweep)
+        self.assertLess(s.find("New-ItemProperty -Path $k"),
+                        s.find("Get-ChildItem -Path $root"),
+                        "the sweep still runs before the rule is refreshed")
+
+    def test_a_refresh_keeps_the_exemption_key_continuous_too(self):
+        s = dns_guard.install_script(["8.8.8.8"], [".local"])
+        self.assertIn(f"$ex = Join-Path $root '{dns_guard.EXEMPT_LOCAL_KEY}'",
+                      s)
+        self.assertIn("New-Item -Path $ex -Force", s)
 
 
 # ═══════════════════════════════════════════════════════════════════════

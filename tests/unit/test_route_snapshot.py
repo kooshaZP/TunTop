@@ -146,8 +146,23 @@ class TestFastDumpIntegration(unittest.TestCase):
 
 
 class TestShutdownVerifyDedupe(unittest.TestCase):
-    """Verify _shutdown_with_progress's verify loop doesn't redundantly dump
-    the routing table (mock _ps / high-level methods — no Windows)."""
+    """Bound the number of live routing-table reads a [Q] quit performs
+    (mock _ps / high-level methods — no Windows).
+
+    The budget changed shape when the verify loop was rebuilt. It used to
+    answer its three questions with three reads per attempt — two PowerShell
+    processes inside _count_wintun_routes (one per tunnel adapter) plus a full
+    Get-NetRoute dump for the geo count — and then "dedupe" by NOT re-reading
+    on a retry. Now every attempt takes ONE read and counts wintun, geo and LAN
+    rows out of it in Python, so a retry genuinely re-measures instead of
+    trusting the previous pass.
+
+    The floor is therefore 2 on a clean quit: one read shared by the geo and LAN
+    task sweeps, and one read for the verification - which cannot reuse the
+    first, because the sweeps deleted routes in between. The number these tests
+    actually protect is the retry count: a verify attempt must cost one read,
+    not three, and must not grow without bound.
+    """
 
     def _app(self):
         app = dashboard.BTopTui.__new__(dashboard.BTopTui)
@@ -172,7 +187,7 @@ class TestShutdownVerifyDedupe(unittest.TestCase):
         stack.enter_context(mock.patch.object(
             dashboard.BTopTui, "_count_wintun_routes", return_value=count_wintun))
         if isinstance(tun2socks, list):
-            # Pad with the last value so every call (loop break check + final
+            # Pad the list so every call (loop break check + final
             # post-loop check) gets a value without StopIteration.
             side = list(tun2socks) + [tun2socks[-1]] * 3
             stack.enter_context(mock.patch.object(
@@ -186,13 +201,15 @@ class TestShutdownVerifyDedupe(unittest.TestCase):
         stack.enter_context(mock.patch.object(
             app, "_geo_sweep_cidrs", return_value=set()))
         sweep = stack.enter_context(mock.patch.object(
-            app, "_sweep_geo_leftovers", return_value=0))
+            app, "_sweep_geo_leftovers",
+            return_value=dashboard.SweepResult.clean(0, 0)))
         stack.enter_context(mock.patch.object(
             app, "_shutdown_teardown_wintun", lambda: None))
         stack.enter_context(mock.patch.object(
-            app, "_sweep_lan_leftovers", return_value=0))
+            app, "_sweep_lan_leftovers",
+            return_value=dashboard.SweepResult.clean(0, 0)))
         stack.enter_context(mock.patch.object(
-            app, "_final_host_route_sweep", return_value=None))
+            app, "_final_host_route_sweep", return_value=True))
         stack.enter_context(mock.patch.object(
             app, "_restore_route_snapshot", return_value=(0, 0)))
         stack.enter_context(mock.patch(
@@ -201,29 +218,34 @@ class TestShutdownVerifyDedupe(unittest.TestCase):
             "tuntop.ui.dashboard.time.sleep"))
         return {"dump": dump, "sweep": sweep}
 
-    def test_clean_table_dumps_at_most_once(self):
-        """Clean table (0 wintun, 0 geo, no tun2socks) → loop breaks on
-        attempt 0. _dump_route_table is called once (by _leftover_geo_routes);
-        _sweep_geo_leftovers is called once (task list, NOT verify retry)."""
+    def test_clean_table_costs_two_reads_and_stops(self):
+        """Clean table (0 wintun, 0 geo, no tun2socks) → the verify loop breaks
+        on attempt 0. Two reads total: one shared by the geo+LAN task sweeps,
+        one for the verification (which cannot reuse the first - the sweeps
+        deleted routes in between). The task-list sweep runs ONCE; the verify
+        loop does not re-invoke it."""
         app = self._app()
         m = self._patch_all(app)
         app._shutdown_with_progress()
-        self.assertLessEqual(m["dump"].call_count, 1)
+        self.assertLessEqual(m["dump"].call_count, 2)
         self.assertEqual(m["sweep"].call_count, 1)
 
-    def test_clean_table_with_tun2socks_dumps_at_most_once(self):
-        """Clean table but tun2socks alive — loop goes to attempt 1 to kill
-        it, yet the dedup prevents a SECOND full-table dump (old code re-dumped
-        via _sweep_geo_leftovers on attempt 1)."""
+    def test_a_tun2socks_retry_costs_one_extra_read(self):
+        """Clean table but tun2socks alive — the loop goes to attempt 1 to kill
+        it, costing exactly ONE more read (the old code spent two PowerShell
+        spawns on _count_wintun_routes plus a geo dump on EVERY attempt)."""
         app = self._app()
         m = self._patch_all(app, tun2socks=[True, False])
         app._shutdown_with_progress()
-        self.assertLessEqual(m["dump"].call_count, 1)
+        self.assertLessEqual(m["dump"].call_count, 3)
         self.assertEqual(m["sweep"].call_count, 1)
 
-    def test_geo_leftovers_triggers_re_sweep(self):
-        """When geo leftovers exist, the verify loop MUST re-sweep on
-        retry (dedup only skips re-sweeping a clean table)."""
+    def test_geo_leftovers_are_deleted_on_retry(self):
+        """When geo leftovers exist, the verify loop MUST act on them and then
+        re-measure. It no longer re-invokes the whole sweep (which re-dumped
+        and re-matched the entire table to remove the one row that was left);
+        it deletes exactly the rows it just measured, which is what the retry
+        is for."""
         app = self._app()
         geo_row = [{"DestinationPrefix": "1.2.0.0/16",
                     "InterfaceAlias": "Wi-Fi", "NextHop": ""}]
@@ -237,16 +259,18 @@ class TestShutdownVerifyDedupe(unittest.TestCase):
             app, "_dump_route_table", side_effect=[geo_row, geo_row, []]))
         stack.enter_context(mock.patch.object(
             app, "_geo_sweep_cidrs", return_value={"1.2.0.0/16"}))
-        stack.enter_context(mock.patch.object(
-            app, "_batch_delete_routes", return_value=1))
+        delete = stack.enter_context(mock.patch.object(
+            app, "_batch_delete_routes",
+            return_value=dashboard.SweepResult.clean(1, 1)))
         sweep = stack.enter_context(mock.patch.object(
             app, "_sweep_geo_leftovers", wraps=app._sweep_geo_leftovers))
         stack.enter_context(mock.patch.object(
             app, "_shutdown_teardown_wintun", lambda: None))
         stack.enter_context(mock.patch.object(
-            app, "_sweep_lan_leftovers", return_value=0))
+            app, "_sweep_lan_leftovers",
+            return_value=dashboard.SweepResult.clean(0, 0)))
         stack.enter_context(mock.patch.object(
-            app, "_final_host_route_sweep", return_value=None))
+            app, "_final_host_route_sweep", return_value=True))
         stack.enter_context(mock.patch.object(
             app, "_restore_route_snapshot", return_value=(0, 0)))
         stack.enter_context(mock.patch(
@@ -254,11 +278,18 @@ class TestShutdownVerifyDedupe(unittest.TestCase):
         stack.enter_context(mock.patch(
             "tuntop.ui.dashboard.time.sleep"))
         app._shutdown_with_progress()
-        # Attempt 0 dumps to find geo leftovers; attempt 1 re-sweeps after
-        # the count pass. Each retry dumps at least once.
+        # Attempt 0 measures the geo leftover; the loop then deletes exactly
+        # that row and attempt 1 re-measures to confirm it is gone. Each
+        # attempt costs one read.
         self.assertGreaterEqual(dump.call_count, 2)
-        # _sweep_geo_leftovers called from the task list + at least one retry.
-        self.assertGreaterEqual(sweep.call_count, 2)
+        # The retry deleted the MEASURED row, rather than re-invoking the
+        # whole sweep (which would have re-dumped and re-matched the entire
+        # table to remove one route).
+        delete.assert_called()
+        self.assertIn(("1.2.0.0/16", "Wi-Fi", ""),
+                      delete.call_args[0][0])
+        # The task-list sweep still ran exactly once.
+        self.assertEqual(sweep.call_count, 1)
 
 
 class TestRestoreRouteSnapshot(unittest.TestCase):

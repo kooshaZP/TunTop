@@ -27,6 +27,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(
 from tuntop.network import dns_guard as G
 
 
+#: Canned output for the one-shot boot-cleanup task (1.0.51). Answered by the
+#: shared fake runner BY DEFAULT, so a test that only cares about the NRPT rule
+#: does not have to enumerate the extra arm/disarm calls install() and
+#: uninstall() now make. `per_script` is still consulted first, so a test can
+#: override either marker.
+_BOOT_STUBS = (
+    ("Register-ScheduledTask", "DNS_GUARD_BOOT_ARMED"),
+    ("Unregister-ScheduledTask", "DNS_GUARD_BOOT_DISARMED"),
+)
+
+
 def _runner(output, ok=True, calls=None, per_script=None):
     """A stand-in for routing._ps that records the scripts it was given.
 
@@ -42,8 +53,23 @@ def _runner(output, ok=True, calls=None, per_script=None):
             for needle, out in per_script.items():
                 if needle in script:
                     return ok, out
+        for needle, out in _BOOT_STUBS:
+            if needle in script:
+                return ok, out
         return ok, output
     return _run
+
+
+def nrpt_calls(calls):
+    """The recorded calls that touch the NRPT store, boot-task scripts removed.
+
+    install() arms the one-shot startup task BEFORE it writes a single NRPT
+    value, and uninstall() disarms it after a confirmed removal - so a raw
+    call index no longer identifies the rule script. Filtering by what the
+    script actually is keeps those assertions about the RULE about the rule.
+    """
+    return [c for c in calls
+            if not any(needle in c for needle, _out in _BOOT_STUBS)]
 
 
 class TestRuleIdentity(unittest.TestCase):
@@ -379,8 +405,8 @@ class TestInstall(unittest.TestCase):
                 path=os.path.join(d, "s.json"))
             self.assertTrue(ok)
             # detect first, then the removal - never the install script.
-            self.assertNotIn("DNS_GUARD_OK", calls[-1])
-            self.assertIn("Remove-Item", calls[-1])
+            self.assertNotIn("DNS_GUARD_OK", nrpt_calls(calls)[-1])
+            self.assertIn("Remove-Item", nrpt_calls(calls)[-1])
 
     def test_uninstall_with_no_verdict_fails_closed(self):
         """A sweep that reports NEITHER marker must NOT be called a success.
@@ -408,7 +434,7 @@ class TestInstall(unittest.TestCase):
         G.install(["8.8.8.8", "2606:4700:4700::1111"],
                   runner=_runner("DNS_GUARD_OK", calls=calls),
                   path=os.path.join(tempfile.mkdtemp(), "s.json"))
-        self.assertIn("8.8.8.8;2606:4700:4700::1111", calls[0])
+        self.assertIn("8.8.8.8;2606:4700:4700::1111", nrpt_calls(calls)[0])
 
     def test_an_unwritable_record_is_reported_not_swallowed(self):
         """The rule IS live when save_state fails (read-only install dir), so
@@ -419,6 +445,21 @@ class TestInstall(unittest.TestCase):
                             runner=_runner("DNS_GUARD_OK"), path=missing)
         self.assertTrue(ok)
         self.assertIn("no install record", msg)
+
+    def test_every_loss_is_reported_not_just_the_first(self):
+        """An unwritable record and an unarmed task are independent. A caller
+        that only hears about the record has no idea the rule is also not
+        crash-safe - which is the fact that decides whether the next power cut
+        costs a reboot."""
+        missing = os.path.join(tempfile.mkdtemp(), "no", "such", "dir", "s.json")
+        ok, msg = G.install(
+            ["8.8.8.8"],
+            runner=_runner("DNS_GUARD_OK", per_script={
+                "Register-ScheduledTask": "DNS_GUARD_BOOT_FAIL:denied"}),
+            path=missing)
+        self.assertTrue(ok)
+        self.assertIn("no install record", msg)
+        self.assertIn("crash-safe", msg)
 
 
 class TestUninstallAndEnsure(unittest.TestCase):
@@ -519,9 +560,9 @@ class TestUninstallAndEnsure(unittest.TestCase):
                     "DNS_GUARD_REMOVED": "DNS_GUARD_REMOVED",
                 }),
                 path=os.path.join(d, "s.json"))
-            self.assertTrue(ok)
-            self.assertEqual(len(calls), 2)
-            self.assertIn("Remove-Item", calls[1])
+        self.assertTrue(ok)
+        self.assertEqual(len(nrpt_calls(calls)), 2)
+        self.assertIn("Remove-Item", nrpt_calls(calls)[1])
 
     def test_uninstall_script_proves_the_store_is_readable(self):
         """An unreadable DnsPolicyConfig must be a FAILURE, not an empty one.
@@ -541,7 +582,7 @@ class TestUninstallAndEnsure(unittest.TestCase):
                                 [".local"],
                                 runner=_runner("DNS_GUARD_OK", calls=calls),
                                 path=os.path.join(d, "s.json"))
-        self.assertIn("1.1.1.1;2606:4700:4700::1001", calls[0])
+        self.assertIn("1.1.1.1;2606:4700:4700::1001", nrpt_calls(calls)[0])
 
     def test_ensure_installed_without_resolver_removes(self):
         calls = []
@@ -720,7 +761,7 @@ class TestInstallRecordOwnership(unittest.TestCase):
             runner=_runner("DNS_GUARD_REMOVED", calls=calls), path=path,
             force=True)
         self.assertTrue(ok)
-        self.assertIn("Remove-Item", calls[-1])
+        self.assertIn("Remove-Item", nrpt_calls(calls)[-1])
         self.assertIsNone(G.load_state(path=path))
 
     def test_recovery_owner_forces_removal(self):
@@ -1083,11 +1124,19 @@ class TestWatchdogOutlivesTheSession(unittest.TestCase):
         self.assertIn("still running", main)
 
     def test_the_sweep_still_removes_the_guard(self):
-        """The end the whole thing exists for."""
+        """The end the whole thing exists for.
+
+        The watchdog must DELEGATE the removal to startup_recovery rather
+        than reimplement it - one implementation of the sweep, so the
+        watchdog only ever decides WHEN to run it. The delegation is
+        `recover_ex` (which also reports whether every step succeeded, so a
+        failed step can veto the "system is clean" marker clear); `recover`
+        remains the same call with the verdict discarded.
+        """
         from tuntop.core import cleanup_watchdog
         src = open(cleanup_watchdog.__file__, encoding="utf-8").read()
         self.assertIn("scan(", src)
-        self.assertIn("recover(", src)
+        self.assertIn("recover_ex(", src)
         self.assertTrue(hasattr(cleanup_watchdog, "sweep_after_unclean_exit"))
 
     def test_the_watchdog_is_spawned_without_the_console(self):
@@ -1684,6 +1733,303 @@ class TestDnsConfigurationCheckUnknown(unittest.TestCase):
         ok, msg = self._run([(False, "reachable OUTSIDE the tunnel")])
         self.assertFalse(ok)
         self.assertIn("NOT pinned", msg)
+
+
+class TestBootCleanupTask(unittest.TestCase):
+    """The one-shot AtStartup task - the only removal owner that survives a
+    BSOD or a power cut.
+
+    Everything else in this module is a process. The catch-all rule is a
+    registry entry under HKLM, so when the machine dies mid-session the rule
+    does not: name resolution is then pinned to a tunnel that is not there,
+    with no user logged in, and the documented way out is a command line flag
+    on a machine with no network. This is the mechanism that closes that, so
+    these tests are about the properties that make it WORK, not about the
+    shape of the script text.
+    """
+
+    # ── the action body ───────────────────────────────────────────────────
+
+    def test_the_action_is_self_contained(self):
+        """The single most important property, and the one a later edit is
+        most likely to break. The action runs as SYSTEM at a boot the user
+        cannot influence, possibly weeks after the crash that made it
+        necessary - by which time the app may have been moved, replaced or
+        deleted. A task whose action cannot be found fails SILENTLY: the
+        machine stays broken while Task Scheduler shows a healthy task."""
+        a = G.boot_cleanup_action().lower()
+        for forbidden in ("tuntop.exe", "python", "executable", "sys.",
+                          "_mei", "appdata", "temp"):
+            self.assertNotIn(forbidden, a,
+                             f"the boot action names {forbidden!r} - it will "
+                             "not be resolvable at the boot that needs it")
+
+    def test_the_action_carries_no_double_quote(self):
+        """The action travels base64-encoded precisely so no quoting layer can
+        mangle it, but a double quote would still break the one place the text
+        is used verbatim (reading the task definition back for diagnostics),
+        and it buys nothing in a PowerShell body."""
+        self.assertNotIn('"', G.boot_cleanup_action())
+
+    def test_the_action_removes_the_rule_the_record_and_flushes(self):
+        a = G.boot_cleanup_action()
+        self.assertIn("DnsPolicyConfig", a)
+        self.assertIn(f"-like '{G.GUARD_KEY_PREFIX}*'", a)
+        self.assertIn("Remove-Item -Recurse -Force", a)
+        self.assertIn("Clear-DnsClientCache", a)
+        # The install record has to go too, or dns_guard_present() reports a
+        # leftover on every future launch forever.
+        self.assertIn("Remove-Item -LiteralPath", a)
+        self.assertIn(G.state_path(), a)
+
+    def test_the_action_never_fails_loudly(self):
+        """It runs with no console and no user watching; a thrown error is
+        invisible, so the body must be incapable of raising."""
+        self.assertTrue(G.boot_cleanup_action().startswith(
+            "$ErrorActionPreference = 'SilentlyContinue'"))
+        self.assertIn("-ErrorAction SilentlyContinue",
+                      G.boot_cleanup_action())
+
+    def test_the_action_only_touches_our_own_keys(self):
+        """A corporate VPN's or DirectAccess's NRPT rule must survive. The
+        filter is the same TunTop-* prefix uninstall_script() uses, and the
+        invariant is asserted here because a future edit to the body is the
+        one place it can silently be lost."""
+        a = G.boot_cleanup_action()
+        self.assertIn(f"'{G.GUARD_KEY_PREFIX}*'", a)
+        self.assertNotIn("-like '*'", a)   # never a blanket wildcard
+
+    # ── the arm / disarm scripts ──────────────────────────────────────────
+
+    def test_arm_registers_a_one_shot_at_startup_task_as_system(self):
+        s = G.arm_boot_cleanup_script()
+        self.assertIn("Register-ScheduledTask", s)
+        self.assertIn("-TaskName $task", s)
+        self.assertIn("New-ScheduledTaskTrigger -AtStartup", s)
+        self.assertIn("-UserId 'SYSTEM'", s)
+        self.assertIn("-RunLevel Highest", s)
+        # The whole lifecycle is bounded by the guard's own: the task deletes
+        # itself the moment it has run, so it can never accumulate or re-fire.
+        self.assertIn("-DeleteExpiredTaskAfter (New-TimeSpan -Seconds 0)", s)
+        self.assertIn(G.BOOT_TASK_NAME, s)
+
+    def test_arm_is_idempotent(self):
+        """The guard is re-asserted on every self-heal cycle and every live [N]
+        DNS change, so registration has to be a replace, not an add - a
+        duplicate-registration failure would otherwise turn every re-assert
+        into a "not crash-safe" warning."""
+        self.assertIn("Register-ScheduledTask", G.arm_boot_cleanup_script())
+        self.assertIn("-Force", G.arm_boot_cleanup_script())
+
+    def test_arm_verifies_the_task_actually_exists(self):
+        """A constrained or disabled Task Scheduler can accept
+        Register-ScheduledTask and register nothing. Trusting its exit would
+        report the machine crash-safe when it is not - the exact silent no-op
+        this whole mechanism exists to avoid."""
+        s = G.arm_boot_cleanup_script()
+        self.assertIn("Get-ScheduledTask -TaskName $task", s)
+        self.assertIn("DNS_GUARD_BOOT_ARMED", s)
+        self.assertIn("DNS_GUARD_BOOT_FAIL", s)
+
+    def test_the_action_reaches_the_task_base64_intact(self):
+        """Round-trip through the transport. Quoting a PowerShell body inside
+        another PowerShell literal is the classic way to ship a task that is
+        registered and does nothing; base64 is what makes it exact."""
+        import base64
+        import re as _re
+        s = G.arm_boot_cleanup_script("C:/t/x.json")
+        m = _re.search(r"-EncodedCommand ([A-Za-z0-9+/=]+)", s)
+        self.assertIsNotNone(m, "the action is not carried as -EncodedCommand")
+        decoded = base64.b64decode(m.group(1)).decode("utf-16-le")
+        self.assertEqual(decoded, G.boot_cleanup_action("C:/t/x.json"))
+
+    def test_disarm_unregisters_and_treats_absent_as_success(self):
+        s = G.disarm_boot_cleanup_script()
+        self.assertIn("Unregister-ScheduledTask", s)
+        self.assertIn("Get-ScheduledTask", s)
+        self.assertIn("DNS_GUARD_BOOT_DISARMED", s)
+
+    # ── wiring: install() / uninstall() / detect() ────────────────────────
+
+    def test_install_arms_before_it_writes_any_nrpt_value(self):
+        """The whole design rests on this order. Arming after the write leaves
+        a window in which a live catch-all rule has nothing registered to
+        remove it - i.e. exactly the crash scenario the task exists for."""
+        calls = []
+        G.install(["8.8.8.8"],
+                  runner=_runner("DNS_GUARD_OK", calls=calls),
+                  path=os.path.join(tempfile.mkdtemp(), "s.json"))
+        arm = [i for i, c in enumerate(calls) if "Register-ScheduledTask" in c]
+        rule = [i for i, c in enumerate(calls)
+                if "New-ItemProperty -Path $k" in c]
+        self.assertTrue(arm, "install() never armed the boot task")
+        self.assertTrue(rule, "install() never wrote the rule")
+        self.assertLess(arm[0], rule[0],
+                        "the boot task is armed AFTER the rule is written - a "
+                        "crash in between leaves a pin with no cleanup")
+
+    def test_install_reports_a_failed_arm_without_failing_the_install(self):
+        """The guard is still worth having without crash safety, and refusing
+        to bring the tunnel up would be worse than the leak. But the loss must
+        be said out loud, not swallowed."""
+        with tempfile.TemporaryDirectory() as d:
+            ok, msg = G.install(
+                ["8.8.8.8"],
+                runner=_runner("DNS_GUARD_OK", per_script={
+                    "Register-ScheduledTask": "DNS_GUARD_BOOT_FAIL:access "
+                                              "denied"}),
+                path=os.path.join(d, "s.json"))
+        self.assertTrue(ok, "a failed arm must not fail the install")
+        self.assertIn("crash", msg.lower())
+        self.assertIn("access denied", msg)
+
+    def test_a_failed_arm_is_recorded_so_diagnostics_can_explain_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.json")
+            G.install(["8.8.8.8"],
+                      runner=_runner("DNS_GUARD_OK", per_script={
+                          "Register-ScheduledTask":
+                              "DNS_GUARD_BOOT_FAIL:Task Scheduler disabled"}),
+                      path=path)
+            self.assertEqual(G.load_state(path=path).get("boot_armed"), False)
+
+    def test_a_successful_arm_is_recorded(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.json")
+            G.install(["8.8.8.8"], runner=_runner("DNS_GUARD_OK"), path=path)
+            self.assertIs(G.load_state(path=path).get("boot_armed"), True)
+
+    def test_install_failure_never_disarms(self):
+        """The asymmetry is deliberate and load-bearing. A failed refresh can
+        still leave the PREVIOUS rule live (values are written in place), and
+        a rule with no task is the unsafe direction. A task with no rule is
+        harmless: it fires once, finds nothing, deletes itself."""
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            ok, _msg = G.install(
+                ["8.8.8.8"],
+                runner=_runner("DNS_GUARD_FAIL:denied", calls=calls),
+                path=os.path.join(d, "s.json"))
+        self.assertFalse(ok)
+        self.assertTrue(any("Register-ScheduledTask" in c for c in calls))
+        self.assertFalse(any("Unregister-ScheduledTask" in c for c in calls),
+                         "a failed install disarmed the boot task - a "
+                         "surviving rule would then survive a crash too")
+
+    def test_uninstall_disarms_only_after_a_confirmed_removal(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.json")
+            G.save_state(["8.8.8.8"], path=path)
+            ok, msg = G.uninstall(runner=_runner("DNS_GUARD_REMOVED",
+                                                calls=calls), path=path)
+        self.assertTrue(ok)
+        self.assertTrue(any("Unregister-ScheduledTask" in c for c in calls))
+        self.assertIn("disarmed", msg)
+
+    def test_a_failed_removal_keeps_the_task_armed(self):
+        for output, ok_expected in (("", False),          # no verdict
+                                    ("DNS_GUARD_UNINSTALL_FAIL:locked", False)):
+            with self.subTest(output=output):
+                calls = []
+                with tempfile.TemporaryDirectory() as d:
+                    path = os.path.join(d, "s.json")
+                    G.save_state(["8.8.8.8"], path=path)
+                    ok, _msg = G.uninstall(runner=_runner(output, calls=calls),
+                                          path=path)
+                    # Read INSIDE the temp dir - the record has to have
+                    # survived, and it does not exist once the dir is gone.
+                    survived = G.load_state(path=path) is not None
+                self.assertEqual(ok, ok_expected)
+                self.assertFalse(
+                    any("Unregister-ScheduledTask" in c for c in calls),
+                    "the task was disarmed while the rule may still be live")
+                self.assertTrue(survived)
+
+    def test_a_disarm_failure_is_reported_but_not_fatal(self):
+        """The removal itself succeeded. Failing it over a leftover task would
+        tell the operator their DNS is still pinned when it is not - and the
+        task is provably harmless."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.json")
+            G.save_state(["8.8.8.8"], path=path)
+            ok, msg = G.uninstall(
+                runner=_runner("DNS_GUARD_REMOVED", per_script={
+                    "Unregister-ScheduledTask":
+                        "DNS_GUARD_BOOT_DISARM_FAIL:denied"}),
+                path=path)
+        self.assertTrue(ok)
+        self.assertIn(G.BOOT_TASK_NAME, msg)
+        self.assertIn("Unregister-ScheduledTask", msg)
+
+    def test_arm_and_disarm_never_raise(self):
+        def boom(script, timeout=8):
+            raise OSError("powershell missing")
+        for fn in (G.arm_boot_cleanup, G.disarm_boot_cleanup):
+            with self.subTest(fn=fn.__name__):
+                ok, msg = fn(runner=boom)
+                self.assertFalse(ok)
+                self.assertIn("powershell missing", msg)
+
+    # ── detect() ──────────────────────────────────────────────────────────
+
+    def test_detect_reports_the_boot_task_state(self):
+        self.assertIn("Get-ScheduledTask -TaskName", G.detect_script())
+        self.assertIn("boot=", G.detect_script())
+        st = G.parse_detect("DNS_GUARD_STATE:keys=1,match=1,effective=true,"
+                            "boot=true,servers=8.8.8.8")
+        self.assertIs(st["boot"], True)
+
+    def test_boot_rides_the_existing_spawn(self):
+        """The health row reads this on every tick, so it must not have cost
+        an extra PowerShell spawn - which on an AV-scanned machine is 1-3s."""
+        s = G.detect_script()
+        self.assertEqual(s.count("Get-ScheduledTask"), 1)
+        self.assertIn("DNS_GUARD_STATE:", s)
+
+    def test_an_absent_boot_field_is_read_as_not_armed(self):
+        """Not back-compat-patched to True. A line emitted before the field
+        existed means the probe ran on something that cannot see Task
+        Scheduler, and the honest direction is "not crash-safe"."""
+        st = G.parse_detect("DNS_GUARD_STATE:keys=1,match=1,"
+                            "effective=true,servers=8.8.8.8")
+        self.assertIs(st["boot"], False)
+        self.assertIs(st["ok"], True)
+
+    def test_boot_does_not_change_the_ok_verdict(self):
+        """`ok` answers "is DNS protected right now". The task answers "will
+        it survive a crash" - a different question, and folding it in would
+        turn every working install on a machine with a disabled Task Scheduler
+        into a red health row."""
+        armed = G.parse_detect("DNS_GUARD_STATE:keys=1,match=1,"
+                               "effective=true,boot=true,servers=8.8.8.8")
+        bare = G.parse_detect("DNS_GUARD_STATE:keys=1,match=1,"
+                              "effective=true,boot=false,servers=8.8.8.8")
+        self.assertEqual(armed["ok"], bare["ok"])
+        self.assertTrue(armed["ok"])
+
+    # ── the install record ────────────────────────────────────────────────
+
+    def test_a_v1_record_loads_without_raising(self):
+        """Records written before 1.0.51 have no boot_armed key, and they are
+        read by startup recovery and the diagnostics on a machine that is
+        exactly the one in trouble."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "installed": True,
+                           "resolvers": ["8.8.8.8"]}, f)
+            rec = G.load_state(path=path)
+        self.assertIsNotNone(rec)
+        self.assertIs(rec["boot_armed"], False)
+
+    def test_detect_script_boot_field_costs_no_extra_shell(self):
+        """detect() is called by the health row, the re-assert and [D]; it must
+        stay one spawn."""
+        calls = []
+        G.detect(runner=_runner("DNS_GUARD_STATE:keys=0,match=0,"
+                                "effective=false,boot=false", calls=calls))
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

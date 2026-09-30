@@ -3,15 +3,40 @@
 Usage:  python build_release.py
         python build_release.py --version 1.0.0
         python build_release.py --with-exe        # also build TunTop.exe (needs pyinstaller)
-        python build_release.py --with-exe --onedir   # AV-friendlier exe layout
+        python build_release.py --with-exe --onefile   # single self-extracting exe (NOT default)
         python build_release.py --with-exe --defender-exclude
 
-Produces dist/TunTop-x64.zip containing everything needed to run TunTop
-(the vendored binaries are included so the download is fully self-contained),
-plus dist/checksums.txt with a SHA-256 for every PUBLISHED artifact
-(TunTop-x64.zip, and TunTop.exe when --with-exe produced one). The vendored
-binaries ship inside the zip but are not release assets, so they are not
-checksummed.
+ONEDIR IS THE DEFAULT (1.0.51)
+------------------------------
+`--with-exe` builds the onedir layout - dist/TunTop/ with the exe plus its
+support files - and publishes it as TunTop-<version>-x64-standalone.zip.
+
+That is a change from 1.0.50, where `--with-exe` produced the single
+self-extracting onefile unless `--onedir` was passed. It is no longer a
+taste question. The onefile bootloader unpacks an unsigned payload to a temp
+dir on every start, which is the exact behaviour profile Defender's ML model
+keys on, and the flag had become reliably reproducible rather than occasional:
+a local 1.0.50 build was quarantined as Trojan:Win32/Bearfoos.A!ml mid-session,
+with the parent exe AND four child processes flagged. `TunTop.spec` already
+documented onefile as "the single most AV-false-positive-prone PyInstaller
+layout"; this just stops shipping it by default.
+
+The alternative fix - an AV exclusion - is NOT the default and should not be.
+TunTop rewrites the host's routing table, so a blanket repo exclusion is a
+broad hole in the one tool the user is relying on. Changing the LAYOUT removes
+the actual trigger and needs no exclusion at all. `--defender-exclude` remains
+available for a one-off local build, and says so.
+
+`--onefile` still builds the old layout for anyone who needs a single file to
+hand around; `--onedir` is accepted and is now a no-op, so existing scripts and
+instructions do not break.
+
+Produces dist/TunTop-x64.zip containing everything needed to run TunTop from
+source (the vendored binaries are included so the download is fully
+self-contained), plus dist/TunTop-<version>-x64-standalone.zip for the onedir
+build, plus dist/checksums.txt with a SHA-256 for every PUBLISHED artifact.
+The vendored binaries ship inside the zip but are not release assets, so they
+are not checksummed on their own.
 
 Pure stdlib, no pip dependencies (PyInstaller is optional and only used for
 the --with-exe step).
@@ -115,12 +140,52 @@ def should_exclude(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_PATTERNS)
 
 
-def build_exe(onedir: bool = False) -> str | None:
-    """Build TunTop.exe with PyInstaller. onedir=False (default) produces the
-    classic single dist/TunTop.exe (onefile); onedir=True produces
-    dist/TunTop/ (exe + support files) - the AV-friendlier layout. Returns
-    the artifact path (the exe itself), or None if PyInstaller is not
-    available. Raises on build failure."""
+def _clean_onedir_output(onedir: bool = True) -> None:
+    """Remove build output that a previous run left in dist/ and that this run
+    will NOT rebuild. Extracted so it is directly testable - the two artifacts
+    it clears are both dangerous to leave next to a fresh release:
+
+    * dist/TunTop/ - PyInstaller's COLLECT merges into an existing directory,
+      so a file dropped from the spec (or left by an older build) survives into
+      the new tree. The whole directory is digested as part of the release
+      artifact, so a stale file would ship INSIDE the published hash with no
+      way to tell it was not in the build.
+    * dist/TunTop.exe - a previous release's self-extracting onefile. This run
+      does not rebuild it, and it is the larger of the two files named
+      TunTop.exe, so a user reaching into dist/ for this release can pick the
+      quarantinable one without any signal that they did.
+
+    No-op when onedir=False: that path DOES rebuild dist/TunTop.exe, and
+    deleting it there would make the opt-out layout unbuildable. Never raises -
+    a locked file is a nuisance, not a build failure."""
+    if not onedir:
+        return
+    stale_tree = os.path.join(DIST, "TunTop")
+    if os.path.isdir(stale_tree):
+        shutil.rmtree(stale_tree, ignore_errors=True)
+    stale_onefile = os.path.join(DIST, "TunTop.exe")
+    if os.path.isfile(stale_onefile):
+        try:
+            os.remove(stale_onefile)
+            print("  ~ removed a stale onefile dist/TunTop.exe - this release "
+                  "ships the onedir layout, not that binary")
+        except OSError as e:
+            print(f"  ! could not remove the stale onefile dist/TunTop.exe "
+                  f"({e}) - DELETE IT BY HAND so it is not mistaken for this "
+                  "release's artifact")
+
+
+def build_exe(onedir: bool = True) -> str | None:
+    """Build TunTop with PyInstaller. onedir=True (the DEFAULT since 1.0.51)
+    produces dist/TunTop/ (exe + support files) and is then zipped for
+    release; onedir=False produces the classic single dist/TunTop.exe (onefile),
+    which is now opt-in because its temp-dir self-extraction is what gets the
+    unsigned build quarantined. Returns the built EXE path in BOTH layouts: the
+    onedir FOLDER is the release artifact (main() takes dirname() of this to
+    zip it), but _guard_exe() exists to watch one file through the scanner's
+    verdict window, and handing it a directory made os.path.isfile() false for
+    every copy - so a perfectly healthy onedir build reported itself
+    quarantined. None if PyInstaller is unavailable. Raises on build failure."""
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
@@ -131,6 +196,9 @@ def build_exe(onedir: bool = False) -> str | None:
     if not os.path.isfile(spec):
         print("  ! TunTop.spec missing - cannot build TunTop.exe")
         return None
+    if onedir:
+        # Clear whatever a previous run left that this one will not rebuild.
+        _clean_onedir_output(onedir=True)
     print("  * Building TunTop.exe with PyInstaller ("
           + ("onedir" if onedir else "onefile") + ") ...")
     cmd = [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm"]
@@ -169,7 +237,12 @@ def build_exe(onedir: bool = False) -> str | None:
         # They must NOT be overwritten here: the versioned backup /
         # standalone names belong to the ONEFILE variant, and clobbering
         # them with the (much smaller) onedir exe would corrupt the backup
-        # set. The onedir folder itself is the artifact.
+        # set. The onedir FOLDER is the artifact, but the EXE is what this
+        # function returns: _guard_exe() exists to watch one file through the
+        # scanner's verdict window, and handing it a directory made
+        # os.path.isfile() false for every copy - so the onedir build reported
+        # itself quarantined even when it was sitting there. main() takes the
+        # directory from dirname() of this when it needs to zip it.
         print("  * onedir artifact: " + exe)
         return exe
     # Two protected copies, written IMMEDIATELY (before the scan completes):
@@ -181,6 +254,39 @@ def build_exe(onedir: bool = False) -> str | None:
     print(f"  * Protected copies: {os.path.basename(keep)}, "
           f"{os.path.basename(fallback)}")
     return exe
+
+
+def zip_onedir(folder: str, version: str) -> str | None:
+    """Zip a built onedir directory into the distributable release asset.
+
+    A directory cannot be published as a GitHub Release asset, and it cannot
+    sensibly be checksummed as one file either - so the zip IS the artifact
+    users download, and its bytes are what checksums.txt promises.
+
+    Deliberately applies NO EXCLUDE_PATTERNS. Those are a SOURCE-tree hygiene
+    list (no __pycache__, no .pyc, no saved profiles, no diagnostic dumps) and
+    they are correct for build_zip(), which walks the repo. This walks
+    PyInstaller's own output, where `_internal/` legitimately contains
+    __pycache__ directories and compiled modules that the app REQUIRES at
+    runtime. Filtering them here would produce a zip that installs and then
+    fails to start - the worst possible outcome for the one layout we ship
+    precisely because it is meant to work.
+    """
+    if not folder or not os.path.isdir(folder):
+        return None
+    os.makedirs(DIST, exist_ok=True)
+    name = f"TunTop-{version}-x64-standalone.zip"
+    path = os.path.join(DIST, name)
+    base = os.path.dirname(folder.rstrip("\\/"))
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for dirpath, dirnames, filenames in os.walk(folder):
+            dirnames.sort()
+            for fname in sorted(filenames):
+                full = os.path.join(dirpath, fname)
+                arc = os.path.relpath(full, base).replace("\\", "/")
+                zf.write(full, arc)
+    print(f"  = {name}")
+    return path
 
 
 def _mirror(src: str, dst: str) -> bool:
@@ -223,16 +329,21 @@ def _restore_all(targets, sources) -> int:
 
 
 _AV_HELP = (
-    "  ! dist/TunTop.exe did not survive the build: an AV (Defender) most\n"
-    "    likely quarantined it. Recover it:\n"
+    "  ! The built exe did not survive: an AV (Defender) most likely\n"
+    "    quarantined it. The path checked is named above.\n"
+    "    BEST FIX - change the layout, no AV configuration required:\n"
+    "      python build_release.py --with-exe\n"
+    "    (onedir is the default since 1.0.51; the self-extracting onefile is\n"
+    "    what gets flagged, and only --onefile asks for it back.)\n"
+    "    If you already built onefile, recover the quarantined file:\n"
     "      Windows Security -> Virus & threat protection -> Protection history\n"
-    "      -> TunTop.exe -> Actions -> Restore\n"
-    "    then add folder exclusions BEFORE rebuilding (admin PowerShell):\n"
-    "      Add-MpPreference -ExclusionPath '<repo>'\n"
+    "      -> the exe -> Actions -> Restore\n"
+    "    LAST RESORT - an AV exclusion. This is a broad hole: TunTop rewrites\n"
+    "    the host routing table, so excluding the build directory also stops\n"
+    "    Defender watching every future artifact written into it. Prefer the\n"
+    "    layout change.\n"
     "      Add-MpPreference -ExclusionPath '<repo>\\dist'\n"
-    "    or build the AV-friendly onedir variant:\n"
-    "      python build_release.py --onedir\n"
-    "    The published GitHub-Release exe is unaffected (built on CI).")
+    "    The published GitHub-Release artifacts are built on CI.")
 
 
 def _guard_exe(exe: str, version: str, timeout: float = 45.0,
@@ -283,12 +394,25 @@ def _guard_exe(exe: str, version: str, timeout: float = 45.0,
 
 
 def try_defender_exclusion(paths=None) -> bool:
-    """OPT-IN, best effort: add `paths` (default: repo root + dist/) to
-    Defender's exclusion list so the freshly-built unsigned exe is not
-    quarantined DURING the build. Needs an elevated shell - without one the
-    manual PowerShell is printed and nothing is changed. Never raises."""
+    """OPT-IN, LAST RESORT, best effort: add `paths` (default: repo root +
+    dist/) to Defender's exclusion list so a freshly-built unsigned onefile is
+    not quarantined DURING the build. Needs an elevated shell - without one the
+    manual PowerShell is printed and nothing is changed. Never raises.
+
+    Read this before using it. A folder exclusion is not scoped to this build:
+    it tells Defender to stop watching every file created under that path,
+    from now on, including anything a later compromised build drops there. For
+    a tool whose whole job is rewriting the host's routing table and DNS, that
+    is a worse trade than the quarantine it prevents. The layout fix -- the
+    onedir build, which does not self-extract -- removes the trigger without
+    any exclusion at all, and is now the default. This exists for the
+    deliberate one-off case where someone genuinely needs a single-file exe and
+    is building it locally.
+    """
     if paths is None:
-        paths = [ROOT, DIST]
+        # dist/ ONLY, not the repo root. The root exclusion was the broader of
+        # the two and bought nothing extra: the build writes only to dist/.
+        paths = [DIST]
     ps = ("; ".join(f"Add-MpPreference -ExclusionPath '{p}'" for p in paths)
           + "; if ($?) { 'TUNTOP_EXCLUSION_OK' }")
     try:
@@ -372,6 +496,37 @@ def build_zip(version: str) -> str:
     return zip_path
 
 
+def dir_digest(path: str) -> tuple:
+    """A stable SHA-256 over a DIRECTORY's contents, plus its total byte count.
+
+    Needed because the onedir artifact is a directory. `write_checksums` used
+    to gate on `os.path.isfile(ap)`, so a directory was SKIPPED SILENTLY and
+    the published standalone build shipped with no checksum line at all - the
+    one claim in the whole release process that users are told to verify, gone
+    for exactly the artifact that replaced the quarantined exe.
+
+    The digest covers each file's path AND its content, with paths sorted and
+    separators normalised to '/', so it is reproducible across machines and
+    does not depend on directory-walk order. Renaming, adding, removing or
+    editing any file changes the digest.
+    """
+    entries = []
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames.sort()
+        for fname in sorted(filenames):
+            full = os.path.join(dirpath, fname)
+            rel = os.path.relpath(full, path).replace("\\", "/")
+            size = os.path.getsize(full)
+            total += size
+            entries.append(f"{rel} {sha256_file(full)} {size}")
+    h = hashlib.sha256()
+    for line in entries:
+        h.update(line.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest(), total, len(entries)
+
+
 def write_checksums(version: str, artifacts: list[str]) -> str:
     """Write SHA-256 checksums for every shipped artifact."""
     path = os.path.join(DIST, "checksums.txt")
@@ -379,29 +534,74 @@ def write_checksums(version: str, artifacts: list[str]) -> str:
         f.write(f"SHA-256 checksums for TunTop {version}\n")
         f.write("=" * 50 + "\n")
         for ap in artifacts:
-            if os.path.isfile(ap):
+            if os.path.isdir(ap):
+                # A directory cannot be hashed as one file, so the line is a
+                # CONTENT digest over the whole tree (see dir_digest). Say so
+                # explicitly, or a user running `certutil -hashfile` on the
+                # folder name gets nothing back and assumes the file is corrupt.
+                h, size, n = dir_digest(ap)
+                f.write(f"{h}  {os.path.basename(ap)}/  "
+                        f"({n} files, {size:,} bytes - content digest: hash "
+                        f"the packaged zip instead)\n")
+            elif os.path.isfile(ap):
                 h = sha256_file(ap)
                 size = os.path.getsize(ap)
                 f.write(f"{h}  {os.path.basename(ap)}  ({size:,} bytes)\n")
+            else:
+                # Never reached in practice (main() only ever appends paths
+                # that were just built), but a silently-skipped artifact is
+                # the failure mode that produced a checksum file promising
+                # less than the release page offered.
+                print(f"  ! artifact missing, not checksummed: {ap}")
     return path
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI. Extracted from main() so the flag semantics are testable
+    without building anything - the default layout in particular is a
+    behavioural contract (see the module docstring), not an implementation
+    detail, and it has to be assertable."""
     ap = argparse.ArgumentParser(description="Build TunTop release")
     ap.add_argument("--version", default=None,
                     help="Version string (default: read from __init__.py)")
     ap.add_argument("--with-exe", action="store_true",
-                    help="Also build TunTop.exe via PyInstaller (optional)")
-    ap.add_argument("--onedir", action="store_true",
-                    help="Build the AV-friendly onedir layout "
-                         "(dist/TunTop/ with the exe + support files) "
-                         "instead of the single self-extracting onefile - "
-                         "dramatically fewer AV false positives")
+                    help="Also build TunTop via PyInstaller (optional). "
+                         "Builds the ONEDIR layout by default and publishes "
+                         "it as TunTop-<version>-x64-standalone.zip")
+    # Mutually exclusive so the contradiction is rejected BY THE PARSER, with
+    # a usage message, instead of by a branch in main() that a future edit can
+    # drop. Silently preferring one flag is how a user ends up shipping the
+    # layout they were trying to avoid.
+    layout = ap.add_mutually_exclusive_group()
+    layout.add_argument("--onedir", action="store_true",
+                        help="(no-op since 1.0.51 - onedir is now the "
+                             "default. Accepted so existing scripts and "
+                             "instructions keep working)")
+    layout.add_argument("--onefile", action="store_true",
+                        help="Build the single SELF-EXTRACTING exe instead. "
+                             "This is what gets quarantined: the onefile "
+                             "bootloader unpacks an unsigned payload to a temp "
+                             "dir on every start, which is the profile "
+                             "Defender's ML model keys on. Opt in only if you "
+                             "need one file to hand around")
     ap.add_argument("--defender-exclude", action="store_true",
-                    help="Best-effort: add this repo and dist/ to Defender's "
-                         "exclusion list first (needs an elevated shell; "
-                         "otherwise the manual command is printed)")
+                    help="LAST RESORT, best effort: add dist/ to Defender's "
+                         "exclusion list before building (needs an elevated "
+                         "shell; otherwise the manual command is printed). A "
+                         "folder exclusion stops Defender watching every "
+                         "future file written there, so prefer the default "
+                         "onedir layout, which needs no exclusion")
+    return ap
+
+
+def main():
+    ap = build_parser()
     args = ap.parse_args()
+
+    # onedir unless onefile was explicitly asked for.
+    onedir = not args.onefile
+    if args.onedir:
+        print("  i --onedir is the default since 1.0.51; nothing to do.")
 
     version = args.version or get_version()
     print(f"Building TunTop {version} release ...")
@@ -423,14 +623,30 @@ def main():
     exe_built = False
 
     if args.with_exe:
-        exe = build_exe(onedir=args.onedir)
+        exe = build_exe(onedir=onedir)
         if exe:
             # Defender routinely quarantines a freshly-written unsigned exe
-            # within seconds (longer for onefile); keep every copy alive
-            # through the scan window and return the best surviving one.
-            exe = _guard_exe(exe, version, protect=not args.onedir)
+            # within seconds (much more reliably for onefile); keep every copy
+            # alive through the scan window and return the best surviving one.
+            exe = _guard_exe(exe, version, protect=not onedir)
             if exe:
-                artifacts.append(exe)
+                if onedir:
+                    # _guard_exe returns the EXE, so the onedir DIRECTORY is
+                    # one level up from it. Zip it: a directory is not a
+                    # release asset, and the zip is what users download and
+                    # verify. The directory itself is checksummed as a content
+                    # digest, so the checksummed name is `TunTop/`, distinct
+                    # from the onefile `TunTop.exe`.
+                    folder = os.path.dirname(exe)
+                    zipped = zip_onedir(folder, version)
+                    if not zipped:
+                        print("ERROR: the onedir build produced no "
+                              "distributable zip.", file=sys.stderr)
+                        raise SystemExit(1)
+                    artifacts.append(zipped)
+                    artifacts.append(folder)
+                else:
+                    artifacts.append(exe)
                 exe_built = True
 
     if args.with_exe and not exe_built:
@@ -443,7 +659,9 @@ def main():
         # failure, not a warning.
         print("ERROR: --with-exe was requested but no exe artifact was "
               "produced (PyInstaller unavailable, TunTop.spec missing, or an "
-              "AV quarantined every copy).", file=sys.stderr)
+              "AV quarantined every copy). The default layout is onedir - if "
+              "you passed --onefile, drop it; that layout is the one AVs "
+              "quarantine.", file=sys.stderr)
         raise SystemExit(1)
 
     checksum_path = write_checksums(version, artifacts)

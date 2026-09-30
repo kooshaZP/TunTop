@@ -11,8 +11,12 @@ implementation that replaces all of those name-based kills.
 Ownership rules - a tun2socks* process belongs to TunTop iff ANY holds:
 
   1. its PID was recorded from TunTop's own Popen handles this session
-     (the caller passes them in; PID reuse is inherently guarded because
-     the enumeration only sees processes whose image name is tun2socks*);
+     (the caller passes them in as `recorded`). NOTE this rule only ever
+     fires for a caller that actually passes PIDs: the helper holds
+     tun2socks's Popen handle, but the dashboard and the watchdog only ever
+     observe the helper, so they rely on rules 2 and 3. Every caller MUST
+     pass `recorded` whenever it has the handle - a bare `kill_own()` gets
+     rule 3 alone.
   2. its ExecutablePath equals the tun2socks path TunTop was configured
      to run (--tun2socks), compared case/separator-insensitively;
   3. its executable's file name is the distinctive vendored name
@@ -101,6 +105,8 @@ def enumerate_tun2socks() -> list:
             "cmd": str(d.get("CommandLine") or ""),
         })
     return rows
+
+
 def _norm(path: str) -> str:
     """Platform-independent case/separator-insensitive absolute form.
 
@@ -109,13 +115,19 @@ def _norm(path: str) -> str:
     ``C:\\Tools\\TUN2SOCKS.EXE`` is left upper-case and split on the wrong
     char there, making the ownership test broken rather than "stricter") -
     this lowercases and treats BOTH ``/`` and ``\\`` as separators on EVERY
-    platform, then anchors relative paths to ``os.getcwd()``.
+    platform.
 
-    The output is therefore identical on Linux, macOS and Windows: the same
-    input always yields the same normalized string and the same ownership
-    verdict regardless of host. Runtime behavior on Windows is unchanged in
-    verdict because every comparison in ``select_own`` flows through this same
-    normalizer on both sides.
+    The separator and case handling really is host-independent, and that is
+    what makes the ownership test RUNNABLE on Linux: a Windows path can be
+    fed in and compared without a Windows box. So is the absolute-path step,
+    because a DRIVE-LETTER path is recognised as already-absolute and
+    returned unchanged - which is what Windows' own abspath() does with it.
+    Without that, a Windows ``C:/Tools/x.exe`` normalized to
+    ``<cwd>/C:/Tools/x.exe`` on POSIX, so the same input produced a different
+    string per host and the location test could not be exercised off
+    Windows at all (it silently depended on the test's own working
+    directory). Anything without a drive letter is a POSIX path or a
+    genuinely relative one, and is resolved as before.
 
     A bare filename (no separator) has no directory component to resolve, so
     its canonical form is the lowercased name itself - this keeps the
@@ -127,9 +139,17 @@ def _norm(path: str) -> str:
         p = str(path).replace("\\", "/").lower()
         if "/" not in p:
             return p
+        if _DRIVE_RE.match(p):
+            return p          # already absolute, on every host
         return os.path.abspath(p).replace("\\", "/").lower()
     except Exception:
         return ""
+
+
+#: A Windows drive-qualified path (``c:/tools/x.exe``). ``os.path.abspath``
+#: leaves these untouched on Windows, so skipping it elsewhere is what makes
+#: the normalized form identical on every host.
+_DRIVE_RE = re.compile(r"^[a-z]:/")
 
 
 #: A PyInstaller onefile extraction dir: %TEMP%\_MEIxxxxxx. The frozen
@@ -151,32 +171,48 @@ def _norm_dir(path: str) -> str:
 
 def _tuntop_owned_locations():
     """Directories TunTop itself puts binaries in: next to TunTop.exe (frozen),
-    next to this package (source run), plus the PyInstaller extraction root."""
+    or next to the application root derived from this package (source run).
+
+    Every entry is derived from EITHER the frozen executable's location or
+    this module's own location on disk. That is the whole point: ownership
+    must follow from something TunTop controls, never from ambient state.
+
+    Two entries that used to be here are deliberately GONE:
+
+    ``os.getcwd()`` - the directory the user happened to launch from. It is
+    user-controlled, not TunTop-controlled: every installer, ``cd``-then-run
+    habit and "open Terminal here" makes it different. Worse, it is the
+    *most* common place to drop a downloaded tool, so a foreign upstream
+    tun2socks.exe sitting in the folder TunTop was started from was treated
+    as TunTop's and killed on every teardown. The coverage it was added for
+    is now provided structurally by the APP_ROOT entry below, which is the
+    real root rather than whatever the shell happened to be sitting in.
+
+    ``%TEMP%`` / ``%TMP%`` - shared with every other application and user on
+    the machine. Anything can unpack a binary there; v2rayN/xray/nekoray
+    unpack their vendored copies into temp dirs by design. The PyInstaller
+    case that entry was presumably added for is already covered by _MEI_RE
+    (a frozen run's child really does live in ``%TEMP%\\_MEIxxxxxx``), which
+    is an exact pattern match instead of a blanket directory.
+    """
     locs = []
     exe = getattr(sys, "executable", "") or ""
     if exe and getattr(sys, "frozen", False):
         locs.append(os.path.dirname(os.path.abspath(exe)))
-    # Source run: this module's own dir, its PARENT PACKAGE dir, and the
-    # CWD. The naming trap worth stating: __file__ is tuntop/network/
-    # procguard.py, so pkg_dir below is ``tuntop/network`` and the second
-    # entry is ``tuntop/`` - the PACKAGE dir, NOT the app/repo root, which
-    # is one level further up. So the release zip (binaries written into
-    # ``tuntop/``) is covered by the second entry, while a git checkout
-    # (binaries at the repo root, none inside the package) is covered only
-    # by the CWD entry - which is why launchers Set-Location to the root.
+    # Source run. The naming trap worth stating: __file__ is tuntop/network/
+    # procguard.py, so pkg_dir below is ``tuntop/network``, its parent is
+    # ``tuntop/`` (the PACKAGE dir - the release zip writes binaries there),
+    # and APP_ROOT is one level further up (a git checkout, whose binaries sit
+    # beside the package rather than inside it). Deriving the root from
+    # __file__ instead of os.getcwd() covers both layouts on every host with
+    # no reliance on the launcher's working directory.
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    pkg_root = os.path.dirname(pkg_dir)
     locs.append(pkg_dir)
-    locs.append(os.path.dirname(pkg_dir))
-    try:
-        locs.append(os.getcwd())
-    except Exception:
-        pass
-    try:
-        tmp = os.environ.get("TEMP") or os.environ.get("TMP") or ""
-        if tmp:
-            locs.append(tmp)
-    except Exception:
-        pass
+    locs.append(pkg_root)
+    app_root = os.path.dirname(pkg_root)
+    if app_root:
+        locs.append(app_root)
     return {_norm_dir(p) for p in locs if p}
 
 
@@ -219,8 +255,10 @@ def select_own(rows: list, tun2socks_path=None, recorded=()) -> list:
             continue
         exe = str(r.get("exe") or "")
         exe_norm = _norm(exe)
-        # No path available (can happen for protected processes): fall back
-        # to the image name itself.
+        # A row with no readable path still has an image name, and the name
+        # is what rule 3's first half compares. The location half is then
+        # what decides it - and with no path, _is_tuntop_location("") is
+        # False, so a pathless row can only ever be ours via a recorded PID.
         base = (os.path.basename(exe_norm) if exe_norm
                 else str(r.get("name") or "").lower())
         if r.get("pid") in recorded_ids:
@@ -232,10 +270,19 @@ def select_own(rows: list, tun2socks_path=None, recorded=()) -> list:
         # Rule 3: the vendored NAME, but only from a directory TunTop put
         # it in. The name alone is the upstream release asset name, so
         # matching it anywhere would kill another application's proxy.
-        if base == _norm(TUN2SOCKS_BINARY) and (
-                _is_tuntop_location(exe_norm)
-                or not exe_norm          # no path at all: recorded PIDs only
-                or os.path.dirname(exe_norm) in _tuntop_owned_locations()):
+        #
+        # The LOCATION half is not optional and cannot be softened. The
+        # previous version also accepted `or not exe_norm` ("no path at
+        # all") - but CIM reports an EMPTY ExecutablePath precisely when it
+        # cannot open the process, i.e. for the elevated/other-user case,
+        # so that clause selected exactly the processes whose identity
+        # could not be established: any upstream-named proxy running
+        # elevated got taskkill /F /T on every teardown. The inline comment
+        # said "recorded PIDs only", but rule 1 above has already claimed
+        # and `continue`d on every recorded PID, so nothing reaching this
+        # line is a recorded PID. With no path there is no proof of
+        # location, and no proof means NOT OURS.
+        if base == _norm(TUN2SOCKS_BINARY) and _is_tuntop_location(exe_norm):
             own.append(r)
     return own
 

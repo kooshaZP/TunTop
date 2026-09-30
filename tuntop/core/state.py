@@ -317,6 +317,11 @@ class TunnelStateMachine:
         `force=True` bypasses the graph check but still validates the type
         and still records/announces the event - escape hatch for genuinely
         exceptional paths, not for normal control flow.
+
+        A non-TunnelState target raises TypeError and is deliberately NOT
+        counted as a rejection: `rejected` is an operational diagnostic for
+        "a caller wants a state the graph does not allow from here", and a
+        programming error folded into it would bury the real signal.
         """
         if not isinstance(target, TunnelState):
             raise TypeError("target must be a TunnelState, got "

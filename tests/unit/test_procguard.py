@@ -85,15 +85,118 @@ class TestSelectOwn(unittest.TestCase):
         rows = [row(4242, name="notepad.exe", exe="C:\\Windows\\notepad.exe")]
         self.assertEqual(procguard.select_own(rows, recorded=[4242]), [])
 
-    def test_no_path_falls_back_to_image_name(self):
+    def test_no_path_is_never_owned_without_a_recorded_pid(self):
+        """An unreadable path proves NOTHING about location, so it is not ours.
+
+        The old body of this test asserted the opposite - that a
+        pathless vendored-named process IS selected - which is precisely the
+        bug: CIM reports an empty ExecutablePath exactly when it cannot open
+        the process (another user, elevated), so that clause selected the
+        processes whose identity could not be established, and killed a
+        foreign upstream proxy on every teardown. The inline comment it
+        implemented said "recorded PIDs only" while the code matched any
+        name; rule 1 already claims recorded PIDs and `continue`s, so a
+        pathless row can only ever be ours via a recorded PID.
+        """
         rows = [row(13, name="tun2socks-windows-amd64-v3.exe", exe="")]
-        self.assertEqual([r["pid"] for r in procguard.select_own(rows)], [13])
+        self.assertEqual(procguard.select_own(rows), [])
+        # ...and a generic pathless name was never ours either.
         rows2 = [row(14, name="tun2socks.exe", exe="")]
         self.assertEqual(procguard.select_own(rows2), [])
+        # Rule 1 still rescues it: this PID came from our own Popen handle.
+        self.assertEqual([r["pid"] for r in
+                          procguard.select_own(rows, recorded=[13])], [13])
+
+    def test_a_path_normalized_to_empty_is_not_owned(self):
+        """A path that exists but cannot be normalized must not become
+        '' and thereby satisfy the old `not exe_norm` escape hatch."""
+        rows = [row(21, name="tun2socks-windows-amd64-v3.exe",
+                    exe="C:\\TunTop\\tun2socks-windows-amd64-v3.exe")]
+        with mock.patch.object(procguard, "_norm", return_value=""):
+            self.assertEqual(procguard.select_own(rows), [])
+            # ...still ours via a recorded PID, since rule 1 runs first.
+            self.assertEqual([r["pid"] for r in
+                              procguard.select_own(rows, recorded=[21])], [21])
+
+    def test_temp_and_cwd_are_not_tuntop_owned_locations(self):
+        """%TEMP% and the launch directory are user-controlled, not
+        TunTop-controlled.
+
+        %TEMP% is shared with every other application (v2rayN/xray/nekoray
+        unpack their vendored copies into temp dirs by design), and the
+        working directory is wherever the user happened to be - also the
+        most common place to drop a downloaded tool. Both used to be in
+        _tuntop_owned_locations, so a foreign upstream-named tun2socks
+        sitting in either was treated as TunTop's and killed. The frozen
+        case those entries were meant to cover is matched exactly by
+        _MEI_RE instead.
+        """
+        import os
+        locs = procguard._tuntop_owned_locations()
+        for env in ("TEMP", "TMP"):
+            tmp = os.environ.get(env)
+            if tmp:
+                self.assertNotIn(tmp.replace("\\", "/").rstrip("/").lower(),
+                                 locs)
+        # The CWD is no longer consulted at all. Running the tests from the
+        # repo root would otherwise pass trivially, because that root is a
+        # genuine owned location via app_root - so point the CWD somewhere
+        # unrelated and require that it still confers no ownership.
+        unrelated = os.path.join(os.sep, "Users", "someone", "Downloads")
+        with mock.patch.object(procguard.os, "getcwd", return_value=unrelated):
+            self.assertNotIn(procguard._norm_dir(unrelated),
+                             procguard._tuntop_owned_locations())
+        # A foreign upstream-named tun2socks in the launch directory is not
+        # ours - this is the case that used to be selected for killing.
+        rows = [row(41, exe=os.path.join(
+            unrelated, "tun2socks-windows-amd64-v3.exe"))]
+        with mock.patch.object(procguard.os, "getcwd", return_value=unrelated):
+            self.assertEqual(procguard.select_own(rows), [])
+
+    def test_app_root_is_an_owned_location(self):
+        """The coverage the CWD entry used to provide is now structural:
+        a git checkout keeps its binaries at the repo root, one level above
+        the package, and that root is derived from __file__ - not from
+        whatever directory the launcher happened to Set-Location into."""
+        import os
+        import tuntop.network as _pkg
+        repo_root = os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(_pkg.__file__))))
+        self.assertIn(procguard._norm_dir(repo_root),
+                      procguard._tuntop_owned_locations())
+        rows = [row(31, exe=os.path.join(
+            repo_root, "tun2socks-windows-amd64-v3.exe"))]
+        self.assertEqual([r["pid"] for r in
+                          procguard.select_own(rows)], [31])
 
     def test_empty_rows(self):
         self.assertEqual(procguard.select_own([]), [])
         self.assertEqual(procguard.select_own(None), [])
+
+    def test_absolute_windows_paths_normalize_the_same_on_every_host(self):
+        """A drive-qualified path is already absolute, so it must NOT be
+        resolved against the process's working directory.
+
+        `os.path.abspath` leaves it alone on Windows but prepends the CWD on
+        POSIX, which made the location test's verdict depend on the test
+        runner's working directory - untestable off Windows, and untestable
+        honestly anywhere. This asserts the cross-host property the
+        docstring claims, from two different working directories.
+        """
+        import os
+        p = r"C:\v2rayN\bin\tun2socks-windows-amd64-v3.exe"
+        results = []
+        for cwd in (r"C:\somewhere", "/tmp", os.getcwd()):
+            with mock.patch.object(procguard.os, "getcwd", return_value=cwd):
+                results.append(procguard._norm(p))
+        self.assertEqual(len(set(results)), 1, results)
+        self.assertEqual(results[0],
+                         "c:/v2rayn/bin/tun2socks-windows-amd64-v3.exe")
+
+    def test_a_foreign_absolute_windows_path_is_not_owned(self):
+        # Now assertable directly on Linux, which is the point of the above.
+        rows = [row(51, exe=r"D:\v2rayN\bin\tun2socks-windows-amd64-v3.exe")]
+        self.assertEqual(procguard.select_own(rows), [])
 
 
 class TestCountAndKill(unittest.TestCase):

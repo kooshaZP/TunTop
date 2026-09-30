@@ -44,6 +44,8 @@ import tempfile          # sweep batch files - eager, see _MEI note
 import time
 import traceback         # sweep failure diagnosis (full stack in the log)
 
+from tuntop import procidentity   # PID identity, not just liveness
+
 # When executed as a script (`python cleanup_watchdog.py --pid N`), the
 # package root is NOT on sys.path (sys.path[0] is this file's directory).
 # Fix that before importing anything from the tuntop package.
@@ -53,7 +55,7 @@ if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 
 from tuntop.startup_recovery import (  # noqa: E402
-    MARKER_FILE, clear_marker, read_marker, recover, scan,
+    MARKER_FILE, clear_marker, read_marker, recover_ex, scan,
 )
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -96,6 +98,21 @@ else:
 
 
 _LOG_SEEN: set = set()
+
+
+def _state_path(marker_path: str) -> str:
+    """The live-session state sidecar that goes with `marker_path`.
+
+    The sidecar lives NEXT TO the crash marker - the dashboard writes both to
+    the same directory, and that directory is where the exe is when frozen.
+    It was derived twice by hand (a str.replace in one place, an
+    os.path.join in the other) and the fallback branch read the module-level
+    STATE_FILE, which is derived from sys.executable / __file__ instead: with
+    a `--marker` pointing somewhere else, the merge silently read a file from
+    the WRONG DIRECTORY and the live bypass/geo state was lost - the routes
+    the sweep was supposed to know about. One derivation, one answer."""
+    return os.path.join(os.path.dirname(os.path.abspath(marker_path)),
+                        os.path.basename(STATE_FILE))
 
 
 def read_live_state(path: str = STATE_FILE) -> dict:
@@ -194,13 +211,53 @@ def wait_for_exit(pid: int, timeout_s: float = None) -> bool:
         return False
 
 
-def kill_pid(pid: int, log=None) -> bool:
+def _helper_start(marker_path, helper_pid):
+    """The creation time the marker recorded for `helper_pid`, or None.
+
+    Two ways to get None, and both are deliberately permissive (see
+    kill_pid): the marker may predate identity tracking, or the PID being
+    killed did not come from the marker at all (it arrived on the command
+    line). A key that is ABSENT cannot contradict anything; a key that is
+    PRESENT for a DIFFERENT pid could, so that case is treated as absent
+    rather than trusted.
+    """
+    try:
+        marker = read_marker(marker_path) or {}
+        if int(marker.get("helper_pid", 0) or 0) != int(helper_pid):
+            return None
+        recorded = marker.get("helper_started")
+        return int(recorded) if recorded else None
+    except Exception:
+        return None
+
+
+def kill_pid(pid: int, log=None, recorded_start=None) -> bool:
     """Forcefully stop the helper process tree (helper + its tun2socks
     children). taskkill /T is tried first because it takes the whole tree
-    in one shot; raw TerminateProcess is the fallback. Best-effort."""
+    in one shot; raw TerminateProcess is the fallback. Best-effort.
+
+    IDENTITY GATE. `taskkill /F /T` on a bare PID is the single most
+    destructive thing this watchdog can do, and the PID came off disk from a
+    crash marker that may be from a previous boot - after which the number
+    plausibly belongs to something else entirely (a browser, another VPN
+    client), and /T would take its whole tree with it. So a `recorded_start`
+    creation time must be supplied and must match before anything is
+    killed. Refusing is always the right answer here: the helper dying is
+    harmless, an unrelated process tree being force-terminated is not.
+
+    An older marker with no `helper_started` still kills, or a crash whose
+    helper genuinely died would be left running - so absence of the key is
+    allowed, while a key that is present and DISAGREES is fatal to the kill.
+    """
     if not pid or int(pid) <= 0:
         return False
     if not sys.platform.startswith("win"):
+        return False
+    if recorded_start is not None and \
+            not procidentity.same_process(pid, recorded_start):
+        _log(f"watchdog: PID {pid} is no longer the helper this marker "
+             f"recorded (creation time differs) - refusing to kill it",
+             log)
         return False
     try:
         rc = subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
@@ -248,12 +305,59 @@ def _lan_victims(rows, iface, gw):
     return lan_victims(rows, iface, gw, prefixes=LAN_BYPASS_PREFIXES)
 
 
+#: Total wall-clock budget for the geo sweep's chunked netsh deletes. It used
+#: to be per-chunk (180 s EACH), so 4096 leftover routes was 16 chunks and up
+#: to 48 minutes of a half-cleaned table - while default traffic still pointed
+#: into a dead tunnel. Past the budget the sweep gives up and RETAINS the
+#: marker, which is the fail-safe direction: the next launch retries from
+#: scratch instead of inheriting a sweep that never finished.
+_GEO_SWEEP_BUDGET_SECONDS = 300.0
+
+
+def _live_rows(timeout=90):
+    """The live routing table as row dicts, via the FAST text dump.
+
+    Both sweeps used to read the table with
+    `Get-NetRoute ... | ConvertTo-Json`, and that was wrong twice over:
+
+      * TIMEOUT. The call went through `routing._ps` with no `timeout`, so it
+        inherited _ps's default of EIGHT seconds - while the `netsh` deletes in
+        the very same functions were allowed 120 s and 180 s. Over a table
+        with thousands of leftover geo routes, i.e. exactly the crash this
+        watchdog exists to clean up, ConvertTo-Json exceeds 8 s, raises
+        TimeoutExpired, and the outer `except Exception` turned the whole
+        sweep into a None. None means "the marker is RETAINED", so the safety
+        net reported a failure, removed nothing, and left every route
+        installed - the one situation it exists for.
+      * COST. routing._dump_route_table_ps() was written for the dashboard
+        precisely because ConvertTo-Json is the bottleneck on large tables
+        (PowerShell 5.1 serialises big object arrays slowly), and it defaults
+        to a 90 s timeout.
+
+    Returns [] for a genuinely empty table and **None** when the table could
+    not be read at all. The difference is load-bearing: "found nothing" lets
+    the caller retire the crash marker, "could not look" must not.
+    """
+    try:
+        import tuntop.network.routing as routing
+        ok, out = routing._dump_route_table_ps(timeout=timeout)
+    except Exception:
+        return None
+    if not ok:
+        return None
+    try:
+        return routing._parse_route_rows(out)
+    except Exception:
+        return None
+
+
 def sweep_lan_routes(log=None) -> int:
     """Remove leftover LAN bypass routes from the PHYSICAL adapter. They are
     benign on the network where they were installed (they point at the same
     gateway Windows uses anyway) but stale after a network change, so a
     crash followed by switching Wi-Fi would otherwise keep routing RFC1918
-    traffic at the old gateway. Returns how many were removed."""
+    traffic at the old gateway. Returns how many were removed, or None when
+    the sweep could not be trusted."""
     log = log or (lambda m: None)
     try:
         import tuntop.network.routing as routing
@@ -261,16 +365,11 @@ def sweep_lan_routes(log=None) -> int:
         if not def_gw:
             return 0
         iface, gw = def_gw[0], def_gw[1]
-        ok, out = routing._ps(
-            "Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
-            "Select-Object DestinationPrefix,InterfaceAlias,NextHop | "
-            "ConvertTo-Json -Compress -Depth 2")
-        rows = []
-        if ok and out.strip():
-            data = json.loads(out)
-            if isinstance(data, dict):
-                data = [data]
-            rows = data
+        rows = _live_rows()
+        if rows is None:
+            _log("watchdog: could not read the routing table for the LAN "
+                 "sweep - marker retained", log)
+            return None
         victims = _lan_victims(rows, iface, gw)
         if not victims:
             return 0
@@ -281,15 +380,43 @@ def sweep_lan_routes(log=None) -> int:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
-            subprocess.run(["netsh", "-f", tmp],
-                           capture_output=True, timeout=120,
-                           creationflags=_NO_WINDOW)
+            try:
+                proc = subprocess.run(["netsh", "-f", tmp],
+                                      capture_output=True, timeout=120,
+                                      creationflags=_NO_WINDOW)
+            except subprocess.TimeoutExpired:
+                _log(f"watchdog: LAN sweep timed out - {len(victims)} "
+                     f"route(s) may remain, marker retained", log)
+                return None
         finally:
             try:
                 os.unlink(tmp)
             except Exception:
                 pass
-        return len(victims)
+        # netsh -f reports per-line failures in its OUTPUT and still exits 0,
+        # while a non-zero code (or no output at all, which means the file was
+        # never read) means the batch did NOT go through. The geo sweep above
+        # already treats that verdict as load-bearing precisely because
+        # counting an undelivered batch cleared the crash marker while the
+        # routes were still installed; the LAN sweep discarded the return
+        # value entirely and returned len(victims) either way, so a
+        # half-failed sweep was indistinguishable from a successful one and
+        # the marker was retired over routes that were still live. Same rule,
+        # same reason.
+        out_txt = ((proc.stdout or b"").decode("utf-8", "replace")
+                   + (proc.stderr or b"").decode("utf-8", "replace"))
+        if proc.returncode != 0:
+            _log(f"watchdog: LAN sweep failed (netsh rc={proc.returncode}) - "
+                 f"{len(victims)} route(s) kept, marker retained", log)
+            return None
+        if not out_txt.strip():
+            _log(f"watchdog: LAN sweep produced no netsh output - "
+                 f"{len(victims)} route(s) unconfirmed, marker retained", log)
+            return None
+        # Count what netsh CONFIRMED, not what we asked for: it reports
+        # per-line failures in the same output it just checked above, and
+        # still exits 0.
+        return sum(1 for ln in out_txt.splitlines() if ln.strip() == "Ok.")
     except Exception as e:
         _log(f"watchdog: LAN sweep failed: {e}\n"
              f"{traceback.format_exc()}".rstrip(), log)
@@ -310,7 +437,9 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
     routing that country's traffic around the (now dead) tunnel, which both
     breaks connectivity for those prefixes and leaves the bypass intent
     armed for the next session. Batch netsh -f deletes, same fast path the
-    dashboard's own sweep uses. Returns how many were removed."""
+    dashboard's own sweep uses. Returns how many were removed (VERIFIED from
+    netsh's own per-line answers), or None when the sweep could not be
+    trusted."""
     log = log or (lambda m: None)
     try:
         if not geoip or not os.path.isfile(geoip):
@@ -322,7 +451,6 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
         if not geoip_code:
             return 0
         from tuntop.geoip import parse_geoip          # repo root on sys.path
-        import tuntop.network.routing as routing
         cidrs = set(parse_geoip(geoip, geoip_code))
         if not cidrs:
             return 0
@@ -338,35 +466,28 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
                 wanted.add(str(ipaddress.ip_network(str(c), strict=False)))
             except ValueError:
                 continue
-        ok, out = routing._ps(
-            "Get-NetRoute -AddressFamily IPv4,IPv6 -ErrorAction SilentlyContinue | "
-            "Select-Object DestinationPrefix,InterfaceAlias,NextHop | "
-            "ConvertTo-Json -Compress -Depth 2")
-        rows = []
-        if ok and out.strip():
-            data = json.loads(out)
-            if isinstance(data, dict):
-                data = [data]
-            rows = data
-        victims = []
-        for r in rows:
-            dp = str(r.get("DestinationPrefix", ""))
-            try:
-                dp = str(ipaddress.ip_network(dp, strict=False))
-            except ValueError:
-                pass
-            if dp not in wanted:
-                continue
-            alias = str(r.get("InterfaceAlias", "") or "").replace("'", "")
-            nh = str(r.get("NextHop", "") or "")
-            victims.append((dp, alias, nh))
+        # Victim selection is the SHARED rule (routeops.sweeps), the same copy
+        # the dashboard uses - this sweep had its own hand-rolled inline loop.
+        from tuntop.network.routeops.sweeps import geo_victims
+        rows = _live_rows()
+        if rows is None:
+            _log("watchdog: could not read the routing table for the geo "
+                 "sweep - marker retained", log)
+            return None
+        victims = geo_victims(rows, wanted)
         if not victims:
             return 0
         # Batch netsh -f deletes: hundreds of lines per process, disjoint
         # prefixes cannot collide.
         chunks = [victims[i:i + 256] for i in range(0, len(victims), 256)]
+        deadline = time.time() + _GEO_SWEEP_BUDGET_SECONDS
         removed = 0
         for chunk in chunks:
+            if time.time() >= deadline:
+                _log(f"watchdog: geo sweep ran out of time after {removed} "
+                     f"route(s) - {len(victims) - removed} may remain, "
+                     "marker retained", log)
+                return None
             lines = []
             for dp, alias, nh in chunk:
                 verb = "ipv6" if ":" in dp else "ipv4"
@@ -405,7 +526,13 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
                          f"- {len(chunk)} route(s) unconfirmed, marker "
                          "retained", log)
                     return None
-                removed += len(chunk)
+                # VERIFIED count. netsh answers each successful line with
+                # "Ok." and reports per-line failures in the SAME output, while
+                # still exiting 0 - so len(chunk) was never a removal count,
+                # and the "removed N routes" line above was fiction whenever a
+                # line was refused.
+                removed += sum(1 for ln in out_txt.splitlines()
+                               if ln.strip() == "Ok.")
             except subprocess.TimeoutExpired:
                 _log(f"watchdog: geo sweep chunk timed out - {len(chunk)} "
                      "route(s) may remain, marker retained", log)
@@ -488,23 +615,30 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
 
     # Unclean exit confirmed. The helper dies FIRST: with its tun2socks
     # child gone it must not auto-restart one (or re-assert routes) while
-    # the sweep is tearing the adapter down.
+    # the sweep is tearing the adapter down. `helper_started` is the
+    # identity proof from the marker - without it a recycled PID would get
+    # an unrelated process tree force-killed.
     if helper_pid:
-        kill_pid(helper_pid, log)
+        kill_pid(helper_pid, log,
+                 recorded_start=_helper_start(marker_path, helper_pid))
 
     findings = scan(hosts=list(hosts or []), probes=probes,
                     marker_path=marker_path, marker_live=marker_live)
-    actions = recover(findings, probes=probes,
-                      log=lambda m: _log(m, log))
+    actions, recovery_ok = recover_ex(findings, probes=probes,
+                                      log=lambda m: _log(m, log))
     if not actions:
         _log("watchdog: sweep found nothing left to clean", log)
 
     # Geo bypass routes sit on the PHYSICAL adapter - invisible to the
     # Wintun teardown. Sweep them by CIDR match if a geoip file is known.
-    # Both sweeps return None on failure - a half-failed sweep must NOT
-    # retire the crash marker, or the log lies ("clean") while routes stay
-    # and the next launch skips its startup recovery.
-    sweeps_ok = True
+    # All three of these return None on failure - a half-failed sweep must
+    # NOT retire the crash marker, or the log lies ("clean") while routes
+    # stay and the next launch skips its startup recovery. `recovery_ok`
+    # is the same veto from the OTHER half of the sweep: a refused adapter
+    # teardown or an unremovable DNS guard used to be reported as "the next
+    # launch retries" and then immediately followed by a cleared marker, so
+    # the next launch never retried anything.
+    sweeps_ok = bool(recovery_ok)
     n_geo = sweep_geo_routes(geoip, geoip_code, log=log)
     if n_geo is None:
         sweeps_ok = False
@@ -634,11 +768,7 @@ def main(argv=None) -> int:
         # Merge the dashboard's live-session state: bypasses/geo chosen
         # AFTER this watchdog was spawned (dashboard [A]/[F]/geo dialogs)
         # are only present here - never in the startup args.
-        state = read_live_state(args.marker.replace(
-            os.path.basename(args.marker),
-            os.path.basename(STATE_FILE))) if os.path.isfile(
-                os.path.join(os.path.dirname(args.marker),
-                             os.path.basename(STATE_FILE))) else read_live_state()
+        state = read_live_state(_state_path(args.marker))
         hosts = list(dict.fromkeys(
             hosts + [h for h in (state.get("hosts") or []) if h]))
         geoip = state.get("geoip") or args.geoip
@@ -658,8 +788,7 @@ def main(argv=None) -> int:
     # (the next launch must re-run the recovery) - keep the sidecar too in
     # that case, since it describes the routes that still need sweeping.
     try:
-        _sc_path = os.path.join(os.path.dirname(os.path.abspath(args.marker)),
-                                os.path.basename(STATE_FILE))
+        _sc_path = _state_path(args.marker)
         _marker_now = read_marker(args.marker)
         _marker_ours = (_marker_now
                         and int(_marker_now.get("pid", -1) or -1) == int(args.pid))

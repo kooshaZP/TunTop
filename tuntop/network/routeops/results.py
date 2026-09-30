@@ -48,3 +48,58 @@ class RouteResult:
 def unwrap(fn, *args, **kwargs):
     """Module-level alias of RouteResult.unwrap (kept for direct imports)."""
     return RouteResult.unwrap(fn, *args, **kwargs)
+
+
+class SweepResult:
+    """Outcome of a leftover-route sweep: what was found, what was actually
+    removed, and whether the sweep is TRUSTWORTHY.
+
+    The three are different questions and conflating them is how a failed
+    cleanup gets reported as a clean one:
+
+      * `found`   - rows in the live table that matched our rule.
+      * `removed` - rows netsh CONFIRMED it deleted (parsed from the batch
+                    script's own `Ok.` lines, not `len(chunk)`). netsh exits 0
+                    even when an individual line fails, so the chunk size is
+                    not a removal count.
+      * `ok`      - the sweep could be trusted at all. False when the route
+                    table could not be read, when a netsh batch exited
+                    non-zero, or when it produced no output (which means the
+                    script file was never read). A False here is what keeps the
+                    crash marker in place so the next launch retries.
+
+    `__bool__` is `removed > 0`, NOT `ok`, on purpose: the historical return
+    value of these sweeps was a plain int and every `if n:` call site means
+    "did we remove anything". Flip it to `ok` and a sweep that found 400 rows
+    and removed all 400 becomes falsy at every call site that only wanted to
+    print a count. Read `.ok` explicitly for the verdict.
+    """
+
+    __slots__ = ("found", "removed", "ok", "err")
+
+    def __init__(self, found: int = 0, removed: int = 0, ok: bool = True,
+                 err: str = ""):
+        self.found = int(found or 0)
+        self.removed = int(removed or 0)
+        self.ok = bool(ok)
+        self.err = str(err or "")
+
+    @classmethod
+    def clean(cls, found: int = 0, removed: int = 0) -> "SweepResult":
+        return cls(found, removed, True, "")
+
+    @classmethod
+    def failed(cls, found: int = 0, reason: str = "") -> "SweepResult":
+        return cls(found, 0, False, reason)
+
+    def __bool__(self):
+        return self.removed > 0
+
+    def __int__(self):
+        # So a sweep result can be printed/formatted where a count was
+        # returned before, without turning into a repr mid-message.
+        return self.removed
+
+    def __repr__(self):
+        return (f"SweepResult(found={self.found}, removed={self.removed}, "
+                f"ok={self.ok}, err={self.err!r})")

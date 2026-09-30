@@ -39,11 +39,17 @@ Windows drop the rule entirely and the catch-all keeps the query.
 
 CLEANUP IS SACRED
 -----------------
-An NRPT rule that outlives the tunnel would keep hijacking name resolution,
-so removal has four independent owners: the helper's cleanup(), the next
-launch's startup recovery, the detached cleanup watchdog, and the dashboard's
-stop/quit sweeps. STATE_FILE records what was installed so even a crash in
-the middle of the install stays recoverable.
+An NRPT rule that outlives the tunnel would keep hijacking name resolution, so
+removal has five independent owners: the helper's cleanup(), the next launch's
+startup recovery, the detached cleanup watchdog, the dashboard's stop/quit
+sweeps, and - the only one that survives the machine itself - a ONE-SHOT
+Task Scheduler entry armed for the next boot (boot_cleanup_action). A BSOD or a
+power cut kills the other four in the same instant, and the rule is a registry
+entry that does not care whether TunTop ever runs again, so that fifth owner is
+what keeps a crash from leaving a machine with no name resolution at all. It is
+armed by install() BEFORE the rule is written, and consumed (and deleted) by the
+first boot that follows. STATE_FILE records what was installed so even a crash
+in the middle of the install stays recoverable.
 
 Pure stdlib, no pip dependencies. The PowerShell text lives here (single
 source of truth, unit-tested as text) and the runner is injectable, so the
@@ -52,6 +58,7 @@ dashboard.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -61,12 +68,14 @@ from typing import Callable, Optional
 __all__ = [
     "GUARD_KEY_PREFIX", "MATCH_KEY", "EXEMPT_LOCAL_KEY", "LOCAL_NAMESPACE",
     "CATCH_ALL_NAMESPACE", "CONFIG_OPTIONS_OVERRIDE_DNS", "RULE_VERSION",
-    "DEFAULT_EXEMPT_NAMESPACES", "STATE_FILE", "NRPT_ROOT",
+    "DEFAULT_EXEMPT_NAMESPACES", "STATE_FILE", "NRPT_ROOT", "BOOT_TASK_NAME",
     "guard_resolvers", "install_script", "uninstall_script", "detect_script",
     "parse_detect", "save_state", "load_state", "clear_state", "state_path",
     "install", "uninstall", "detect", "ensure_installed", "ensure_removed",
     "foreign_resolvers", "foreign_resolvers_script", "guard_in_force",
     "parse_foreign", "DEFAULT_TUNNEL_ALIASES",
+    "boot_cleanup_action", "arm_boot_cleanup_script",
+    "disarm_boot_cleanup_script", "arm_boot_cleanup", "disarm_boot_cleanup",
 ]
 
 # ── Rule identity ───────────────────────────────────────────────────────────
@@ -102,6 +111,7 @@ NRPT_PS_ROOT = ("HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache"
 # re-hardcoded in seven places across three modules, and any disagreement made
 # a route get pointed at an interface the rest of the code believed was "not
 # a VPN").
+from tuntop import procidentity
 from tuntop.config.defaults import VPN_IFACE_RE as VPN_IFACE_RE  # noqa: F401
 from tuntop.psshell import ps_quote
 
@@ -115,7 +125,7 @@ if getattr(sys, "frozen", False):
     STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
                               ".tuntop_dns_guard.json")
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 #: A rule with no override servers would force every lookup to fail - never
 #: write one, and never claim more resolvers than a rule can carry.
 _MAX_SERVERS = 8
@@ -125,6 +135,11 @@ _MAX_SERVERS = 8
 GUARD_COMMENT = ("TunTop: temporary DNS leak protection - all name resolution "
                  "is pinned to the tunnel resolvers. Removed when the tunnel "
                  "stops.")
+
+#: Name of the ONE-SHOT boot-time cleanup task (see boot_cleanup_action).
+#: TunTop- prefixed like the registry keys, so it is obvious in Task Scheduler
+#: whose task it is and so an operator can unregister it by hand.
+BOOT_TASK_NAME = "TunTop-DnsGuard-Removal"
 
 
 def state_path() -> str:
@@ -200,18 +215,30 @@ def install_script(resolvers, exempt=(), comment: str = GUARD_COMMENT) -> str:
     """PowerShell that installs (or refreshes) the catch-all rule plus the
     exemption rule, then flushes the resolver cache.
 
-    WRITE FIRST, THEN DELETE. This used to drop every TunTop-* key up front
-    and only then write the replacement, which opened a window - on EVERY
-    re-apply (self-heal, a live [N] DNS change, a VPN-shadow pass) - in which
-    no rule existed at all, i.e. Windows was free to ask a physical adapter's
-    resolver in parallel and let the ISP answer. That is exactly the leak the
-    guard exists to close, and it reopened for the duration of the re-assert
-    on a schedule the tunnel itself drives.
+    WRITTEN IN PLACE, NEVER SWAPPED. This used to drop every TunTop-* key up
+    front and only then write the replacement, which opened a window - on
+    EVERY re-apply (self-heal, a live [N] DNS change, a VPN-shadow pass) - in
+    which no rule existed at all, i.e. Windows was free to ask a physical
+    adapter's resolver in parallel and let the ISP answer. That is exactly the
+    leak the guard exists to close, and it reopened for the duration of the
+    re-assert on a schedule the tunnel itself drives.
 
-    The ordering is safe in both directions: the new keys are written under
-    fresh temp names and moved into place individually, and only keys that
-    are NOT part of the new set are removed afterwards. A failure part-way
-    through therefore leaves a mix, never a gap."""
+    A later revision staged the replacement under a `TunTop-Match.new` key and
+    then did `Remove-Item` on the LIVE key followed by `Move-Item` - which is
+    the same gap, narrowed to the two statements between them, and still on
+    every re-assert. `Move-Item -Force` cannot overwrite an existing directory
+    in PowerShell, so the delete was load-bearing for the swap and the swap was
+    the leak. There is no need for a swap at all: `New-Item -Force` opens the
+    key when it exists, and each `New-ItemProperty -Force` is an idempotent
+    value replace. The rule therefore exists CONTINUOUSLY and only its
+    contents are refreshed.
+
+    THE FAILURE DIRECTION IS SAFE. If a value write fails part-way the rule
+    keeps the PREVIOUS server list - which is still the tunnel's resolvers, so
+    it is still a working leak-free pin, not a black hole. The script reports
+    DNS_GUARD_FAIL, `install()` returns False and the monitor's re-assert
+    retries. The old staging version instead had to delete the good rule to
+    find out whether the new one could be written."""
     servers = _servers_value(resolvers)
     if not servers:
         # Callers must use uninstall_script() for this case: a rule with no
@@ -234,7 +261,8 @@ def install_script(resolvers, exempt=(), comment: str = GUARD_COMMENT) -> str:
     # GenericDNSServers value MUST be present and empty here (ConfigOptions
     # stays 0x8): a missing value makes Windows discard the rule and the
     # catch-all keeps the query - exactly the NXDOMAIN-for-.local bug this
-    # rule prevents.
+    # rule prevents. Written IN PLACE for the same reason as the catch-all
+    # above: it is never deleted, so it is never absent either.
     $ex = Join-Path $root {_ps_quote(EXEMPT_LOCAL_KEY)}
     New-Item -Path $ex -Force | Out-Null
     New-ItemProperty -Path $ex -Name 'Version' -PropertyType DWord -Value {RULE_VERSION} -Force | Out-Null
@@ -243,33 +271,25 @@ def install_script(resolvers, exempt=(), comment: str = GUARD_COMMENT) -> str:
     New-ItemProperty -Path $ex -Name 'ConfigOptions' -PropertyType DWord -Value {CONFIG_OPTIONS_OVERRIDE_DNS} -Force | Out-Null
     New-ItemProperty -Path $ex -Name 'Comment' -PropertyType String -Value {_ps_quote('TunTop: NRPT exemption - names the tunnel resolvers must not answer (mDNS .local etc.).')} -Force | Out-Null
 """
-    # Pre-computed rather than inline. A BACKSLASH inside an f-string
-    # EXPRESSION is a SyntaxError before 3.12 (PEP 701 is what relaxed it), and
-    # this module has to import on the 3.10 floor CI tests - the inline form
-    # made every import of tuntop.network.dns_guard (and therefore the whole
-    # dashboard) fail there. The value is unchanged: a literal backslash, so
-    # the script still builds the sibling "$root\TunTop-Match.new" key name.
-    new_key_ps = _ps_quote('\\' + MATCH_KEY + '.new')
     return f"""$ErrorActionPreference = 'Stop'
 $root = {_ps_quote(NRPT_PS_ROOT)}
 try {{
     if (-not (Test-Path $root)) {{ New-Item -Path $root -Force | Out-Null }}
-    # WRITE FIRST. See the docstring: deleting up front opened a leak window on
-    # every re-assert. Build each rule under a .new key, then swap it in.
-    $matchNew = $root + {new_key_ps}
-    if (Test-Path $matchNew) {{ Remove-Item -Path $matchNew -Recurse -Force -ErrorAction SilentlyContinue }}
-    New-Item -Path $matchNew -Force | Out-Null
-    New-ItemProperty -Path $matchNew -Name 'Version' -PropertyType DWord -Value {RULE_VERSION} -Force | Out-Null
-    New-ItemProperty -Path $matchNew -Name 'Name' -PropertyType MultiString -Value @({_ps_quote(CATCH_ALL_NAMESPACE)}) -Force | Out-Null
-    New-ItemProperty -Path $matchNew -Name 'GenericDNSServers' -PropertyType String -Value {_ps_quote(servers)} -Force | Out-Null
-    New-ItemProperty -Path $matchNew -Name 'ConfigOptions' -PropertyType DWord -Value {CONFIG_OPTIONS_OVERRIDE_DNS} -Force | Out-Null
-    New-ItemProperty -Path $matchNew -Name 'Comment' -PropertyType String -Value {_ps_quote(comment)} -Force | Out-Null
+    # IN PLACE. See the docstring: staging under a .new key and swapping still
+    # required deleting the live rule first, which is a gap on every
+    # re-assert. `New-Item -Force` opens the key when it exists, so the
+    # catch-all is never absent - only its values are refreshed.
     $k = Join-Path $root {_ps_quote(MATCH_KEY)}
-    Remove-Item -Path $k -Recurse -Force -ErrorAction SilentlyContinue
-    Move-Item -Path $matchNew -Destination $k -Force
-{exempt_script}    # NOW drop anything that is not part of the set we just wrote -
-    # i.e. a stale exemption key, or a leftover .new from an aborted run. The
-    # keys we just wrote are always kept.
+    New-Item -Path $k -Force | Out-Null
+    New-ItemProperty -Path $k -Name 'Version' -PropertyType DWord -Value {RULE_VERSION} -Force | Out-Null
+    New-ItemProperty -Path $k -Name 'Name' -PropertyType MultiString -Value @({_ps_quote(CATCH_ALL_NAMESPACE)}) -Force | Out-Null
+    New-ItemProperty -Path $k -Name 'GenericDNSServers' -PropertyType String -Value {_ps_quote(servers)} -Force | Out-Null
+    New-ItemProperty -Path $k -Name 'ConfigOptions' -PropertyType DWord -Value {CONFIG_OPTIONS_OVERRIDE_DNS} -Force | Out-Null
+    New-ItemProperty -Path $k -Name 'Comment' -PropertyType String -Value {_ps_quote(comment)} -Force | Out-Null
+{exempt_script}    # NOW drop anything that is NOT part of the set we just wrote -
+    # i.e. a stale exemption key, or a .new/.old left behind by a run of the
+    # pre-1.0.51 staging version. The keys we just wrote are always kept, and
+    # the live catch-all is never a sweep candidate.
     Get-ChildItem -Path $root -ErrorAction SilentlyContinue |
         Where-Object {{
             $_.PSChildName -like {_ps_quote(GUARD_KEY_PREFIX + '*')}
@@ -333,6 +353,134 @@ try {{
 """
 
 
+def boot_cleanup_action(path: Optional[str] = None) -> str:
+    """The body the boot task runs AS SYSTEM, once, at the next startup.
+
+    WHY A BOOT TASK AND NOT A PROCESS
+    ---------------------------------
+    Every other owner of the removal is a running process: the helper's
+    cleanup(), startup recovery, the detached watchdog, the dashboard's
+    sweeps. A BSOD or a power cut kills all of them in the same instant, and
+    the NRPT rule is a REGISTRY entry - it does not care whether TunTop ever
+    runs again. Name resolution is then broken at the OS level, with no user
+    logged in, and the only documented way out is a flag the user has to
+    remember. The watchdog cannot cover this either: it is a child of the
+    dashboard whose whole job is to wait for the dashboard's process to exit,
+    so it dies with the OS and nothing respawns it until a user launches
+    TunTop - which is the exact situation this exists to avoid.
+
+    SELF-CONTAINED ON PURPOSE. The action is a plain PowerShell one-liner and
+    never names TunTop.exe, python, sys.executable or any temp path. After the
+    crash that made this necessary the user may well have moved, replaced or
+    deleted the app, and a scheduled task whose action cannot be found fails
+    SILENTLY at boot - the machine would stay broken with a green-looking task
+    in the scheduler.
+
+    The registry root, the TunTop-* prefix and the state file all come from the
+    SAME constants uninstall_script() uses, so the invariant that matters most -
+    a foreign NRPT rule (a corporate VPN's, DirectAccess's) is never touched -
+    cannot drift between the two.
+    """
+    return (
+        "$ErrorActionPreference = 'SilentlyContinue'; "
+        f"$r = {_ps_quote(NRPT_PS_ROOT)}; "
+        "if (Test-Path -LiteralPath $r) { Get-ChildItem -LiteralPath $r | "
+        f"Where-Object {{ $_.PSChildName -like {_ps_quote(GUARD_KEY_PREFIX + '*')} }}"
+        " | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }; "
+        # The install record must go too, or dns_guard_present() reports True
+        # on EVERY later launch and each one logs a phantom "remove leftover
+        # DNS guard" for a rule that no longer exists.
+        f"Remove-Item -LiteralPath {_ps_quote(path or state_path())} -Force "
+        "-ErrorAction SilentlyContinue; "
+        "Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null"
+    )
+
+
+def arm_boot_cleanup_script(path: Optional[str] = None) -> str:
+    """Register/overwrite the one-shot AtStartup cleanup task. Prints
+    DNS_GUARD_BOOT_ARMED, or DNS_GUARD_BOOT_FAIL:<reason>.
+
+    -AtStartup + SYSTEM + Highest, because the removal has to happen BEFORE
+    anyone logs in - a machine that cannot complete a logon, or whose
+    networking needs DNS first, never reaches the point where a user-space
+    process could have cleaned up.
+
+    -DeleteExpiredTaskAfter 0 is what makes this a ONE-SHOT: Task Scheduler
+    deletes the task the moment it has run, so a leftover can never
+    accumulate, re-fire on later boots, or be mistaken for a permanent
+    component. The whole lifecycle is therefore bounded by the guard's own.
+
+    -Force makes registration idempotent, which matters because the guard is
+    re-asserted on every self-heal cycle and every live [N] DNS change.
+
+    The action travels as -EncodedCommand (base64 UTF-16LE) rather than as
+    quoted text. Boot-cleanup actions are exactly where quoting goes wrong: the
+    body is a single-quoted PowerShell literal that itself carries single
+    quotes, and the alternative (`-Command "..."`) makes the child's own parser
+    expand the body's variables. Base64 sidesteps both - nothing in the payload
+    needs escaping at any layer.
+    """
+    encoded = base64.b64encode(
+        boot_cleanup_action(path).encode("utf-16-le")).decode("ascii")
+    # Pre-computed rather than inline. A MULTI-LINE expression (or a backslash)
+    # inside an f-string replacement field is a SyntaxError before 3.12 - PEP
+    # 701 is what relaxed it - and this module has to import on the 3.10 floor
+    # CI tests. 1.0.49 shipped a SyntaxError from exactly this construct, on
+    # the interpreter the release build did not use, and the fix is to keep
+    # every replacement field a single line with no escapes.
+    arg = ("-NoProfile -NonInteractive -WindowStyle Hidden "
+           "-ExecutionPolicy Bypass -EncodedCommand " + encoded)
+    return f"""$ErrorActionPreference = 'Stop'
+try {{
+    $task = {_ps_quote(BOOT_TASK_NAME)}
+    $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument {_ps_quote(arg)}
+    $trg = New-ScheduledTaskTrigger -AtStartup
+    $prn = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+        -DeleteExpiredTaskAfter (New-TimeSpan -Seconds 0)
+    Register-ScheduledTask -TaskName $task -Action $act -Trigger $trg `
+        -Principal $prn -Settings $set -Force | Out-Null
+    # Do not trust Register-ScheduledTask's exit: a constrained or disabled
+    # Task Scheduler can accept the call and register nothing, and the whole
+    # point of this is that a silent no-op here means a machine with no DNS.
+    if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) {{
+        Write-Output 'DNS_GUARD_BOOT_ARMED'
+    }} else {{
+        Write-Output 'DNS_GUARD_BOOT_FAIL:the task did not register'
+    }}
+}} catch {{
+    Write-Output ('DNS_GUARD_BOOT_FAIL:' + $_.Exception.Message)
+}}
+"""
+
+
+def disarm_boot_cleanup_script() -> str:
+    """Unregister the one-shot boot task. Prints DNS_GUARD_BOOT_DISARMED, or
+    DNS_GUARD_BOOT_DISARM_FAIL:<reason>.
+
+    Only ever called on a CONFIRMED rule removal. A task left behind is
+    harmless (it runs once, finds nothing, deletes itself), whereas a rule left
+    behind is not - so the asymmetry is deliberate and the callers must keep
+    it. An absent task is a success: there is nothing to disarm.
+    """
+    return f"""$ErrorActionPreference = 'Stop'
+try {{
+    $task = {_ps_quote(BOOT_TASK_NAME)}
+    $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+    if ($t) {{
+        Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction Stop
+        Write-Output 'DNS_GUARD_BOOT_DISARMED'
+    }} else {{
+        Write-Output 'DNS_GUARD_BOOT_DISARMED'
+    }}
+}} catch {{
+    Write-Output ('DNS_GUARD_BOOT_DISARM_FAIL:' + $_.Exception.Message)
+}}
+"""
+
+
 def detect_script() -> str:
     """PowerShell that reports the guard's state in one parseable line:
 
@@ -343,7 +491,10 @@ def detect_script() -> str:
     installed" from "only the .local exemption survived a GPO refresh";
     `effective` is whether Windows' own effective NRPT policy actually carries
     the root namespace - the ground truth, since a rule Windows dropped from
-    the policy never takes effect."""
+    the policy never takes effect; `boot` is whether the one-shot startup task
+    that removes a surviving rule is still armed, i.e. whether a BSOD would
+    leave this machine without DNS. It rides along in THIS spawn rather than
+    adding a second one, because the health row reads it on every tick."""
     return f"""$root = {_ps_quote(NRPT_PS_ROOT)}
 $keys = @(Get-ChildItem -Path $root -ErrorAction SilentlyContinue |
     Where-Object {{ $_.PSChildName -like {_ps_quote(GUARD_KEY_PREFIX + '*')} }})
@@ -362,30 +513,39 @@ try {{
         $eff = $true
     }}
 }} catch {{ }}
+$boot = $false
+try {{
+    $boot = [bool](Get-ScheduledTask -TaskName {_ps_quote(BOOT_TASK_NAME)} -ErrorAction SilentlyContinue)
+}} catch {{ }}
 # FIELD SEPARATOR: ',' - NOT ';'. The `servers` field is a resolver LIST
 # joined with ';' by _servers_value(), so splitting the line on ';' chopped a
 # two-resolver value ("8.8.8.8;2606:4700:4700::1111") into a first field
 # "8.8.8.8" plus an orphan part that matched no branch and was dropped. Every
 # diagnostic then reported only the first resolver, hiding the v6 half of the
 # pin. A resolver list can never contain ',', so ',' is unambiguous.
-Write-Output ('DNS_GUARD_STATE:keys=' + @($keys).Count + ',match=' + $match + ',effective=' + $eff.ToString().ToLower() + ',servers=' + $servers)
+Write-Output ('DNS_GUARD_STATE:keys=' + @($keys).Count + ',match=' + $match + ',effective=' + $eff.ToString().ToLower() + ',boot=' + $boot.ToString().ToLower() + ',servers=' + $servers)
 """
 
 
 def parse_detect(out) -> dict:
     """Parse detect_script()'s output. Always returns a dict:
 
-        {"keys": int, "match": int, "effective": bool, "servers": str,
-         "ok": bool}
+        {"keys": int, "match": int, "effective": bool, "boot": bool,
+         "servers": str, "ok": bool}
 
     `ok` is True only when OUR catch-all rule exists AND Windows' effective
     policy carries the root namespace, i.e. the guard is actually protecting
     DNS. A leftover exemption key alone is never `ok`: it claims no namespace,
     so counting it would report a dead pin as live protection. `match` is None
     when the line predates the field, in which case `keys` is used.
+
+    `boot` defaults to False and is NOT back-compat-patched: a line emitted
+    before the field existed means the probe ran on something that cannot see
+    Task Scheduler, and reporting "armed" there would be a guess. The health
+    row treats it as "not crash-safe", which is the honest direction.
     """
-    state = {"keys": 0, "match": None, "effective": False, "servers": "",
-             "ok": False}
+    state = {"keys": 0, "match": None, "effective": False, "boot": False,
+             "servers": "", "ok": False}
     line = ""
     for ln in str(out or "").splitlines():
         if "DNS_GUARD_STATE:" in ln:
@@ -411,6 +571,8 @@ def parse_detect(out) -> dict:
                 state["match"] = 0
         elif key == "effective":
             state["effective"] = val.lower() == "true"
+        elif key == "boot":
+            state["boot"] = val.lower() == "true"
         elif key == "servers":
             state["servers"] = val
     ours = state["keys"] if state["match"] is None else state["match"]
@@ -421,9 +583,16 @@ def parse_detect(out) -> dict:
 # ── Install record (crash safety) ───────────────────────────────────────────
 
 def save_state(resolvers, exempt=(), path: Optional[str] = None,
-               owner_pid: Optional[int] = None) -> bool:
+               owner_pid: Optional[int] = None,
+               boot_armed: bool = False) -> bool:
     """Record what was installed, so ANY later process can remove it."""
     target = path or state_path()
+    owner = int(owner_pid if owner_pid is not None else os.getpid())
+    # The creation time of the OWNING process, so a later reader can tell
+    # "the installer is still running" from "an unrelated process inherited
+    # its pid after a reboot". None when it cannot be read; readers treat
+    # that as unprovable and fall back to liveness alone.
+    owner_started = _process_start_time(owner)
     payload = {
         "version": STATE_VERSION,
         "installed": True,
@@ -431,7 +600,13 @@ def save_state(resolvers, exempt=(), path: Optional[str] = None,
         "exempt": [str(n) for n in (exempt or [])],
         "keys": [MATCH_KEY] + ([EXEMPT_LOCAL_KEY] if exempt else []),
         "since": time.time(),
-        "owner_pid": int(owner_pid if owner_pid is not None else os.getpid()),
+        "owner_pid": owner,
+        "owner_started": owner_started,
+        # Whether the one-shot startup task is registered. Recorded so the
+        # diagnostics can say WHY a rule would survive a crash rather than
+        # leaving the operator to guess; a v1 record simply lacks the key and
+        # load_state() reports False for it.
+        "boot_armed": bool(boot_armed),
     }
     try:
         # ATOMIC. open(target, "w") truncates to zero before the first write
@@ -461,7 +636,12 @@ def save_state(resolvers, exempt=(), path: Optional[str] = None,
 
 
 def load_state(path: Optional[str] = None) -> Optional[dict]:
-    """The install record, or None (no guard installed / unreadable)."""
+    """The install record, or None (no guard installed / unreadable).
+
+    `boot_armed` is NORMALISED to a bool. A record written before 1.0.51 has
+    no such key, and a caller asking "would this rule survive a crash?" must
+    get a definite False rather than a KeyError - the record is also read by
+    the boot task's own diagnostics path and by startup recovery."""
     target = path or state_path()
     try:
         with open(target, "r", encoding="utf-8") as f:
@@ -470,6 +650,7 @@ def load_state(path: Optional[str] = None) -> Optional[dict]:
         return None
     if not isinstance(data, dict) or not data.get("installed"):
         return None
+    data["boot_armed"] = bool(data.get("boot_armed"))
     return data
 
 
@@ -492,16 +673,75 @@ def _default_runner() -> Callable:
     return routing._ps
 
 
+# ── Boot-time cleanup (the owner that survives a BSOD / power loss) ──────────
+#
+# The four other owners are all processes. This one is a Task Scheduler entry,
+# registered while the rule is live and consumed by the next boot. It is
+# registered by install() - which the HELPER calls - rather than by the
+# dashboard or the watchdog, so the arming does not depend on the dashboard
+# process existing at all.
+
+def arm_boot_cleanup(runner: Optional[Callable] = None,
+                     path: Optional[str] = None) -> tuple:
+    """Register the one-shot startup task. Returns (ok, message).
+
+    Never raises: a failure here must degrade to the pre-1.0.51 behaviour
+    (report the loss loudly, keep the guard) and not abort the install. The
+    guard is still worth having without crash safety; a machine with no DNS is
+    not."""
+    run = runner or _default_runner()
+    try:
+        _ok, out = run(arm_boot_cleanup_script(path))
+    except Exception as e:
+        return False, f"boot cleanup task could not be armed: {e}"
+    text = str(out or "")
+    if "DNS_GUARD_BOOT_ARMED" in text:
+        return True, "boot cleanup task armed"
+    reason = (text.split("DNS_GUARD_BOOT_FAIL:", 1)[1].strip()
+              if "DNS_GUARD_BOOT_FAIL:" in text
+              else (text.strip() or "no output"))
+    return False, f"boot cleanup task could not be armed: {reason}"
+
+
+def disarm_boot_cleanup(runner: Optional[Callable] = None) -> tuple:
+    """Unregister the one-shot startup task. Returns (ok, message).
+
+    Called ONLY after a confirmed rule removal - see the asymmetry note on
+    disarm_boot_cleanup_script(). An absent task is success."""
+    run = runner or _default_runner()
+    try:
+        _ok, out = run(disarm_boot_cleanup_script())
+    except Exception as e:
+        return False, f"boot cleanup task could not be disarmed: {e}"
+    text = str(out or "")
+    if "DNS_GUARD_BOOT_DISARMED" in text:
+        return True, "boot cleanup task disarmed"
+    reason = (text.split("DNS_GUARD_BOOT_DISARM_FAIL:", 1)[1].strip()
+              if "DNS_GUARD_BOOT_DISARM_FAIL:" in text
+              else (text.strip() or "no output"))
+    return False, f"boot cleanup task could not be disarmed: {reason}"
+
+
 def install(resolvers, exempt=(), runner: Optional[Callable] = None,
             path: Optional[str] = None) -> tuple:
     """Install/refresh the guard. Returns (ok, message).
 
     An empty `resolvers` installs nothing and REMOVES any existing guard: a
-    pin with no servers would break resolution without protecting it."""
+    pin with no servers would break resolution without protecting it.
+
+    The boot cleanup task is armed FIRST, before a single NRPT value is
+    written, so there is no window in which a live catch-all rule has nothing
+    registered to remove it after a crash. The inverse asymmetry is
+    deliberate: an install FAILURE never disarms, because a partially refreshed
+    rule (see install_script - values are written in place) may still be live,
+    and a rule without a task is the unsafe direction. A task without a rule is
+    harmless: it runs once at the next boot, finds nothing and deletes itself.
+    """
     resolvers = [str(s).strip() for s in (resolvers or []) if str(s).strip()]
     if not resolvers:
         return ensure_removed(runner=runner, path=path)
     run = runner or _default_runner()
+    armed, arm_msg = arm_boot_cleanup(runner=run, path=path)
     try:
         _ok, out = run(install_script(resolvers, exempt))
     except Exception as e:
@@ -511,14 +751,33 @@ def install(resolvers, exempt=(), runner: Optional[Callable] = None,
         reason = (text.split("DNS_GUARD_FAIL:", 1)[1].strip()
                   if "DNS_GUARD_FAIL:" in text else (text.strip() or "no output"))
         return False, f"guard install failed: {reason}"
-    if not save_state(resolvers, exempt, path=path):
+    # Collect EVERY loss before reporting, not just the first. An unwritable
+    # record and an unarmed task are independent, and a caller that only hears
+    # about the record has no idea the rule is also not crash-safe - which is
+    # the one fact that decides whether the next power cut costs them a reboot.
+    warnings = []
+    if not save_state(resolvers, exempt, path=path, boot_armed=armed):
         # The rule IS live, so this is still a success - but say plainly that
         # no crash-safety record exists, because that record is what lets the
         # next launch/cleanup owner find the rule without probing.
-        return True, (f"pinned to {', '.join(resolvers)} (WARNING: no install "
-                      "record could be written - a hard kill now leaves the "
-                      "rule behind with no file to recover it from)")
-    return True, f"pinned to {', '.join(resolvers)}"
+        warnings.append("no install record could be written - a hard kill now "
+                        "leaves the rule behind with no file to recover it "
+                        "from")
+    if not armed:
+        # A failed arm is NOT a failed install - the guard is still worth
+        # having and refusing to bring the tunnel up would be worse than the
+        # leak - but the loss of crash safety is exactly the case a silent
+        # success would hide.
+        warnings.append(f"{arm_msg}. The rule is live but NOT crash-safe: a "
+                        "hard kill, BSOD or power loss would leave this machine "
+                        "without DNS until TunTop is launched again. Run "
+                        "--remove-dns-guard to clear it by hand")
+    msg = f"pinned to {', '.join(resolvers)}"
+    if not warnings:
+        # Named explicitly, because "the machine has no DNS until you reboot"
+        # is not something the operator should have to know to look for.
+        return True, msg + " (crash-safe: a one-shot startup task will remove it)"
+    return True, f"{msg} - WARNING: " + "; ".join(warnings)
 
 
 def uninstall(runner: Optional[Callable] = None,
@@ -548,7 +807,19 @@ def uninstall(runner: Optional[Callable] = None,
                        + text.split("DNS_GUARD_UNINSTALL_FAIL:", 1)[1].strip())
     if "DNS_GUARD_REMOVED" in text:
         clear_state(path=path)
-        return True, "removed"
+        # ONLY here, and only now. The boot task is the removal's safety net,
+        # so it must outlive every failed attempt (the rule is still live) and
+        # must not outlive a confirmed one. A disarm failure does not make the
+        # removal a failure - the task self-deletes at the next boot having
+        # found nothing - but it is reported, never swallowed.
+        _disarmed, disarm_msg = disarm_boot_cleanup(runner=run)
+        if _disarmed:
+            return True, "removed (boot cleanup task disarmed)"
+        return True, ("removed, but the boot cleanup task could not be "
+                      f"unregistered ({disarm_msg}). It is harmless: it runs "
+                      "once at the next boot, finds no rule and deletes "
+                      "itself. Remove it with: Unregister-ScheduledTask "
+                      f"-TaskName {BOOT_TASK_NAME}")
     # The command ran and reported NEITHER marker. That is not proof that
     # nothing of ours was found: uninstall_script() sweeps with
     # -ErrorAction SilentlyContinue, so on a non-elevated process (or an
@@ -581,39 +852,32 @@ def detect(runner: Optional[Callable] = None) -> tuple:
     return bool(ok), state
 
 
+def _process_start_time(pid: int) -> Optional[int]:
+    """`pid`'s creation time in whole seconds since the epoch, or None.
+
+    Thin alias onto the shared leaf (tuntop/procidentity.py) so the DNS guard
+    and the crash-marker code cannot drift into two different notions of
+    "same process". See that module for why a bare PID cannot answer that.
+    """
+    return procidentity.process_start_time(pid)
+
+
 def _pid_alive(pid: int) -> bool:
     """True when `pid` is a RUNNING process. Unknown-means-dead on purpose:
     a false "dead" only means the rule gets removed (what every recovery path
     wants), while a false "alive" would strand a catch-all pin on a machine
-    that no longer has a tunnel."""
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
-    try:
-        import ctypes
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        k32 = ctypes.windll.kernel32
-        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not h:
-            # ERROR_ACCESS_DENIED (5) means the process EXISTS but belongs to
-            # another user/elevation level - treat it as alive; anything else
-            # is "not running".
-            return k32.GetLastError() == 5
-        try:
-            code = ctypes.c_ulong(0)
-            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
-                return True
-            return code.value == STILL_ACTIVE
-        finally:
-            k32.CloseHandle(h)
-    except Exception:
-        return False
+    that no longer has a tunnel.
+
+    Every uncertain branch returns False, including an access-denied
+    OpenProcess and a failed GetExitCodeProcess. The previous version
+    returned True for both - the one direction this docstring calls
+    dangerous, and the direction that made `ensure_removed` answer "left in
+    place" for an owner that was already gone. The trade is deliberate: a
+    second instance that cannot inspect the owner clears the rule (a leak the
+    tunnel's own health rows will show) rather than stranding a machine-wide
+    DNS pin to dead resolvers (no resolution at all).
+    """
+    return procidentity.process_alive(pid)
 
 
 def record_owner_alive(record: Optional[dict]) -> bool:
@@ -621,7 +885,16 @@ def record_owner_alive(record: Optional[dict]) -> bool:
 
     That is the multi-instance hazard: a second TunTop's teardown must not
     delete the catch-all pin the first one is still relying on, or the machine
-    silently goes back to leaking (with every health row still green)."""
+    silently goes back to leaking (with every health row still green).
+
+    The pid alone cannot answer that question - it is a recycled slot - so a
+    record that carries `owner_started` is only honoured when the LIVE
+    process is demonstrably the recorded one. A mismatch (or an unreadable
+    creation time) means the pid now belongs to somebody else, and this
+    returns False so the leftover is cleared instead of protected forever.
+    Records written before start times were tracked lack the key and fall
+    back to liveness alone, as they always did.
+    """
     if not isinstance(record, dict):
         return False
     pid = record.get("owner_pid")
@@ -631,6 +904,9 @@ def record_owner_alive(record: Optional[dict]) -> bool:
         if int(pid) == os.getpid():
             return False
     except (TypeError, ValueError):
+        return False
+    if record.get("owner_started") is not None and \
+            not procidentity.same_process(pid, record.get("owner_started")):
         return False
     return _pid_alive(pid)
 

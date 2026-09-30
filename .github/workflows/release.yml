@@ -94,13 +94,29 @@ jobs:
       # second line of defence: it turns "a release went out with a missing
       # asset" into a named, readable failure instead of whatever opaque
       # error the publishing action raises for a missing file.
+      #
+      # The standalone asset is the ONEDIR build (dist\TunTop\ since 1.0.51),
+      # published as a zip, and its name carries the version, so it is
+      # resolved by glob rather than hardcoded. Checking for the old
+      # dist\TunTop.exe here instead would have let a release publish with the
+      # onedir tree but no downloadable archive for it.
       - name: Verify the published artifacts exist
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $init = Get-Content -Raw -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tuntop\__init__.py')
+          $line = ($init -split '\r?\n' | Where-Object { $_ -match '^\s*__version__\s*=' } | Select-Object -First 1)
+          $version = ($line -split '=')[1].Trim().Trim('"', "'")
+          $standalone = Join-Path $env:GITHUB_WORKSPACE "dist\TunTop-$version-x64-standalone.zip"
+          $expected = @(
+            'dist\TunTop-x64.zip',
+            'dist\checksums.txt',
+            'dist\TunTop\TunTop.exe',
+            $standalone
+          )
           $missing = @()
-          foreach ($f in @('dist\TunTop-x64.zip', 'dist\TunTop.exe', 'dist\checksums.txt')) {
-            $p = Join-Path $env:GITHUB_WORKSPACE $f
+          foreach ($f in $expected) {
+            $p = if ([System.IO.Path]::IsPathRooted($f)) { $f } else { Join-Path $env:GITHUB_WORKSPACE $f }
             if (Test-Path -LiteralPath $p) {
               $item = Get-Item -LiteralPath $p
               Write-Output ("{0} - {1} bytes" -f $f, $item.Length)
@@ -118,9 +134,18 @@ jobs:
         # at f052065072d7e8e0811ea19967e868938377d1da.
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          # The self-extracting onefile exe is no longer published: it is what
+          # Defender's ML model quarantines (TunTop.spec documents onefile as
+          # the single most false-positive-prone PyInstaller layout, and a
+          # local 1.0.50 build was eaten mid-session as Trojan:Win32/Bearfoos.
+          # A!ml with four child processes flagged). dist/TunTop/TunTop.exe
+          # inside the standalone zip is the same application with no
+          # temp-dir self-extraction, and needs no AV exclusion to install.
+          # The glob covers the version in the archive name.
           files: |
             dist/TunTop-x64.zip
-            dist/TunTop.exe
+            dist/TunTop-*-x64-standalone.zip
+            dist/TunTop/TunTop.exe
             dist/checksums.txt
           generate_release_notes: true
           draft: false
