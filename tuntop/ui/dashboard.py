@@ -29,6 +29,24 @@ import socket
 import subprocess
 import sys
 import tempfile
+
+# `subprocess.CREATE_NO_WINDOW` exists only on Windows, and the attribute is
+# looked up when the kwarg is EVALUATED - not at import. So naming it bare
+# raises AttributeError on Linux, from inside the caller's `except Exception`.
+#
+# In `_netsh_batch_result` that was not cosmetic: the AttributeError was caught
+# by the blanket handler that already means "this batch did not run", so every
+# sweep on a non-Windows host returned (0, False) - a verdict indistinguishable
+# from "netsh refused every line". It is the exact class of bug this codebase
+# keeps auditing for: a programming error reported as a benign operational
+# outcome. `getattr(..., 0)` is the idiom the other four modules already use
+# (tuntop/tunnel/exec.py, which calls itself the chokepoint, plus
+# tuntop/network/routing.py, tuntop/core/cleanup_watchdog.py and
+# tuntop/network/procguard.py). This module was the one place that missed it,
+# at five call sites.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# Same story for the process-group flag the detached watchdog is spawned with.
+_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 import threading
 import time
 import traceback
@@ -1045,7 +1063,7 @@ def _https(proxy=False, v6=False, port=DEFAULT_SOCKS_PORT,
     for _ in range(2):
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=18,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
+                               creationflags=_NO_WINDOW)
             out = (p.stdout or "").strip() or (p.stderr or "").strip()
             last = (p.returncode == 0 and out.startswith("2"), out)
             if last[0]:
@@ -2199,7 +2217,7 @@ def _netsh_batch_result(lines, add=False, timeout=180):
             try:
                 proc = subprocess.run(["netsh", "-f", path],
                                       capture_output=True, timeout=timeout,
-                                      creationflags=subprocess.CREATE_NO_WINDOW)
+                                      creationflags=_NO_WINDOW)
             except subprocess.TimeoutExpired:
                 return 0, False
             out = ((proc.stdout or b"").decode("utf-8", "replace")
@@ -8751,7 +8769,7 @@ class BTopTui:
                 # (its stdout is piped, so nothing was ever printed in it).
                 # CREATE_NO_WINDOW alone keeps a piped child console-free
                 # (the exact pattern every other TunTop spawn uses).
-                creationflags=subprocess.CREATE_NO_WINDOW)
+                creationflags=_NO_WINDOW)
             # TIE tun2socks TO THE HELPER'S LIFETIME. The helper is a plain
             # parent, so killing it used to leave tun2socks running - still
             # holding the Wintun adapter, its routes and the traffic path,
@@ -11541,8 +11559,8 @@ def main():
                          # as the helper child) is the only flag pair that
                          # empirically produced zero windows for a detached
                          # frozen child; DEVNULL stdio never needs a console.
-                         creationflags=subprocess.CREATE_NO_WINDOW |
-                                 subprocess.CREATE_NEW_PROCESS_GROUP)
+                         creationflags=_NO_WINDOW |
+                                 _NEW_PROCESS_GROUP)
     except Exception as e:
         # Watchdog is best-effort; if it fails to start, the next launch's
         # startup_recover still cleans everything.

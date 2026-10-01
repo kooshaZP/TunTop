@@ -133,7 +133,18 @@ def process_alive(pid) -> bool:
     both: a false "dead" only means a leftover gets cleaned up, while a
     false "alive" strands a machine-wide DNS pin or protects a crashed
     session's state forever. This process is trivially alive.
+
+    A BOOL IS NOT A PID. `int(True)` is 1, so the coercion below used to turn
+    a stray `True` into a liveness question about PID 1 - which is alive on
+    every POSIX host, so the function answered "yes, PID 1 is running" and a
+    caller asking about a malformed record was told the owner was alive. That
+    is the dangerous direction this docstring exists to prevent, and it was
+    invisible on Windows only because OpenProcess on PID 1 fails there for an
+    unrelated reason. Reject the type rather than answer about a PID the
+    caller never named.
     """
+    if isinstance(pid, bool):
+        return False
     try:
         pid = int(pid)
     except (TypeError, ValueError):

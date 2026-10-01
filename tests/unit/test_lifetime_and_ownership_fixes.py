@@ -236,13 +236,33 @@ class TestWatchdogKillIdentity(unittest.TestCase):
         run.assert_not_called()
 
     def test_a_matching_creation_time_allows_the_kill(self):
+        # sys.platform is patched because kill_pid refuses on a non-Windows
+        # host by design (below): both the fast path and the fallback are
+        # taskkill and TerminateProcess, so there is nothing to run on POSIX.
+        # Without this the assertion only ever held on Windows and failed the
+        # Linux job.
         with mock.patch.object(procidentity, "same_process",
                                return_value=True), \
+             mock.patch.object(cleanup_watchdog.sys, "platform", "win32"), \
              mock.patch.object(cleanup_watchdog.subprocess, "run") as run:
             run.return_value = mock.Mock(returncode=0)
             self.assertTrue(cleanup_watchdog.kill_pid(
                 5555, recorded_start=999999))
         run.assert_called_once()
+
+    def test_a_non_windows_host_refuses_rather_than_guessing(self):
+        """The platform gate is a real branch with a real answer, so it is
+        tested rather than skipped: `taskkill /F /T` and `TerminateProcess` are
+        Windows-only, and a watchdog that could not terminate anything must
+        say so instead of reporting a kill that never happened."""
+        if os.name == "nt":
+            self.skipTest("this asserts the non-Windows refusal")
+        with mock.patch.object(procidentity, "same_process",
+                               return_value=True), \
+             mock.patch.object(cleanup_watchdog.subprocess, "run") as run:
+            self.assertFalse(cleanup_watchdog.kill_pid(
+                5555, recorded_start=999999))
+        run.assert_not_called()
 
 
 # ── A failed route-table read is not a successful removal ──────────────────
@@ -496,11 +516,20 @@ class TestHelperLifetimeIsBoundToADeadHelper(unittest.TestCase):
 
     def test_job_creation_failure_is_soft(self):
         """Refusing to start the tunnel because a lifetime guard could not be
-        installed would be a far worse outcome than running without one."""
+        installed would be a far worse outcome than running without one.
+
+        `create=True` is load-bearing. `ctypes.windll` exists only on Windows,
+        and without it `patch.object` raises AttributeError while trying to
+        *replace* something that was never there - so this test could only ever
+        run on the platform whose behaviour it is trying to pin down, and the
+        whole Linux CI job failed on it. Injecting the attribute makes the test
+        hermetic: the logic under test is `_create_kill_on_close_job` treating
+        a failed CreateJobObjectW as soft, which is platform-independent
+        decision-making, not platform machinery."""
         from tuntop.ui import dashboard
         with mock.patch.object(dashboard.sys, "platform", "win32"), \
              mock.patch.object(dashboard.ctypes, "windll",
-                               mock.Mock()) as windll:
+                               mock.Mock(), create=True) as windll:
             windll.kernel32.CreateJobObjectW.return_value = 0
             self.assertIsNone(dashboard._create_kill_on_close_job())
 

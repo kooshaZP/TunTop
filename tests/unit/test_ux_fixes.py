@@ -44,9 +44,14 @@ class TestHelperSpawnNoConsole(unittest.TestCase):
         # EMPTY (its stdout is piped, so nothing was ever printed in it).
         # The spawn must pass CREATE_NO_WINDOW alone - the same pattern
         # every other TunTop child spawn already uses.
+        #
+        # Matched on the flag, not on the spelling of the reference: the bare
+        # `subprocess.CREATE_NO_WINDOW` form is the same flag and the only one
+        # that raises AttributeError on a non-Windows host, so pinning the
+        # literal would have pinned the defect that failed the Linux CI job.
         import inspect
         src = inspect.getsource(dashboard.BTopTui.launch)
-        self.assertIn("creationflags=subprocess.CREATE_NO_WINDOW)", src)
+        self.assertIn("creationflags=_NO_WINDOW)", src)
         self.assertNotIn("CREATE_NEW_CONSOLE |", src)
         self.assertNotIn("CREATE_NEW_PROCESS_GROUP", src)
 
@@ -69,10 +74,21 @@ class TestWatchdogSpawnNoConsole(unittest.TestCase):
         import re
         src = inspect.getsource(dashboard.main)
         # The creationflags EXPRESSION of the watchdog spawn must not use
-        # DETACHED_PROCESS (comments mentioning the history are fine):
-        m = re.search(r"creationflags=subprocess\.[^)]*\)", src)
+        # DETACHED_PROCESS (comments mentioning the history are fine). The
+        # expression is matched on either spelling of the Windows-only flags:
+        # `subprocess.CREATE_*` (which raises AttributeError on POSIX, inside
+        # the caller's own except) or the guarded module constants, which is
+        # what the module now uses.
+        m = re.search(r"creationflags=[^)]*\)", src)
         self.assertIsNotNone(m, "watchdog creationflags expression not found")
         flags = m.group(0)
+        # Expand the guarded constants back to the flag names they stand for, so
+        # the assertions below are about WHICH flags are combined rather than
+        # about how the module happens to spell them. `_NO_WINDOW` is
+        # `getattr(subprocess, "CREATE_NO_WINDOW", 0)`; the bare spelling is
+        # Windows-only and is what failed the Linux CI job.
+        flags = flags.replace("_NO_WINDOW", "CREATE_NO_WINDOW")
+        flags = flags.replace("_NEW_PROCESS_GROUP", "CREATE_NEW_PROCESS_GROUP")
         self.assertNotIn("DETACHED_PROCESS", flags)
         self.assertIn("CREATE_NO_WINDOW", flags)
         self.assertIn("CREATE_NEW_PROCESS_GROUP", flags)

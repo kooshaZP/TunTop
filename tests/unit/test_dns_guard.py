@@ -16,6 +16,7 @@ import ctypes
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1141,12 +1142,53 @@ class TestWatchdogOutlivesTheSession(unittest.TestCase):
 
     def test_the_watchdog_is_spawned_without_the_console(self):
         """If it shared the console, Alt+F4 would kill it too and nothing
-        would be left to do the cleanup."""
+        would be left to do the cleanup.
+
+        Matched on the FLAG NAMES, not on one spelling of how they are
+        referenced. Both spellings are the same flag; only the bare
+        `subprocess.CREATE_*` form breaks on a non-Windows host, so pinning it
+        would pin the bug - and pinning the module constant would pin the fix
+        and fail the day someone inlines the getattr again."""
         from tuntop.ui import dashboard
         src = open(dashboard.__file__, encoding="utf-8").read()
         spawn = src.split("_wd_cmd = [sys.executable", 1)[1][:3000]
+        # Expand the guarded constants back to the flag names they stand for,
+        # so the assertions are about WHICH flags are combined rather than how
+        # the module spells them. `_NO_WINDOW` is
+        # `getattr(subprocess, "CREATE_NO_WINDOW", 0)` - the bare spelling is
+        # the same flag and the only one that raises AttributeError on a
+        # non-Windows host, which is what failed the Linux CI job.
+        spawn = spawn.replace("_NO_WINDOW", "CREATE_NO_WINDOW")
+        spawn = spawn.replace("_NEW_PROCESS_GROUP", "CREATE_NEW_PROCESS_GROUP")
         self.assertIn("CREATE_NO_WINDOW", spawn)
         self.assertIn("CREATE_NEW_PROCESS_GROUP", spawn)
+
+    def test_the_spawn_flags_are_portable(self):
+        """The reason the flag is now reached through a guarded constant.
+
+        `subprocess.CREATE_NO_WINDOW` exists only on Windows, and the attribute
+        is resolved when the kwarg is EVALUATED, so a bare reference raises
+        AttributeError from inside the caller's `except Exception`. In
+        `_netsh_batch_result` that turned into (0, False) - "the batch did not
+        run" - which is the verdict that vetoes a clean report. Nothing pinned
+        this, so the Linux CI job failed on it while Windows was green.
+        """
+        from tuntop.ui import dashboard
+        self.assertEqual(dashboard._NO_WINDOW,
+                         getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertEqual(dashboard._NEW_PROCESS_GROUP,
+                         getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        # No call site may name the attribute directly again.
+        src = open(dashboard.__file__, encoding="utf-8").read()
+        code = "\n".join(ln for ln in src.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        for bare in ("subprocess.CREATE_NO_WINDOW",
+                     "subprocess.CREATE_NEW_PROCESS_GROUP",
+                     "subprocess.DETACHED_PROCESS",
+                     "subprocess.CREATE_NEW_CONSOLE"):
+            self.assertNotIn(bare, code,
+                             f"{bare} is Windows-only; reach it through the "
+                             "guarded module constant instead")
 
 
 class TestStaleWintunDeviceCleanup(unittest.TestCase):
