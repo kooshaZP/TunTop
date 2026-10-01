@@ -94,7 +94,7 @@ from tuntop.routing import (          # noqa: E402, F401
     # old behaviour. tests/routing/test_routing_quoting.py asserts that
     # identity for every name below, so an "unused import" cleanup here is
     # a regression, not a tidy-up.
-    _ps, _netsh, _teardown_wintun,
+    _ps, _netsh, _teardown_wintun, remove_tunnel_adapters,
     _add_route_v4, _del_route_v4, _add_route_v6, _del_route_v6,
     _del_route_scoped, _tun_family_aliases, _route_rows,
     _route_exists_v4, _route_exists_v6,
@@ -102,6 +102,7 @@ from tuntop.routing import (          # noqa: E402, F401
     _get_egress_for, _get_vpn_ipv4_default, _get_vpn_ipv6_default,
     _dump_route_table_ps, _dump_route_table_full_ps, _parse_route_rows,
 )
+from tuntop.network import egress_scripts as _egress_scripts  # noqa: E402
 from tuntop.network.egress_scripts import (  # noqa: E402  (single source)
     is_tun_iface as _is_tun_iface,
     TUN_DRIVER_RE as _TUN_DRIVER_RE,
@@ -2560,6 +2561,15 @@ class BTopTui:
         self._dash_mode = None  # console mode the dashboard runs in (set in _init_mouse)
         self._live_geo_added = []  # geo routes this dashboard process installed live (for cleanup on stop)
         self._live_bypass_added = []  # live [A] bypass-IP routes (for cleanup on stop)
+        # Country codes this session applied geo bypasses for and has since
+        # stopped bypassing. Used ONLY by _write_watchdog_state, for the crash
+        # sweep: `geo_victims` identifies a leftover by comparing its prefix
+        # against a CIDR set, so after a `[F]` switch only the CURRENT code's
+        # routes can be named - a hard kill then left the previous country's
+        # routes installed with no owner able to identify them. `[F]` -> 4
+        # removes the configured country on request, but a crash can land
+        # between the switch and any removal.
+        self._geo_prev_codes = {}
         self._geo_dl_active = False   # a background geoip download is running
         self._geo_applied_target = None  # egress target the live geo routes currently point at
         self._route_snapshot = None  # pre-session routing table (see _take_route_snapshot)
@@ -4099,7 +4109,24 @@ class BTopTui:
         with self._bypass_res_lock:
             st = state.get(entry)
             if st is None or st.get("status") != "ok":
-                state[entry] = self._bypass_new_state()
+                state[entry] = self._bypass_new_state()   # next = 0.0 -> due now
+            else:
+                # FORCE THE CYCLE. This used to leave an already-ok entry alone,
+                # including its `next`, which _bypass_resolve_entry had set to
+                # now + _BYPASS_REFRESH (300 s) so a healthy entry is not
+                # re-resolved constantly. _bypass_resolve_tick only queues an
+                # entry where `next <= now`, so pressing [A] on a working entry
+                # queued NOTHING: the two lines below announced "re-applying
+                # now" and "resolving + installing the route live in the
+                # background", and the process then sat idle for up to five
+                # minutes.
+                #
+                # That is the wrong answer to the request. Pressing [A] on an
+                # entry the panel already calls OK is how a user FORCES a repair
+                # after something outside TunTop stole or stripped the route -
+                # exactly when a five-minute wait is not acceptable. Same idiom
+                # as _on_vpn_arrived, which forces the cycle the same way.
+                st["next"] = 0.0
         target_note = " (second hop: proxy2)" if target == "proxy2" else (
             " (egress: Windows VPN)" if target == "vpn" else "")
         if already:
@@ -4157,6 +4184,31 @@ class BTopTui:
         with self._bypass_res_lock:
             state.pop(entry, None)
         self.checks = build_checks(self.ns)
+        # Prune the LIVE LEDGER here, not only at teardown. _live_bypass_added
+        # is what _reroute_own_bypass_live rebuilds from, so a row left behind
+        # resurrects the deleted entry on the next [GATEWAY] event or [V]/[Y]
+        # toggle. Two knock-on consumers of the same leak: _protected_geo_prefixes
+        # would keep shielding the prefix from geoip forever, and the [Q] sweep
+        # would be handed routes that no longer exist - netsh's "element not
+        # found" is a failure, so _batch_delete_routes returned failed() and the
+        # quit reported "some routes may still be installed" and retained the
+        # crash marker on a table that was in fact clean.
+        #
+        # Match on the resolved prefixes this entry actually installed. The
+        # delete below is per-IP and backgrounded, so the row is dropped here on
+        # the main thread: a delete that fails leaves no ledger row to retry
+        # from, which is the right direction - a stale tracking row is the bug
+        # being fixed, and the [Q] sweep still matches the live table by
+        # destination for anything genuinely left behind.
+        try:
+            stale = {f"{ip}/32" if ":" not in str(ip) else f"{ip}/128"
+                     for ip in known}
+            if stale:
+                self._live_bypass_added[:] = [
+                    row for row in self._live_bypass_added
+                    if row[1] not in stale]
+        except Exception:
+            pass
         self.log_lines.append(f"[-] Removed '{entry}' from the {target} bypass list.")
         # Removal is ALWAYS a live, backgrounded route delete - it must never
         # restart the tunnel (that would reload geo and briefly drop traffic for
@@ -4564,6 +4616,68 @@ class BTopTui:
             return
         self._reroute_own_bypass_live()
 
+    def _live_bypass_dests(self):
+        """Every destination prefix the BYPASS LISTS still authorise, as
+        {'v4': set(/32...), 'v6': set(/128...)}.
+
+        `_live_bypass_added` is a CACHE of what was installed, not a statement
+        of what the user wants. Two paths write it ([A] and the [GATEWAY]
+        re-point) and one used to prune it wholesale at teardown only, so
+        `_remove_bypass_ip` left the row behind: the entry was gone from
+        `ns.bypass_ip` and its per-entry resolution state, but its installed
+        route stayed in the ledger. The next `_reroute_own_bypass_live` - a
+        [GATEWAY] event, or a [V]/[Y] toggle - rebuilds rows from that ledger
+        with no membership check and re-adds the row at the new egress. A
+        bypass the user deliberately deleted comes back, and the re-point then
+        rewrites the tracking to the new gateway, so nothing ever repairs it.
+
+        So the lists are the authority and this is the membership test, applied
+        where the ledger is consumed as well as at the point of removal. Both
+        the resolver state and the per-target resolution cache are consulted:
+        state is popped on removal, but a cache entry is a pure DNS record with
+        no lifecycle, so a route for a live entry must not be dropped merely
+        because its state row was replaced. Union, not intersection - a prefix
+        either is still authorised or is not.
+
+        A prefix that is in NO list is dropped from the ledger AND from the
+        re-point (the caller logs it), so the two cannot drift again.
+        """
+        out = {"v4": set(), "v6": set()}
+        for target in ("direct", "proxy2", "vpn"):
+            # Defensive on every attribute: this runs on the re-point's
+            # background thread, where an AttributeError would be caught by the
+            # worker's blanket handler and surface as a silent "re-route failed"
+            # with nothing re-pointed - the same invisible-failure class this
+            # method exists to prevent. `_bypass_stores` is NOT used here: it
+            # returns a PAIR, so a single missing cache dict raised while
+            # building the tuple and took the state dict down with it.
+            store = {
+                "direct": ("_bypass_res_state", "_bypass_res_cache"),
+                "proxy2": ("_proxy2_res_state", "_proxy2_res_cache"),
+                "vpn": ("_vpn_res_state", "_vpn_res_cache"),
+            }[target]
+            state = getattr(self, store[0], None) or {}
+            cache = getattr(self, store[1], None) or {}
+            for st in state.values():
+                for ip in ((st or {}).get("ips") or []):
+                    if ":" in str(ip):
+                        out["v6"].add(f"{ip}/128")
+                    else:
+                        out["v4"].add(f"{ip}/32")
+            # The CACHE has a different shape - entry -> (v4_list, v6_list), not
+            # a state dict - so it is read separately rather than through a
+            # shape-agnostic loop. Reading it with the state's accessor raised
+            # AttributeError, which the caller's except turned into a silent
+            # "re-route failed" with nothing re-pointed.
+            for pair in cache.values():
+                if not isinstance(pair, (tuple, list)) or len(pair) < 2:
+                    continue
+                for ip in (pair[0] or []):
+                    out["v4"].add(f"{ip}/32")
+                for ip in (pair[1] or []):
+                    out["v6"].add(f"{ip}/128")
+        return out
+
     def _reroute_own_bypass_live(self):
         """Re-point the routes THIS dashboard installed after launch
         (_live_bypass_added: [A]-added entries) at the new mode's egress,
@@ -4598,10 +4712,34 @@ class BTopTui:
                     for ip in (st.get("ips") or []):
                         vpn_ips.add(f"{ip}/32" if ":" not in str(ip)
                                     else f"{ip}/128")
-                rows = [(fam, dest, iface, gw)
-                        for fam, dest, iface, gw in list(self._live_bypass_added)
-                        if not _is_tun_iface(iface)
-                        and dest not in vpn_ips]
+                # MEMBERSHIP TEST against the bypass lists. Without this the
+                # ledger alone decides, and a row left behind by an [X] is
+                # re-added here - a bypass the user deleted comes back, and
+                # the re-point below rewrites its tracking to the new gateway
+                # so nothing repairs it. See _live_bypass_dests.
+                allowed = self._live_bypass_dests()
+                dropped = []
+                kept = []
+                for fam, dest, iface, gw in list(self._live_bypass_added):
+                    if not _is_tun_iface(iface) and dest in vpn_ips:
+                        continue          # VPN-tagged: excluded below by design
+                    if dest in allowed[fam]:
+                        kept.append((fam, dest, iface, gw))
+                    else:
+                        dropped.append((fam, dest, iface, gw))
+                if dropped:
+                    # Forget them: a ledger row that is not authorised is a
+                    # leak in every consumer - the [Q] sweep would try to
+                    # delete routes that no longer exist (netsh's "element not
+                    # found" is a failure, so a CLEAN table was reported as
+                    # "some routes may still be installed" and the crash marker
+                    # was retained), and _protected_geo_prefixes would keep
+                    # protecting the prefix from geoip forever.
+                    self._live_bypass_added[:] = kept
+                    self._blog(f"[*] Dropped {len(dropped)} stale live bypass "
+                               f"ledger row(s) for entries no longer in any "
+                               f"bypass list.")
+                rows = kept
                 if not rows:
                     return
                 over = bool(getattr(self.ns, "vless_over_vpn", False))
@@ -5086,9 +5224,27 @@ class BTopTui:
                 examples=["ir = Iran   cn = China   ru = Russia   pk = Pakistan",
                           "or enter any ISO country code",
                           "leave empty to cancel"])
+            new_code = (new_code or "").strip().lower()
             if not new_code:
                 return
-            self.ns.geoip_code = new_code.strip().lower()
+            # Remember what we are leaving. `geo_victims` can only name routes
+            # whose prefix is in the CURRENT country's CIDR set, so after this
+            # switch the previous country's routes (which [F] -> 2 does not
+            # remove - it applies the new code, and the removal option is a
+            # separate action) belong to a set no sweep can name any more. The
+            # sidecar's geoip_codes is read by the cleanup watchdog, which
+            # sweeps every code this session used after a crash. Without it a
+            # `[F]` country switch followed by a hard kill left the OLD
+            # country's routes installed with no owner able to identify them.
+            #
+            # A BLANK entry must not get here (the guard above) - a bare
+            # newline is truthy, and recording the old code on the way to
+            # clearing geoip_code would tell the watchdog to sweep a country
+            # the user is still bypassing. Hence strip-then-check.
+            prev = str(getattr(self.ns, "geoip_code", None) or "").strip().lower()
+            if prev and prev != new_code:
+                self._geo_prev_codes[prev] = True
+            self.ns.geoip_code = new_code
             # The memoised sweep CIDR set now describes the PREVIOUS country.
             self._invalidate_geo_cache()
             self.log_lines.append(
@@ -5578,6 +5734,23 @@ class BTopTui:
         if new_port == old_port:
             self.log_lines.append(f"[i] Already using SOCKS port {old_port}.")
             return
+        # REFUSE THE PROXY2 COLLISION HERE, where the value is typed. The
+        # helper used to catch this and sys.exit() - but it is reached only
+        # AFTER _apply_launch_change -> restart, so the user got "restarting
+        # the tunnel in the background", then a FAILED tunnel, and the only
+        # explanation buried in helper stdout. The helper now degrades instead
+        # of exiting, so the primary tunnel survives a command-line mistake;
+        # the dashboard still refuses it outright, because a restart the user
+        # did not ask for is the more expensive mistake of the two.
+        p2 = getattr(self.ns, "proxy2_port", None)
+        if p2 is not None and new_port == p2:
+            self.log_lines.append(
+                f"[!] {new_port} is the PROXY2 port, not the primary's - the "
+                f"second hop is configured for 127.0.0.1:{p2}. Setting the "
+                f"primary to the same value would make the second pipe point "
+                f"at the primary proxy. Change or remove proxy2 with [Z] "
+                f"first, or pick a different primary port.")
+            return
         self.log_lines.append(
             f"[*] Changing SOCKS port {old_port} -> {new_port}; tun2socks has to restart "
             "for this (no live hot-swap), so the tunnel will briefly drop...")
@@ -5633,6 +5806,16 @@ class BTopTui:
                     + [h for h in (getattr(self.ns, "vpn_bypass_ip", None) or []) if h])),
                 "geoip": getattr(self.ns, "geoip", None),
                 "geoip_code": getattr(self.ns, "geoip_code", None),
+                # Every country this session bypassed, current first. The
+                # watchdog sweeps all of them: `geo_victims` matches on prefix,
+                # so a single code can only ever name that country's routes -
+                # and after a `[F]` switch a crash would strand the previous
+                # country's routes with nothing able to identify them.
+                "geoip_codes": sorted({str(c).strip().lower() for c in
+                                       (list(getattr(self, "_geo_prev_codes", None)
+                                             or {}) +
+                                        [getattr(self.ns, "geoip_code", None)])
+                                       if c and str(c).strip()}),
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f)
@@ -5723,11 +5906,33 @@ class BTopTui:
                     getattr(self.ns, "dns6", None))
                 _servers = [s for s in (_eff4, _eff6) if s]
                 _lst = ",".join("'" + s + "'" for s in _servers)
-                _ps("Set-DnsClientServerAddress -InterfaceAlias 'wintun' "
-                    f"-ServerAddresses @({_lst}) -ErrorAction SilentlyContinue; "
+                # -ErrorAction Stop, and ps_quote(TUN) rather than a hardcoded
+                # 'wintun'. Every other DNS path in the project names the
+                # shared TUN constant precisely so a renamed or reconfigured
+                # tunnel cannot diverge (see the rationale above TUN and the
+                # ps_quote(TUN) at the endpoint-route install). This one was
+                # the exception. Combined with SilentlyContinue and a discarded
+                # result, [N] with the tunnel STOPPED logged
+                # "Wintun DNS4 set to ... (live)" although nothing had been
+                # applied at all - a false success claim on the one action
+                # where the user is told the change took effect immediately.
+                _ps(f"Set-DnsClientServerAddress -InterfaceAlias '{ps_quote(TUN)}' "
+                    f"-ServerAddresses @({_lst}) -ErrorAction Stop | Out-Null; "
                     "Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null; "
                     "ipconfig /flushdns | Out-Null")
-                self._blog(f"[+] Wintun {label} set to {ip} (live).")
+                # Report what the other family did, not only the one typed:
+                # a v6 address here CLEARS IPv4, and the user is entitled to
+                # know that before the next lookup fails. Derived from the
+                # effective pair - the raw ns attribute says nothing.
+                if _eff4 and _eff6:
+                    _other = ""
+                elif _eff4:
+                    _other = " Its IPv6 resolver is now UNSET."
+                elif _eff6:
+                    _other = " Its IPv4 resolver is now UNSET."
+                else:
+                    _other = ""
+                self._blog(f"[+] Wintun {label} set to {ip} (live).{_other}")
             except Exception as e:
                 self._blog(f"[!] Live DNS apply failed ({e}) - the helper's "
                            "monitor loop will re-apply it within seconds.")
@@ -5871,6 +6076,19 @@ class BTopTui:
         except ValueError:
             self.log_lines.append(f"[!] Invalid port: {val!r}")
             return
+        # The collision check _change_port has, for the same reason: a second
+        # pipe to the primary proxy is pointless, and the helper used to answer
+        # it with sys.exit() AFTER this function had already restarted the
+        # tunnel - so the user got a FAILED tunnel and an explanation buried in
+        # helper stdout. Refuse it where the value is typed.
+        primary = getattr(self.ns, "port", None)
+        if primary is not None and port == primary:
+            self.log_lines.append(
+                f"[!] {port} is already the PRIMARY SOCKS5 port. A second pipe "
+                f"to the same proxy is pointless and only adds a second "
+                f"adapter. Pick a different port for proxy2, or type OFF to "
+                f"remove it.")
+            return
         self.ns.proxy2_port = port
         srv = self._read_line(
             "proxy2's own upstream server(s) (comma/space separated, "
@@ -5998,27 +6216,33 @@ class BTopTui:
         except Exception as e:
             self._blog(f"[!] geoip parse failed ({code}): {e}")
             return
-        # Egress target changed live? Remove the routes that still point at
-        # the OLD egress first, so no country CIDR ends up with two routes
-        # (one via the old egress, one via the new).
+        # Egress target changed live? The old country routes are swept further
+        # down - but ONLY after the new egress has been resolved and proven
+        # usable.
         #
         # REMOVE-BEFORE-INSTALL, batched and CIDR-based: we sweep EVERY live
         # route whose prefix belongs to this country (on ANY interface -
         # physical NIC, wintun2, Windows VPN, ...) before installing the new
-        # egress. The old code only removed routes it had itself tracked in
-        # _live_geo_added, one PowerShell call per route, and only when the
-        # target had changed - so helper-installed routes from an earlier run
-        # stayed behind, every re-apply re-added the full set, and the
-        # "thousands of already-exists errors / geo upload takes forever"
-        # mess followed. One route-table dump + parallel netsh -f batches is
-        # seconds even for a full country.
-        if self._live_geo_added and self._geo_applied_target \
-                and self._geo_applied_target != target:
-            self._blog(f"[*] Geo egress changed {self._geo_applied_target} -> "
-                       f"{target}; removing the old country routes first...")
-        self._remove_geo_routes_for(cidrs)
-        self._live_geo_added = []
-        self._geo_applied_target = None
+        # egress, so no country CIDR ends up with two routes. The old code only
+        # removed routes it had itself tracked in _live_geo_added, one
+        # PowerShell call per route, and only when the target had changed - so
+        # helper-installed routes from an earlier run stayed behind, every
+        # re-apply re-added the full set, and the "thousands of already-exists
+        # errors / geo upload takes forever" mess followed. One route-table
+        # dump + parallel netsh -f batches is seconds even for a full country.
+        #
+        # THE SWEEP USED TO RUN FIRST, so the order was: destroy the working
+        # routes, THEN discover there is no usable egress. The proxy2 branch
+        # made that concrete - it checked `ns.proxy2_port` (CONFIGURED, not up)
+        # and ignored `_proxy2_active`, the flag that exists precisely to say
+        # the wintun2 pipe is not running. So with proxy2's SOCKS5 closed, [R]
+        # deleted a working bypass, then targeted an adapter that was not there,
+        # and every netsh add failed: the country ended up in the TUN - worse
+        # than not bypassing it at all, and with a success line already
+        # printed before the attempt was even made. The neighbouring winvpn
+        # branch already got this right (it retries 4x and returns WITHOUT
+        # touching the table when no route exists); every branch now returns
+        # before the sweep, not after it.
         if target == "winvpn":
             # Route the country ranges out through a CONNECTED Windows VPN.
             # (This branch was MISSING: [F] -> 3=vpn sets geoip_target="winvpn",
@@ -6055,6 +6279,21 @@ class BTopTui:
             if not getattr(self.ns, "proxy2_port", None):
                 self._blog("[!] geoip via proxy2 requested but proxy2 is not "
                            "configured (press [Z]) - using the direct egress.")
+                target = "direct"
+            elif not getattr(self, "_proxy2_active", False):
+                # CONFIGURED IS NOT UP. This branch used to test only
+                # ns.proxy2_port, so with the second proxy's SOCKS5 closed the
+                # worker targeted an adapter that was not there, every netsh
+                # add failed, and - because the sweep had already run by then -
+                # the working bypass was gone too. `_proxy2_active` is the flag
+                # that exists for exactly this question, and the helper's own
+                # "[*] proxy2 pipe skipped - SOCKS5 not listening" marker clears
+                # it. Degrade to direct, which at least works.
+                self._blog(
+                    f"[!] geoip via proxy2 requested but the second proxy is "
+                    f"NOT running (nothing is listening on 127.0.0.1:"
+                    f"{self.ns.proxy2_port}) - using the direct egress "
+                    f"instead. The existing geo bypass was left in place.")
                 target = "direct"
             else:
                 t2, t2_ip4, t2_ip6 = self._tun2_constants()
@@ -6115,6 +6354,14 @@ class BTopTui:
             if v6:
                 v6iface, v6gw = v6[0], v6[1]
             g_iface, g_gw = iface_gw[0], iface_gw[1]
+        # ── The old egress goes away ONLY HERE ────────────────────────────
+        # Every branch above has now either returned (no usable egress - and
+        # the working bypass is untouched) or produced a verified
+        # (g_iface, g_gw). Only now is it safe to sweep the country routes
+        # pointing at the old egress.
+        self._remove_geo_routes_for(cidrs)
+        self._live_geo_added = []
+        self._geo_applied_target = None
         # Capture only the routes this call adds (the helper appends to its own
         # module-global geoip_added); we then hand ownership to the dashboard.
         # Redirect stdout to a sink that dispatches each line exactly like the
@@ -6574,11 +6821,20 @@ class BTopTui:
                 self._change_port(val)
             return True
         elif key == 'n':
-            _cur4 = getattr(self.ns, "dns4", None) or (_cfgdef.DNS4 + " (default)")
-            _cur6 = getattr(self.ns, "dns6", None) or "(not set)"
+            # The EFFECTIVE pair, from the same single source the helper and
+            # build_checks use - never a guess. `dns4 or (DNS4 + " (default)")`
+            # claimed the default v4 resolver was in force after a v6-only [N]
+            # had actually CLEARED it (resolve_dns_choice: a v6-only choice gets
+            # no default v4 injected), so the prompt told the user the old
+            # value both before and after the change that removed it.
+            _cur4, _cur6 = _cfgdef.resolve_dns_choice(
+                getattr(self.ns, "dns4", None),
+                getattr(self.ns, "dns6", None))
+            _show4 = _cur4 or "none (IPv4 resolver CLEARED)"
+            _show6 = _cur6 or "none (IPv6 resolver CLEARED)"
             val = self._read_line(
                 f"New DNS server, IPv4 or IPv6 "
-                f"(current DNS4 {_cur4}, DNS6 {_cur6}):")
+                f"(current DNS4 {_show4}, DNS6 {_show6}):")
             if val:
                 self._change_dns(val)
             return True
@@ -7111,14 +7367,27 @@ class BTopTui:
             tun.append(_kv("RESOLVED", f"{GRAY}-{_R}"))
         tun.append(_kv("PROXY", f"{CYAN}127.0.0.1:{self.ns.port}{_R}"
                                 f"{GRAY} socks5{_R}"))
-        _d4 = getattr(self.ns, "dns4", None)
-        _d6 = getattr(self.ns, "dns6", None)
-        if _d4 and _d6:
-            _dns_txt = f"{CYAN}{_d4}{_R}{GRAY} / {_R}{CYAN}{_d6}{_R}"
-        elif _d4:
-            _dns_txt = f"{CYAN}{_d4}{_R}{GRAY} (v4 only){_R}"
-        elif _d6:
-            _dns_txt = f"{GRAY}(default {_cfgdef.DNS4}){_R} / {CYAN}{_d6}{_R}"
+        _eff4, _eff6 = _cfgdef.resolve_dns_choice(
+            getattr(self.ns, "dns4", None), getattr(self.ns, "dns6", None))
+        if _eff4 and _eff6:
+            _dns_txt = f"{CYAN}{_eff4}{_R}{GRAY} / {_R}{CYAN}{_eff6}{_R}"
+        elif _eff4:
+            _dns_txt = f"{CYAN}{_eff4}{_R}{GRAY} (v4 only){_R}"
+        elif _eff6:
+            # SAY THE TRUTH. This used to read
+            #   f"{GRAY}(default {_cfgdef.DNS4}){_R} / {CYAN}{_d6}{_R}"
+            # which claims the default v4 resolver is in force when setting a v6
+            # address has, in fact, CLEARED it: resolve_dns_choice returns
+            # (None, <the v6>) for a v6-only choice ("a v4-only choice gets NO
+            # default v6 injected, and vice versa"), and the helper honours a
+            # present-but-null key as "clear this family". So after one [N] with
+            # a v6 address the tunnel adapter had no IPv4 resolver at all while
+            # the panel advertised 8.8.8.8 - and the same wrong string was
+            # repeated in the [N] prompt, so the user was told the old value
+            # both before and after making the change. build_checks already
+            # resolved the pair correctly, so the health row said "v6 only / no
+            # v4 resolver" while CONFIG said otherwise, one panel above.
+            _dns_txt = f"{YELLOW}no v4 resolver{_R}{GRAY} / {_R}{CYAN}{_eff6}{_R}"
         else:
             _dns_txt = (f"{CYAN}{_cfgdef.DNS4} / {_cfgdef.DNS6}{_R}"
                         f"{GRAY} (defaults){_R}")
@@ -7168,7 +7437,24 @@ class BTopTui:
         bl.append(" " + vpn_dot + " " + _kv("VPN", vpn_val))
         if getattr(self.ns, "geoip", None):
             _gt = self._geo_target()
-            if _gt == "proxy2":
+            if _gt == "proxy2" and not getattr(self.ns, "proxy2_port", None):
+                # CONFIGURED INTENT IS NOT EFFECTIVE EGRESS. A profile can carry
+                # geoip_target "proxy2" with proxy2_port null - profiles.py saves
+                # the two independently, and restores the port only when the key is
+                # present. The [F] menu blocks choosing proxy2 without a port and
+                # the [R] worker degrades to direct with a log line, but this row
+                # rendered a GREEN dot either way, because it keys off config
+                # alone. Same class as the restart bug: the panel reported what
+                # was asked for, not what is installed.
+                geo_egress, geo_dot = ("proxy2 selected but NOT configured "
+                                       "- falling back to direct"), DOT_WARN
+            elif _gt == "proxy2" and not getattr(self, "_proxy2_active", False):
+                # Configured, and the pipe is known to be down. The same green
+                # dot would say the country exits via the second hop while the
+                # worker is sending it out the physical adapter.
+                geo_egress, geo_dot = ("proxy2 configured but NOT running "
+                                       "- falling back to direct"), DOT_WARN
+            elif _gt == "proxy2":
                 geo_egress, geo_dot = "via second proxy (proxy2)", DOT_OK
             elif _gt == "winvpn":
                 geo_egress, geo_dot = "via connected Windows VPN", DOT_OK
@@ -8436,6 +8722,14 @@ class BTopTui:
             cmd.append("--geoip-via-vpn")
         if self._geo_target() == "winvpn":
             cmd.append("--geoip-via-win-vpn")
+        # The proxy2 geo target was live-only until 1.0.51: the helper had no
+        # branch for it at all, so every RESTART - a [Z] port change, a [U]
+        # server switch, or the recovery engine restarting a crashed helper -
+        # installed every country CIDR via Wi-Fi while the status bar kept
+        # reading "via second proxy". The flag is what makes the choice survive
+        # a restart, exactly as --geoip-via-win-vpn already does.
+        if self._geo_target() == "proxy2" and getattr(self.ns, "proxy2_port", None):
+            cmd.append("--geoip-via-proxy2")
 
         try:
             # Force the child (helper) into UTF-8 so its log lines are readable
@@ -9040,7 +9334,19 @@ class BTopTui:
         for dest, iface, nh, metric, persistent in rows:
             verb = "ipv6" if ":" in str(dest) else "ipv4"
             iface_dq = '"' + str(iface).replace('"', '') + '"'
-            nh_tok = f" {nh}" if nh else ""
+            # ON-LINK NORMALISATION, matching _batch_delete_routes three
+            # functions below. netsh REJECTS a literal 0.0.0.0 next hop ("The
+            # filename, directory name, or volume label syntax is
+            # incorrect"), so a row read from the table with NextHop 0.0.0.0 -
+            # the normal form for a PPP/PPTP VPN and for a normal connected
+            # subnet - could be DELETED by the snapshot restore but never
+            # re-ADDED by it. That asymmetry is the whole bug: the restore
+            # reported the VPN's routes back and silently dropped the on-link
+            # ones. Every other netsh writer in this project normalises
+            # (helper.add_v4, _raw_add_route, _remove_routes_bulk, the geo
+            # installer); this one and the geo installer were the two that did
+            # not.
+            nh_tok = _egress_scripts.netsh_gw_token(nh)
             store = "persistent" if persistent else "active"
             lines.append(f"interface {verb} add route {dest} {iface_dq}"
                          f"{nh_tok} metric={int(metric or 0)} store={store}")
@@ -9197,22 +9503,11 @@ class BTopTui:
             # same copy the watchdog uses; prefixes come from
             # tuntop.config.defaults (single source).
             table = rows if rows is not None else self._dump_route_table()
-            raw = _rsweeps.lan_victims(table, iface, gw,
-                                       prefixes=LAN_BYPASS_PREFIXES)
-            dels = []
-            for dp, alias, nh in raw:
-                if nh in ("0.0.0.0", "::", "On-link", ""):
-                    # On-link: ours when it equals the current gateway's
-                    # iface; keep the original current-gw semantics.
-                    dels.append((dp, alias, ""))
-                    continue
-                if nh == gw:
-                    dels.append((dp, alias, ""))
-                    continue
-                # Real next-hop that is NOT the current gateway on the same
-                # adapter: a stale pin from a previous network - ours,
-                # deleted next-hop-exact so foreign routes survive.
-                dels.append((dp, alias, nh))
+            # The widening rule (which next-hop token each class needs) lives in
+            # routeops.sweeps beside the match rule, so the watchdog and this
+            # dashboard can never disagree about what a leftover LAN pin is.
+            dels = _rsweeps.lan_victim_deletes(table, iface, gw,
+                                               prefixes=LAN_BYPASS_PREFIXES)
             if not dels:
                 return SweepResult.clean(0, 0)
             return self._batch_delete_routes(dels)
@@ -9238,6 +9533,61 @@ class BTopTui:
         except Exception:
             return False
         return bool(ok)
+
+    def _sweep_doh_templates(self):
+        """Remove the machine-wide DoH mappings this session registered.
+
+        `Add-DnsClientDohServer` writes into the DNS client's own registry
+        store, not onto the wintun adapter - so unlike the adapter's addresses
+        or its resolvers, nothing that tears the adapter down reaches them.
+        Before this step no code path removed them at all, so every DoH address
+        TunTop ever enabled outlived both the tunnel and the process, on a
+        clean quit and after a crash alike.
+
+        Only addresses in the residue record are named, so a DoH mapping the
+        user configured themselves is never touched. Delegates to the helper's
+        implementation (tuntop/tunnel/helper.py) so the generated PowerShell
+        and the "verify, do not assume" re-enumeration exist once.
+        Returns True when nothing of ours is registered."""
+        try:
+            from tuntop.tunnel.helper import _remove_doh_servers
+            return bool(_remove_doh_servers())
+        except Exception as e:
+            self._blog(f"[!] DoH template removal failed: "
+                       f"{e.__class__.__name__}: {e}")
+            return False
+
+    def _restore_physical_metric(self):
+        """Put a crash-lowered physical-adapter InterfaceMetric back.
+
+        `ensure_physical_metric_below_vpn()` lowers the USER's Wi-Fi/Ethernet
+        metric (e.g. 4270 -> 9) so geo bypass routes beat a connected VPN's
+        identical-prefix routes, and the original value used to live only in
+        the helper's memory. A hard kill therefore left the metric lowered
+        permanently, with nothing remembering what it had been. It is on the
+        residue record now (tuntop/network/residue.py), and this is one of the
+        three owners that can act on it."""
+        try:
+            from tuntop.tunnel.helper import restore_recorded_physical_metric
+            return bool(restore_recorded_physical_metric())
+        except Exception:
+            return False
+
+    def _remove_tunnel_adapters(self):
+        """Remove the wintun adapter(s) and their PnP device nodes.
+
+        The adapter is a device, not a process: it survived every exit path
+        until now, carrying our static IP, resolvers, lowered metric and
+        disabled NetBIOS binding (see routing.remove_tunnel_adapters). Called
+        LAST in each teardown, after the route sweeps and the snapshot restore,
+        so a partially-failed sweep still leaves the adapter for the next
+        launch's preflight_cleanup."""
+        try:
+            return bool(remove_tunnel_adapters())
+        except Exception as e:
+            self._blog(f"[!] Tunnel adapter removal failed: "
+                       f"{e.__class__.__name__}: {e}")
+            return False
 
     def _sweep_geo_leftovers(self, progress=None, rows=None):
         """Last-resort exit sweep for HELPER-installed geoip country-bypass
@@ -9792,6 +10142,27 @@ class BTopTui:
                       self._final_host_route_sweep))
         tasks.append(("Restoring the pre-session route table",
                       self._restore_route_snapshot))
+        # Everything below is machine state that is NOT a route, so it can only
+        # be cleaned after the table has settled - and all three outlived every
+        # exit path until now:
+        #   * the physical adapter's InterfaceMetric, lowered by the VPN-shadow
+        #     pass. The original value lived only in the helper's memory, so a
+        #     force-killed helper left the user's Wi-Fi permanently at ~9.
+        #   * the machine-wide DoH templates. They live in the DNS client's
+        #     registry store, not on the adapter, so neither the adapter going
+        #     away nor any route sweep reached them - there was no
+        #     Remove-DnsClientDohServer anywhere in the project.
+        #   * the wintun adapter itself and its PnP device node. It is a device,
+        #     not a process, so it did NOT "die with the process tree"; until
+        #     now only the NEXT launch's preflight_cleanup removed it, so a
+        #     clean quit left a connected-looking adapter with our static IP,
+        #     resolvers, lowered metric and disabled NetBIOS binding.
+        tasks.append(("Restoring the physical adapter metric",
+                      self._restore_physical_metric))
+        tasks.append(("Removing the DoH templates we registered",
+                      self._sweep_doh_templates))
+        tasks.append(("Removing the wintun adapter + device node",
+                      self._remove_tunnel_adapters))
         # MUST stay last: the verify row is addressed positionally
         # (verify_idx = len(tasks) - 1) when the result is recorded below.
         tasks.append(("Verifying routes are clear",
@@ -9905,6 +10276,21 @@ class BTopTui:
         except Exception as e:
             self._blog(f"[!] Final route flush failed: "
                        f"{e.__class__.__name__}: {e}")
+
+        # Non-route residue, once the table is verified clear. Each is idempotent
+        # and each reports through _blog on failure; none may abort the quit,
+        # because the alternative is an exit that skipped them ALL.
+        for label, fn in (("physical adapter metric",
+                           self._restore_physical_metric),
+                          ("DoH templates", self._sweep_doh_templates),
+                          ("wintun adapter", self._remove_tunnel_adapters)):
+            try:
+                if not fn():
+                    self._blog(f"[!] Leftover {label} could not be fully "
+                               f"removed - rerun TunTop to sweep it.")
+            except Exception as e:
+                self._blog(f"[!] Leftover {label}: "
+                           f"{e.__class__.__name__}: {e}")
 
         self._cleanup_done = True
         self.running = False
@@ -10095,6 +10481,30 @@ class BTopTui:
             self._restore_route_snapshot()
         except Exception:
             pass
+        # Non-route residue, AFTER the table has settled. `[T]` stops the tunnel
+        # but keeps the dashboard open, so this is the point where the machine
+        # must look exactly as it did before [S]:
+        #   * the physical adapter's InterfaceMetric, lowered by the VPN-shadow
+        #     pass - its original lived only in the (now stopped) helper's
+        #     memory, so a force-killed helper left it lowered permanently;
+        #   * the machine-wide DoH templates, which live in the DNS client's
+        #     registry store and are touched by nothing else (there was no
+        #     Remove-DnsClientDohServer anywhere in the project);
+        #   * the wintun adapter and its PnP device node - a device, not a
+        #     process, so it never "died with the process tree" and only the
+        #     NEXT launch's preflight_cleanup removed it.
+        # Idempotent and never fatal: a refusal here is reported, and the next
+        # `[S]` preflight is the backstop for the adapter.
+        for label, fn in (("physical adapter metric",
+                           self._restore_physical_metric),
+                          ("DoH templates", self._sweep_doh_templates),
+                          ("wintun adapter", self._remove_tunnel_adapters)):
+            try:
+                if not fn():
+                    self.logs.put(f"[!] Leftover {label} could not be fully "
+                                  f"removed; the next tunnel start will retry.")
+            except Exception:
+                pass
         return ok
 
     def _stop_locked(self):
@@ -10788,10 +11198,16 @@ def main():
                          "vpn-as-geo) instead of bypassing them through the "
                          "physical adapter")
     ap.add_argument("--geoip-via-win-vpn", action="store_true",
-                    help="Route the geoip country ranges out through a connected "
-                         "Windows VPN instead of the physical adapter or wintun. "
-                         "Overrides --geoip-via-vpn. Falls back to wifi when no "
-                         "connected Windows VPN default route is found")
+                     help="Route the geoip country ranges out through a connected "
+                          "Windows VPN instead of the physical adapter or wintun. "
+                          "Overrides --geoip-via-vpn. Falls back to wifi when no "
+                          "connected Windows VPN default route is found")
+    ap.add_argument("--geoip-via-proxy2", action="store_true",
+                     help="Route the geoip country ranges out through the second "
+                          "proxy hop (wintun2) instead of the physical adapter or "
+                          "wintun. Falls back to wifi when the wintun2 pipe is not "
+                          "running. Set by the [F] geo target; the launch builder "
+                          "passes it automatically.")
     ap.add_argument("--log-adapter-activity", action="store_true",
                     dest="log_adapter_activity",
                     help="Log adapter traffic activity (UDP/TCP/QUIC/ICMP + "
@@ -11208,6 +11624,29 @@ def main():
             _teardown_wintun()
         except Exception:
             pass
+        # Non-route residue, after the table has settled (same three items as
+        # [Q] / [T] / the close handler). atexit is the last line, so whatever
+        # the interactive paths skipped lands here - but a partially failed
+        # sweep must NOT retire the crash marker over residue still on the
+        # machine, hence the local verdict rather than a fold into cleanup_ok.
+        residue_ok = True
+        if app is not None:
+            for label, fn in (("physical adapter metric",
+                               app._restore_physical_metric),
+                              ("DoH templates", app._sweep_doh_templates),
+                              ("wintun adapter",
+                               app._remove_tunnel_adapters)):
+                try:
+                    if not fn():
+                        residue_ok = False
+                        print(f"[!] Leftover {label} could not be fully "
+                              f"removed.")
+                except Exception as e:
+                    residue_ok = False
+                    print(f"[!] Leftover {label}: "
+                          f"{e.__class__.__name__}: {e}")
+        if not residue_ok:
+            cleanup_ok = False
         if cleanup_ok and helper_stopped:
             # Verified clean exit: the crash marker goes away, so the NEXT
             # launch knows it starts from a clean slate - and the detached
@@ -11261,7 +11700,8 @@ def main():
             # live routes run FIRST (they are what actually pollutes the
             # table); the multi-second PowerShell teardown comes after and is
             # allowed to be cut short - a killed _teardown_wintun is harmless
-            # (the adapter dies with the process tree), a killed route delete
+            # (the next launch's preflight removes whatever adapter it left),
+            # a killed route delete
             # is not (routes outlive us). The detached watchdog sweeps the
             # remainder either way (marker survives: atexit does not run
             # after this handler returns).
@@ -11376,6 +11816,24 @@ def main():
                         app._restore_route_snapshot()
                     except Exception:
                         pass
+                    # Then the non-route residue, inside the same close budget.
+                    # Each is one PowerShell call; each is idempotent; and each
+                    # outlived every exit path until now:
+                    #   * the physical adapter's InterfaceMetric (original value
+                    #     held only in the signalled helper's memory);
+                    #   * the machine-wide DoH templates (registry, not adapter -
+                    #     nothing else in the project removed them);
+                    #   * the wintun adapter + PnP node, a DEVICE that did not
+                    #     die with the process tree. All three come after the
+                    #     table settles, so a kill mid-sweep still leaves the
+                    #     next launch's preflight_cleanup as the backstop.
+                    for _fn in (app._restore_physical_metric,
+                                app._sweep_doh_templates,
+                                app._remove_tunnel_adapters):
+                        try:
+                            _fn()
+                        except Exception:
+                            pass
             finally:
                 app._stopping.clear()
                 if not fatal:
@@ -11507,6 +11965,20 @@ def main():
         except Exception:
             pass
         _teardown_wintun()
+        # Non-route residue, after the table: the physical adapter's metric, the
+        # machine-wide DoH templates, and the adapter's own PnP node. A crash
+        # leaves the crash marker in place, so the detached watchdog and the next
+        # launch both re-run these - running them here too is harmless (every
+        # one is idempotent) and means a crash does not depend on either owner
+        # being alive to notice.
+        if app is not None:
+            for _fn in (app._restore_physical_metric,
+                        app._sweep_doh_templates,
+                        app._remove_tunnel_adapters):
+                try:
+                    _fn()
+                except Exception:
+                    pass
         if is_interrupt:
             print("\n[*] Interrupted - tunnel and routes cleaned up.")
             return

@@ -212,6 +212,17 @@ class TestShutdownVerifyDedupe(unittest.TestCase):
             app, "_final_host_route_sweep", return_value=True))
         stack.enter_context(mock.patch.object(
             app, "_restore_route_snapshot", return_value=(0, 0)))
+        # The non-route residue steps added to the [Q] checklist (1.0.51).
+        # They are separate owners of separate state - the physical adapter's
+        # InterfaceMetric, the machine-wide DoH templates and the wintun
+        # adapter + PnP node - and each one is a real PowerShell call against
+        # this machine, so they must be stubbed here for the same reason the
+        # route sweeps are: these tests count what [Q] does, not what the
+        # network looks like afterwards.
+        for name in ("_restore_physical_metric", "_sweep_doh_templates",
+                     "_remove_tunnel_adapters"):
+            stack.enter_context(mock.patch.object(
+                app, name, return_value=True))
         stack.enter_context(mock.patch(
             "tuntop.ui.dashboard._teardown_wintun"))
         stack.enter_context(mock.patch(
@@ -273,6 +284,13 @@ class TestShutdownVerifyDedupe(unittest.TestCase):
             app, "_final_host_route_sweep", return_value=True))
         stack.enter_context(mock.patch.object(
             app, "_restore_route_snapshot", return_value=(0, 0)))
+        # The non-route residue steps of the [Q] checklist (1.0.51) - separate
+        # owners of separate machine state, and each one a real PowerShell call
+        # against this machine. Stubbed for the same reason the route sweeps are.
+        for name in ("_restore_physical_metric", "_sweep_doh_templates",
+                     "_remove_tunnel_adapters"):
+            stack.enter_context(mock.patch.object(
+                app, name, return_value=True))
         stack.enter_context(mock.patch(
             "tuntop.ui.dashboard._teardown_wintun"))
         stack.enter_context(mock.patch(

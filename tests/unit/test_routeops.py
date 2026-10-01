@@ -13,6 +13,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
+from tuntop.config.defaults import LAN_BYPASS_PREFIXES
 from tuntop.network.routeops import RouteLedger, RouteResult, sweeps
 
 
@@ -162,15 +163,76 @@ class TestSweeps(unittest.TestCase):
 
     def test_geo_victims_match_ipv6_canonically(self):
         """THE regression: parse_geoip rendered IPv6 uncompressed
-        ("2001:db8:0:0:0:0:0:0/32") while Get-NetRoute returns
-        ("2001:db8::/32"), so a string compare missed EVERY IPv6 geo route
+        ("2001:4860:0:0:0:0:0:0/32") while Get-NetRoute returns
+        ("2001:4860::/32"), so a string compare missed EVERY IPv6 geo route
         and they survived every sweep - the bypass intent stayed armed
-        against a dead tunnel."""
-        rows = [{"DestinationPrefix": "2001:db8::/32",
+        against a dead tunnel.
+
+        The prefix is Google's, not 2001:db8::/32: from Python 3.13
+        `is_private` includes the documentation ranges, so 2001:db8::/32 is
+        now correctly refused by `is_sweepable_geo_cidr` and a test built on
+        it started failing for a reason that has nothing to do with the
+        canonicalisation it is here to protect. (A documentation prefix is
+        also something the install side refuses, so it was never a realistic
+        geo range.)"""
+        rows = [{"DestinationPrefix": "2001:4860::/32",
                  "InterfaceAlias": "Wi-Fi", "NextHop": "fe80::1"}]
         self.assertEqual(
-            sweeps.geo_victims(rows, {"2001:db8:0:0:0:0:0:0/32"}),
-            [("2001:db8::/32", "Wi-Fi", "fe80::1")])
+            sweeps.geo_victims(rows, {"2001:4860:0:0:0:0:0:0/32"}),
+            [("2001:4860::/32", "Wi-Fi", "fe80::1")])
+
+    def test_geo_victims_refuse_ranges_the_install_would_refuse(self):
+        """The sweep must not be WIDER than the install.
+
+        `geo_victims` filtered nothing, so any prefix in a `.dat`'s country list
+        was deleted. `helper._is_routable_bypass_cidr` refuses these before
+        they are ever installed, and the invariant geoip.py states is that the
+        sweep boundary has to refuse them too. The load-bearing case is CGNAT:
+        `100.64.0.0/10` is in LAN_BYPASS_PREFIXES - so `_add_lan_bypass`
+        installs it on every run - and it is NOT `is_private` on the 3.10-3.12
+        CI matrix (it only became so in 3.13). So the install accepted it as a
+        routable country range, the LAN bypass installed the same prefix, and
+        the geo sweep then deleted TunTop's own route on every [R]/[F]->5, every
+        [Q] and every watchdog pass - while CGNAT (Tailscale, mobile
+        broadband) rode the physical NIC against the user's intent in between.
+        """
+        rows = [{"DestinationPrefix": c, "InterfaceAlias": "Wi-Fi",
+                 "NextHop": "g"}
+                for c in ("100.64.0.0/10", "10.0.0.0/8", "172.16.0.0/12",
+                          "192.168.0.0/16", "169.254.0.0/16", "0.0.0.0/0",
+                          "224.0.0.0/4", "127.0.0.0/8", "::/0",
+                          "fe80::/10", "2001:db8::/32", "fc00::/7")]
+        self.assertEqual(
+            sweeps.geo_victims(rows, {r["DestinationPrefix"] for r in rows}),
+            [], "the sweep deleted a range the install would have refused")
+
+    def test_geo_victims_still_hit_public_ranges_including_cgnats_neighbours(self):
+        """The filter must be a boundary, not a blanket refusal."""
+        rows = [{"DestinationPrefix": "5.0.0.0/8", "InterfaceAlias": "Wi-Fi",
+                 "NextHop": "g"},
+                {"DestinationPrefix": "2606:4700::/32",
+                 "InterfaceAlias": "Wi-Fi", "NextHop": "fe80::1"}]
+        self.assertEqual(
+            sweeps.geo_victims(rows, {"5.0.0.0/8", "2606:4700::/32"}),
+            [("5.0.0.0/8", "Wi-Fi", "g"),
+             ("2606:4700::/32", "Wi-Fi", "fe80::1")])
+
+    def test_geo_victims_enforce_the_prefix_floor(self):
+        """A /4 (v4) or /8 (v6) range is refused by install; the sweep must
+        not delete the user's other halves of the address space if one turns
+        up in a hand-built CIDR list."""
+        rows = [{"DestinationPrefix": "0.0.0.0/4", "InterfaceAlias": "Wi-Fi",
+                 "NextHop": "g"},
+                {"DestinationPrefix": "::/8", "InterfaceAlias": "Wi-Fi",
+                 "NextHop": "fe80::1"}]
+        self.assertEqual(sweeps.geo_victims(rows, {"0.0.0.0/4"}), [])
+        self.assertEqual(sweeps.geo_victims(rows, {"::/8"}), [])
+
+    def test_cgnat_is_a_lan_bypass_prefix_the_sweep_must_not_eat(self):
+        """Tie the two lists together: the prefix the LAN bypass installs is
+        exactly the one the geo sweep used to remove."""
+        self.assertIn("100.64.0.0/10", list(LAN_BYPASS_PREFIXES))
+        self.assertFalse(sweeps.is_sweepable_geo_cidr("100.64.0.0/10"))
 
     def test_host_route_stmts_families(self):
         stmts = sweeps.host_route_stmts(["1.2.3.4", "2606:4700::1111"])

@@ -236,6 +236,14 @@ class Probes:
     #: the registry.
     dns_guard_present: Optional[Callable[[], bool]] = None
     remove_dns_guard: Optional[Callable[[], bool]] = None
+    #: Non-route machine state this project changes: the physical adapter's
+    #: lowered InterfaceMetric and the machine-wide DoH templates. Both live in
+    #: tuntop/network/residue.py, which the writing process records precisely so
+    #: that a process which did NOT write them can undo them - which is what
+    #: this is. Same optional shape, and the same "exact True" contract, as the
+    #: DNS guard probe: a leftover here is a live, observable change to the
+    #: user's network configuration, but acting on a guess is not good enough.
+    remove_residue: Optional[Callable[[], bool]] = None
 
 
 def _wintun_route_count() -> int:
@@ -362,6 +370,30 @@ def default_probes() -> Probes:
         except Exception:
             return False
 
+    def remove_residue():
+        """Restore the physical adapter metric and drop the DoH templates.
+
+        `force`-equivalent by construction: startup recovery runs at launch, when
+        no live instance should still own these. residue.record_owner_alive is
+        honoured anyway (it is checked inside), so a second instance launched
+        while a first one runs does not reconfigure the first one's adapter.
+        """
+        try:
+            from tuntop.tunnel.helper import restore_recorded_physical_metric
+        except Exception:
+            return False
+        ok = True
+        try:
+            ok = bool(restore_recorded_physical_metric()) and ok
+        except Exception:
+            ok = False
+        try:
+            from tuntop.tunnel.helper import _remove_doh_servers
+            ok = bool(_remove_doh_servers()) and ok
+        except Exception:
+            ok = False
+        return ok
+
     return Probes(
         tun2socks_count=_tun2socks_owned_count,
         wintun_route_count=_wintun_route_count,
@@ -371,6 +403,7 @@ def default_probes() -> Probes:
         sweep_host_routes=sweep_host_routes,
         dns_guard_present=dns_guard_present,
         remove_dns_guard=remove_dns_guard,
+        remove_residue=remove_residue,
     )
 
 
@@ -389,6 +422,12 @@ class StartupFindings:
     #: never removed it): system-wide name resolution is still pinned to a
     #: tunnel that no longer exists - remove it before anything else.
     dns_guard: bool = False
+    #: Non-route machine state survived the previous run: a physical adapter
+    #: still carrying the lowered InterfaceMetric the VPN-shadow pass applied,
+    #: and/or machine-wide DoH templates this project registered. Neither is
+    #: reachable from a route sweep - one is not a route, the other lives in the
+    #: DNS client's registry store - so without this they survived every exit.
+    residue: bool = False
     #: The marker's dashboard PID is STILL ALIVE: a second TunTop window is
     #: running with a working tunnel. Nothing that marker points at may be
     #: torn down - this launch must not kill another instance's session.
@@ -400,7 +439,7 @@ class StartupFindings:
             return False                # a live session owns this state
         return bool(self.marker or self.orphan_tun2socks
                     or self.wintun_routes or self.host_routes
-                    or self.dns_guard)
+                    or self.dns_guard or self.residue)
 
     def summary_lines(self) -> list:
         """Human-readable 'what we found' lines for the startup log."""
@@ -425,7 +464,27 @@ class StartupFindings:
         if self.dns_guard:
             lines.append("a leftover DNS leak-guard rule (system name "
                          "resolution is still pinned to the dead tunnel)")
+        if self.residue:
+            lines.append("non-route machine state from the previous run (a "
+                         "lowered physical-adapter InterfaceMetric and/or DoH "
+                         "templates this project registered)")
         return lines
+
+
+def _residue_record_left() -> bool:
+    """True when the residue record names something to undo.
+
+    The RECORD, not a probe: unlike the NRPT rule - which can be found by
+    enumerating the registry from any process - a lowered InterfaceMetric looks
+    exactly like a normal one until you know what it should be, and only the
+    session that lowered it recorded the original. So the record's presence is
+    the detection, and an absent/corrupt one means "nothing to restore" rather
+    than a failure. Never raises."""
+    try:
+        from tuntop.network import residue
+        return bool(residue.load())
+    except Exception:
+        return False
 
 
 def scan(hosts=None, probes: Optional[Probes] = None,
@@ -464,6 +523,7 @@ def scan(hosts=None, probes: Optional[Probes] = None,
             findings.wintun_routes = 0
             findings.host_routes = []
             findings.dns_guard = False
+            findings.residue = False
             return findings
     # Never let one broken probe hide the others (each returns a safe
     # default on failure, but a hard raise here must not crash startup).
@@ -484,6 +544,12 @@ def scan(hosts=None, probes: Optional[Probes] = None,
             findings.dns_guard = _guard_probe() is True
         except Exception:
             findings.dns_guard = False
+    _residue_probe = getattr(p, "remove_residue", None)
+    if callable(_residue_probe) and _residue_record_left():
+        try:
+            findings.residue = True
+        except Exception:
+            findings.residue = False
     if hosts:
         try:
             findings.host_routes = list(p.host_routes(hosts) or [])
@@ -552,6 +618,13 @@ def recover_ex(findings: StartupFindings,
         # otherwise DNS keeps failing (or, worse, keeps being answered by the
         # wrong resolver) all through the sweep.
         tasks.append(("remove leftover DNS guard", _do_dns_guard))
+    if findings.residue:
+        # Then the non-route residue, for the same reason it is early here: the
+        # DoH template is a machine-wide DNS change and the metric changes how
+        # every route on that adapter is chosen. Neither is a route, so neither
+        # is touched by anything below - but both should be gone before the new
+        # session starts configuring this machine.
+        tasks.append(("restore non-route machine state", _do_residue))
     if findings.orphan_tun2socks:
         tasks.append(("kill orphaned tun2socks", _do_kill))
     if findings.wintun_routes or findings.marker or findings.orphan_tun2socks:
@@ -598,6 +671,17 @@ def _do_dns_guard(p: Probes, f: StartupFindings):
     if removed is True:
         return "NRPT rule removed (name resolution is unpinned again)", True
     return "removal reported failure - the next launch retries", False
+
+
+def _do_residue(p: Probes, f: StartupFindings):
+    """Restore the physical adapter's metric and drop our DoH templates."""
+    fn = getattr(p, "remove_residue", None)
+    if not callable(fn):
+        return "no residue probe available", False
+    if fn() is True:
+        return ("physical adapter metric restored and DoH templates removed",
+                True)
+    return ("restoration reported failure - the next launch retries", False)
 
 
 def _do_teardown(p: Probes, f: StartupFindings):

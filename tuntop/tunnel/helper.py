@@ -76,6 +76,7 @@ from tuntop.config.defaults import (  # noqa: E402  (single source of truth)
 )
 from tuntop.network import egress_scripts as _es
 from tuntop.network import dns_guard as _dns_guard  # noqa: E402  (DNS leak guard)
+from tuntop.network import residue as _residue  # noqa: E402  (crash-recoverable residue)
 from tuntop.network.dns import _host_from_url as _shared_host_from_url  # noqa: E402
 from tuntop.network.routeops import RouteLedger, RouteResult  # noqa: E402
 from tuntop.tunnel.exec import (  # noqa: E402  (moved Phase 4: state-free primitives)
@@ -818,7 +819,14 @@ $best | Select-Object NextHop, InterfaceAlias, InterfaceIndex | ConvertTo-Json -
     d = ps_json(ps)
     if not d:
         return None
-    return d["InterfaceAlias"], d["NextHop"], int(d["InterfaceIndex"])
+    # A PPP/PPTP VPN has NO gateway: it reports NextHop '0.0.0.0', the
+    # neighbour-discovery form. Hand that on verbatim and every netsh writer
+    # downstream emits a literal 0.0.0.0 token, which netsh REJECTS - the
+    # whole route silently fails. The IPv6 twin below has normalised '::' to
+    # '' since 1.0.30; this is the missing IPv4 half, and it is the reason
+    # geo-via-VPN installed nothing on exactly the adapters the docstring
+    # calls the normal case.
+    return d["InterfaceAlias"], _norm_v4_gw(d["NextHop"]), int(d["InterfaceIndex"])
 
 
 def get_vpn_ipv6_default(vpn_interface=None):
@@ -994,8 +1002,12 @@ def remove_stale_wintun_devices():
             n = int(tok)
             break
     if n:
-        print(f"[*] Removed {n} orphaned Wintun device node(s) from a "
-              "previous run - tun2socks can create its adapter again.")
+        # _say, not print: this function is also reached from the DASHBOARD's
+        # exit paths (routing.remove_tunnel_adapters), where stdout may already
+        # be a broken pipe because the dashboard's own console is gone - and a
+        # raising print there would abort the adapter removal.
+        _say(f"[*] Removed {n} orphaned Wintun device node(s) from a "
+             "previous run - tun2socks can create its adapter again.")
     return n
 
 
@@ -1264,8 +1276,8 @@ def _register_doh_server(ip, template):
 
     VERIFY THE RESULT, do not trust the cmdlets. Both calls carry
     -ErrorAction SilentlyContinue, which makes the ordinary failures
-    NON-TERMINATING: DoH absent from this Windows build, the server not in
-    the list, access denied, a rejected template. Nothing is thrown, execution
+    NON-TERMINATING: DoH absent from this Windows build, the server not in the
+    list, access denied, a rejected template. Nothing is thrown, execution
     falls straight through to `Write-Output 'DOH_OK'`, and the catch block
     could only ever fire on a parse or parameter-binding error. So the function
     reported success for a registration that never happened - the caller put
@@ -1277,7 +1289,20 @@ def _register_doh_server(ip, template):
     (_set_wintun_dns_servers right below already uses -ErrorAction Stop for
     exactly this reason - this call was the outlier.)
 
-    So: attempt, then ASK the OS whether the server is actually registered."""
+    So: attempt, then ASK the OS whether the server is actually registered.
+
+    RECORD WHAT WE REGISTERED. The mapping is machine-wide - it lives in the
+    registry under the DNS client's DoH store, not on the wintun adapter - so
+    it outlives the adapter AND this process. Nothing removed it: there was no
+    `Remove-DnsClientDohServer` anywhere in the project, so every DoH address
+    TunTop ever enabled stayed in the machine's DNS configuration after a clean
+    quit and after a crash alike. A successful registration is therefore written
+    to the residue record (tuntop/network/residue.py), and _remove_doh_servers
+    - called from cleanup(), from the dashboard's exit sweeps and from the
+    detached watchdog - deletes exactly those addresses and nothing else. A
+    user's own pre-existing mapping for the same address is not in the record,
+    so it is never touched.
+    """
     if not ip or not template:
         return False
     ps = (
@@ -1295,7 +1320,93 @@ def _register_doh_server(ip, template):
         "} catch { Write-Output ('DOH_FAIL:' + $_.Exception.Message) }"
     )
     _, out, _ = run_ps(ps)
-    return "DOH_OK" in out
+    ok = "DOH_OK" in out
+    if ok:
+        try:
+            # APPEND, never replace: a v6 registration must not evict the v4
+            # one recorded moments earlier, and a self-heal pass re-registers
+            # the same pair every cycle.
+            known = _residue.load_doh_servers()
+            if ip not in known:
+                _residue.save_doh_servers(known + [ip])
+        except Exception:
+            pass
+    return ok
+
+
+def _remove_doh_servers(servers=None):
+    """Remove the machine-wide DoH mappings THIS session registered.
+
+    Only addresses present in the residue record are named, so a DoH mapping the
+    user configured themselves - for their own browser, or a corporate one -
+    survives. Nothing is removed when the record is empty.
+
+    VERIFIED, not assumed. `Remove-DnsClientDohServer` runs with
+    -ErrorAction SilentlyContinue (a denied or in-use mapping must not abort the
+    sweep), which is exactly why the script RE-ENUMERATES afterwards and only
+    reports DOH_REMOVED when nothing of ours survived - the same shape as
+    dns_guard.uninstall_script(). Reporting "removed" over a mapping that is
+    still in the registry would strand a machine-wide DNS template with no
+    record left to retry from.
+
+    Returns True when the residue record is clear of TunTop's mappings (either
+    because they are gone, or because there were none to begin with)."""
+    try:
+        ips = [str(s).strip() for s in (servers or []) if str(s).strip()]
+        if not ips:
+            ips = _residue.load_doh_servers()
+        if not ips:
+            return True
+    except Exception:
+        return False
+    cond = " -or ".join("$_.ServerAddress -eq '" + ps_quote(ip) + "'"
+                        for ip in ips)
+    ps = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "try {\n"
+        # PROVE we can read the DoH store before sweeping. Every cmdlet below
+        # runs silenced, so a non-elevated process (or an ACL-denied key) makes
+        # Get-DnsClientDohServer return nothing and the script would happily
+        # print DOH_REMOVED while our mapping is still registered. An unreadable
+        # store is a FAILURE, not an empty one.
+        "    $probe = @(Get-DnsClientDohServer -ErrorAction Stop)\n"
+        "    Get-DnsClientDohServer -ErrorAction SilentlyContinue |\n"
+        f"        Where-Object {{ {cond} }} |\n"
+        "        Remove-DnsClientDohServer -Force -ErrorAction SilentlyContinue\n"
+        "    Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null\n"
+        "    $left = @(Get-DnsClientDohServer -ErrorAction SilentlyContinue |\n"
+        f"        Where-Object {{ {cond} }})\n"
+        "    if ($left.Count -gt 0) {\n"
+        "        Write-Output ('DOH_UNINSTALL_FAIL:still registered: ' +\n"
+        "            (($left | ForEach-Object { $_.ServerAddress }) -join ','))\n"
+        "    } else {\n"
+        "        Write-Output 'DOH_REMOVED'\n"
+        "    }\n"
+        "} catch {\n"
+        "    Write-Output ('DOH_UNINSTALL_FAIL:' + $_.Exception.Message)\n"
+        "}\n")
+    try:
+        _, out, _ = run_ps(ps)
+    except Exception as e:
+        _say(f"[!] DoH template removal failed: {e}")
+        return False
+    text = str(out or "")
+    if "DOH_UNINSTALL_FAIL:" in text:
+        # Keep the record: a later owner (watchdog, next launch) retries.
+        _say("[!] DoH template removal incomplete: "
+             + text.split("DOH_UNINSTALL_FAIL:", 1)[1].strip())
+        return False
+    if "DOH_REMOVED" not in text:
+        # The command ran and reported NEITHER marker, so nothing was
+        # proven either way - fail closed and keep the record.
+        _say("[!] DoH template removal gave no verdict - treating it as a "
+             "failure so the record is kept and the next launch retries.")
+        return False
+    try:
+        _residue.clear_doh_servers()
+    except Exception:
+        pass
+    return True
 
 
 def _set_wintun_dns_servers(servers):
@@ -1665,11 +1776,13 @@ def _norm_v4_gw(gw):
     volume label syntax is incorrect". Normalising here makes an existing
     on-link route compare equal to an on-link install, which is what stops
     the add/re-add/re-fail loop the 15 s endpoint heal used to be stuck in.
-    """
-    g = str(gw or "").strip()
-    if g in ("0.0.0.0", "::", "0", ""):
-        return ""
-    return g
+
+    Thin alias for egress_scripts.norm_next_hop, which is the shared
+    implementation: the same on-link spellings have to be understood by the
+    dashboard's routing module, the geo installer and every netsh writer, and
+    three copies of this predicate is how the geo installer ended up the one
+    place that still emitted a literal 0.0.0.0."""
+    return _es.norm_next_hop(gw)
 
 
 #: Each Wintun adapter's own address per family, keyed by its alias. Every
@@ -2178,6 +2291,71 @@ def override_vpn_routes(vpn_iface, skip_ips):
                 print(f"[*] VPN-override add failed for {prefix} on "
                       f"{vpn_iface} - not shadowed, will retry on the next "
                       "self-heal.", flush=True)
+
+
+def unshadow_geo_prefixes(geo_dests, code=""):
+    """Give the geo country ranges back their direct (physical/VPN) egress.
+
+    WHY THIS CANNOT LIVE IN override_vpn_routes
+    ------------------------------------------
+    That function reads `geo_dests = {r[1] for r in geoip_added}` to skip
+    prefixes that must stay direct, and its own comment states the intent. It
+    could not honour it, because of an ORDERING it does not control:
+    `_geo_install` runs on a background daemon thread which must first decode a
+    multi-megabyte geoip.dat, and `override_vpn_routes` runs on the MAIN thread
+    a few hundred lines later - while that thread is still parsing. So
+    `geoip_added` is EMPTY at shadow time, every VPN-injected prefix is
+    shadowed, and the country's ranges end up captured by the shadow as well as
+    by the geo routes. The shadow then wins: wintun is driven to
+    `InterfaceMetric 2` and the shadow route carries metric=1, giving an
+    effective metric far better than `ensure_physical_metric_below_vpn`'s
+    target, so the country is tunneled - the exact opposite of the intent
+    stated three lines above the code that broke it. It is also invisible:
+    every health row is green, because a shadowed VPN route is what "sole
+    egress" is SUPPOSED to look like.
+
+    Fixing it in place would mean parsing the .dat synchronously on the main
+    thread, which is the one thing the background thread exists to avoid. So
+    the reconciliation happens here instead, where the CIDR set is finally
+    known: the geo install is the thing that decides which prefixes are
+    direct, and it withdraws the shadows that contradict it.
+
+    For each shadowed prefix that is now a geo range: delete the Wintun shadow
+    and restore the VPN's own route (persistent store, the store it was
+    observed in), then drop both ledger entries so cleanup() does not try to
+    delete a route we just gave back. `geoip_added` is the authoritative set
+    rather than `cidrs` because a protected prefix (the server, the VPN
+    endpoint, a user bypass) is never installed as a geo route and must stay
+    shadowed."""
+    if not geo_dests:
+        return 0
+    with _vpn_saved_lock:
+        saved = list(vpn_saved_routes)
+    victims = [(fam, prefix) for fam, prefix, _i, _g, _m in saved
+               if prefix in geo_dests]
+    if not victims:
+        return 0
+    for fam, prefix in victims:
+        remove_route((fam, prefix, TUN, TUN4 if fam == "v4" else TUN6))
+    with _vpn_saved_lock:
+        freed = set(victims)
+        # Capture the receipts to restore BEFORE dropping them from the ledger.
+        restore = [row for row in vpn_saved_routes
+                   if (row[0], row[1]) in freed]
+        for row in list(vpn_override_routes):
+            if (row[0], row[1]) in freed:
+                vpn_override_routes.remove(row)
+        vpn_saved_routes[:] = [row for row in vpn_saved_routes
+                               if (row[0], row[1]) not in freed]
+    for fam, dest, iface, gateway, metric in restore:
+        # store="persistent": this is the VPN's OWN route being put back, so it
+        # lands in the store it was observed in. The on-link gateway token is
+        # normalised inside _raw_add_route.
+        _raw_add_route(fam, dest, iface, gateway, metric, store="persistent")
+    print(f"[*] geoip:{code} owns {len(victims)} range(s) the VPN shadow had "
+          f"captured - restored the VPN's own route for them so the country "
+          f"traffic exits directly.", flush=True)
+    return len(victims)
 
 
 # ── Live [V]/[Y] mode switching (dashboard -> running helper) ───────────────
@@ -2919,20 +3097,78 @@ def ensure_physical_metric_below_vpn(phys_iface):
     if phys_bypass_metric_saved is None:
         phys_bypass_metric_saved = phys_metric
         phys_bypass_iface = phys_iface
+        # PERSIST IT. The module globals die with this process, and the metric
+        # they hold is a change to the USER's Wi-Fi/Ethernet adapter, not to
+        # ours: a hard kill (Task Manager, power loss, a BSOD) between here and
+        # restore_physical_metric() left the machine's physical adapter at
+        # metric 9 forever, with no owner left that remembered what it had been.
+        # The residue record is what lets the next process - the watchdog, or the
+        # next launch's startup recovery - put it back.
+        try:
+            _residue.save_physical_metric(phys_iface, phys_metric)
+        except Exception:
+            pass
     run_ps(f"Set-NetIPInterface -InterfaceAlias '{ps_quote(phys_iface)}' -InterfaceMetric {target}")
 
 
 def restore_physical_metric():
-    """Undo ensure_physical_metric_below_vpn() if it changed the metric."""
+    """Undo ensure_physical_metric_below_vpn() if it changed the metric.
+
+    Clears the persisted record too, and only on the in-memory path: the
+    recovery owners (startup recovery, the cleanup watchdog) reach the record
+    through the same functions in tuntop/network/residue.py, and they clear it
+    once they have actually restored the value.
+    """
     global phys_bypass_metric_saved, phys_bypass_iface
+    restored = False
     if phys_bypass_iface is not None and phys_bypass_metric_saved is not None:
         try:
             run_ps(f"Set-NetIPInterface -InterfaceAlias '{ps_quote(phys_bypass_iface)}' "
                    f"-InterfaceMetric {phys_bypass_metric_saved}")
+            restored = True
         except Exception:
             pass
     phys_bypass_metric_saved = None
     phys_bypass_iface = None
+    if restored:
+        try:
+            _residue.clear_physical_metric()
+        except Exception:
+            pass
+    return restored
+
+
+def restore_recorded_physical_metric():
+    """Restore the physical adapter's InterfaceMetric from the residue record.
+
+    THE CRASH OWNER for the metric. Called by startup recovery and by the
+    detached cleanup watchdog: both run when this helper's globals are gone, and
+    both find the (adapter, metric) pair on disk.
+
+    Refuses when the record names a LIVE process that is not us - a second
+    TunTop's recovery pass must not reconfigure the first one's adapter
+    mid-session (residue.record_owner_alive, the same gate dns_guard uses for
+    its install record).
+
+    Returns True when nothing was left to restore or the restore was issued.
+    Never raises: an unreadable record or a failed Set-NetIPInterface leaves the
+    record in place so a later owner retries."""
+    try:
+        record = _residue.load()
+        if not record:
+            return True
+        if _residue.record_owner_alive(record):
+            return True
+        entry = _residue.load_physical_metric()
+        if not entry:
+            return True
+        iface, metric = entry
+        run_ps(f"Set-NetIPInterface -InterfaceAlias '{ps_quote(iface)}' "
+               f"-InterfaceMetric {metric} -ErrorAction SilentlyContinue")
+        _residue.clear_physical_metric()
+        return True
+    except Exception:
+        return False
 
 
 # ── Gateway-change auto re-route ─────────────────────────────────────────────
@@ -3327,6 +3563,15 @@ def ensure_wintun_ipv4():
 # The Wintun subnets are defined in tuntop.config.defaults
 # (WINTUN4_NET / WINTUN6_NET); a bypass route that overlaps either would
 # shadow the tunnel's own next-hop and break every Wintun route add.
+#
+# SCOPE: these cover the PRIMARY adapter only. TUN2_IP4 (192.168.124.1) sits
+# outside WINTUN4_NET and TUN2_IP6 (fd00:dead:beef:1::1) is outside
+# WINTUN6_NET, so a bypass CIDR overlapping the SECOND hop is NOT refused here.
+# Deliberate, not an oversight: both subnets are private, so the
+# `is_private` test above already rejects them, and this pair exists only to
+# cover the public-range case for the primary adapter. Adding the second pair
+# would be dead code with a comment that overstates what it protects - which is
+# what the old wording did.
 _WINTUN4_NET = WINTUN4_NET
 _WINTUN6_NET = WINTUN6_NET
 
@@ -3346,8 +3591,18 @@ def _is_routable_bypass_cidr(cidr):
         net = ipaddress.ip_network(cidr, strict=False)
     except ValueError:
         return False
-    if (net.is_private or net.is_loopback or net.is_link_local
-            or net.is_multicast or net.is_reserved):
+    # Routability comes from the SHARED predicate
+    # (egress_scripts.is_globally_routable), over an explicit IANA
+    # special-purpose registry, rather than from `is_private` alone. The
+    # difference is 100.64.0.0/10 - RFC 6598 shared address space, which
+    # CPython only learned in 3.13. On 3.10-3.12 `is_private` says it is
+    # public, so CGNAT was accepted here as a routable country range while
+    # _add_lan_bypass installs the SAME prefix on every run - two owners of one
+    # prefix, and the geo sweeps then deleted the LAN bypass (see
+    # routeops.sweeps.geo_victims). One predicate for both boundaries is the
+    # only way geoip.py's stated invariant ("install is protected, but the SWEEP
+    # is not, so the sweep boundary has to refuse them too") stays true.
+    if not _es.is_globally_routable(net):
         return False
     if net.version == 4 and net.overlaps(_WINTUN4_NET):
         return False
@@ -3714,13 +3969,22 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
         if _geo_install_cancel.is_set():
             # Teardown started mid-install: skip the remaining sub-batches
             # so we cannot add routes behind cleanup()'s bulk delete.
-            return
+            return None
         netsh_verb = "ipv4" if fam == "v4" else "ipv6"
         iface_dq = '"' + str(ifa).replace('"', '') + '"'
-        # IPv6 on-link routes have gw='' (or '::', already normalized to ''
-        # upstream).  netsh requires the gateway part to be omitted entirely
-        # for on-link routes - a bare double-space token is rejected.
-        gw_part = (" " + str(gw)) if gw else ""
+        # netsh requires the gateway part to be OMITTED ENTIRELY for an on-link
+        # route - a bare double-space token is rejected, and so is a literal
+        # '0.0.0.0'. The comment here used to reason about the IPv6 form
+        # ('::', already normalised to '' upstream) while letting the IPv4 form
+        # through verbatim, and this is the ONLY netsh writer in the helper
+        # that did: add_v4, _raw_add_route, _remove_routes_bulk and
+        # _repoint_geo_batch all normalise first. The value arrives from
+        # get_vpn_ipv4_default, which (until 1.0.51) returned the raw NextHop -
+        # so on any VPN with an on-link default (PPTP, L2TP, IKEv2, SSTP, the
+        # case this function's own docstring calls normal) EVERY country CIDR
+        # failed with "The filename, directory name, or volume label syntax is
+        # incorrect" and the geo bypass silently installed nothing at all.
+        gw_part = _es.netsh_gw_token(gw)
         lines = ["interface %s add route %s %s%s metric=1 store=active"
                  % (netsh_verb, r, iface_dq, gw_part) for r in grp]
         fd, path = tempfile.mkstemp(suffix=".txt", prefix="geo_")
@@ -3741,7 +4005,15 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
             s = ln.strip()
             if s == "Ok." or "already exists" in s:
                 done += 1
-        if done == 0 and rc == 0:
+        # "The batch succeeded but netsh said nothing per line" - only trust
+        # that when the output is genuinely EMPTY. The old test was
+        # `done == 0 and rc == 0`, which a batch of *wholly refused* routes
+        # also satisfies: netsh -f reports every per-line failure in its
+        # output and can still exit 0, so a total failure was scored as a
+        # total success and the "route failures (continuing)" warning never
+        # printed. A non-English netsh prints something else entirely, so
+        # empty output is the only honest "no per-line report" case.
+        if done == 0 and rc == 0 and not (out or "").strip():
             done = len(grp)   # no per-line output but the batch succeeded
         if done < len(grp) or rc != 0:
             first_err = None
@@ -3767,16 +4039,20 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
                 # dashboard) AND the marker never reaches the progress
                 # panel (bar stuck at 0%). The joining thread below emits
                 # the marker after each future completes instead.
+        return done
 
+    # Per-sub-batch installed counts, so a sub-batch that installed NOTHING can
+    # be withdrawn from the ledger (see the block after the join).
+    installed = {}
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(len(sub_batches), GEO_MAX_WORKERS)) as ex:
-        futures = [ex.submit(_install_sub, fam, grp, ifa, gw)
-                   for fam, grp, ifa, gw in sub_batches]
+        futures = {ex.submit(_install_sub, fam, grp, ifa, gw): i
+                   for i, (fam, grp, ifa, gw) in enumerate(sub_batches)}
         for fut in concurrent.futures.as_completed(futures):
             try:
-                fut.result()
+                installed[futures[fut]] = fut.result()
             except Exception:
-                pass
+                installed[futures[fut]] = None
             # Progress marker on the INSTALLING (sink-owner) thread, once
             # per finished sub-batch: `loaded` is the geo_lock-guarded
             # total the workers advanced. The old code printed from the
@@ -3797,6 +4073,51 @@ def add_geoip_bypass(code, cidrs, iface, gateway, v6iface=None, v6gw=None,
             if diag:
                 msg += f"  first error: {diag}"
             _geo_diag(("routefail", code, fam), msg)
+
+    # WITHDRAW the sub-batches that installed nothing.
+    #
+    # Registration is deliberately upfront (above), so a cleanup() racing this
+    # install always SEES a route before it exists and can bulk-remove it - that
+    # ordering is a teardown-safety property and stays. But the same upfront
+    # list is what this function RETURNS, and the dashboard records the return
+    # value in _live_geo_added and announces "re-applied live (3000 routes)".
+    # So a total failure - every line refused, e.g. the on-link 0.0.0.0 token
+    # this function used to emit - returned the full planned list as
+    # "installed", the UI reported a complete success, and the ledger then held
+    # thousands of prefixes that were never in the routing table. Every later
+    # use of that ledger is now wrong: the [Q] sweep tries to delete routes
+    # that do not exist (netsh's "element not found" is a failure, so a clean
+    # table was reported as "some routes may still be installed" and the crash
+    # marker was retained), and the geo re-point rebuilds from it.
+    #
+    # A sub-batch that installed NOTHING is withdrawn from geoip_added and
+    # from the returned list. A PARTIAL sub-batch is KEPT: we cannot map netsh
+    # per-line output back to individual prefixes on a localised build, and for
+    # teardown purposes "might exist" is the safe direction - an untracked route
+    # that really is installed is the failure that matters.
+    withdrawn = 0
+    with _geo_state_lock:
+        keep = []
+        drop = set()
+        for i, (fam, grp, ifa, gw) in enumerate(sub_batches):
+            if installed.get(i) == 0:
+                for r in grp:
+                    drop.add((fam, r, ifa, gw))
+            else:
+                keep.extend((fam, r, ifa, gw) for r in grp)
+        if drop:
+            geoip_added[:] = [row for row in geoip_added if row not in drop]
+            withdrawn = len(drop)
+            _geo_diag(
+                ("nothing_installed", code),
+                f"[!] geoip:{code}: {withdrawn} route(s) were NOT installed and "
+                f"are not being tracked (the netsh batch was wholly refused).")
+        registered = keep
+    if withdrawn and not loaded:
+        _geo_diag(
+            ("install_all_failed", code),
+            f"[!] geoip:{code} bypass installed NO routes on either family - "
+            f"geo bypass for {code} is INACTIVE.")
     # Belt-and-braces: re-install the protected host routes the caller handed
     # us.  add_v4/add_v6 are idempotent (an identical route is kept, a drifted
     # one is replaced), so this is a cheap no-op when the table is already
@@ -3979,6 +4300,14 @@ def cleanup():
     # resolution, so it must not outlive the tunnel even if the OS kills this
     # process during the longer route sweeps below.
     _step("remove DNS leak guard", _remove_dns_guard)
+    # ...and with it the machine-wide DoH templates this session registered.
+    # They live in the DNS client's registry store, NOT on the adapter, so
+    # neither the adapter going away nor any route sweep touches them: without
+    # this step every DoH address TunTop ever enabled stayed in the machine's
+    # DNS configuration after the tunnel stopped, and after a crash. One
+    # PowerShell call, so it belongs with the small critical steps - and BEFORE
+    # the geo long pole, for the same reason the guard removal is.
+    _step("remove DoH templates", _remove_doh_servers)
     # The geo install thread can still be adding routes; stop it and WAIT for
     # it before snapshotting the ledger, or a sub-batch that lands after the
     # snapshot installs routes nothing will ever track (uncleanable, and the
@@ -4879,6 +5208,11 @@ def main():
                           "send the geoip country's traffic via your Windows VPN egress. "
                           "Overrides --geoip-via-vpn. Falls back to the physical adapter "
                           "if no connected Windows VPN default route is found.")
+    ap.add_argument("--geoip-via-proxy2", action="store_true",
+                      help="Route the geoip country ranges out through the SECOND proxy "
+                           "hop (wintun2, requires --proxy2-port) instead of the physical "
+                           "adapter or wintun. Falls back to the physical adapter if the "
+                           "wintun2 pipe is not running.")
     ap.add_argument("--monitor-interval", type=int, default=30, metavar="SEC",
                     help="Seconds between tunnel health probes in the monitor loop (default 30)")
     ap.add_argument("--monitor-retries", type=int, default=2, metavar="N",
@@ -5293,9 +5627,31 @@ def main():
         # of the real cause.
         p2_v4, p2_v6, _p2b_v4, _p2b_v6 = [], [], [], []
         if args.proxy2_port == args.port:
-            sys.exit(f"[!] --proxy2-port {args.proxy2_port} equals the primary "
-                     "--port; a second pipe to the same proxy is pointless and "
-                     "only adds a second adapter. Choose a different port.")
+            # DEGRADE, DO NOT EXIT. The next three lines of this branch are
+            # the reason: a second pipe to the same local SOCKS5 port is
+            # pointless, and every OTHER proxy2 misconfiguration here is
+            # explicitly non-fatal - no server, unreachable SOCKS5, a probe
+            # timeout - precisely so a second-hop mistake can never cost the
+            # user their PRIMARY tunnel (the same reasoning as fatal=False on
+            # start_tun2socks_pipe below, and the comment above it).
+            #
+            # This one used to sys.exit(). Neither dashboard entry point that
+            # can produce it checks for it: _proxy2_set_port and _change_port
+            # validate only 1..65535 and then call _apply_launch_change ->
+            # restart. So the user typed 10808 into [Z] when the primary was on
+            # 10808, the dashboard logged "restarting the tunnel in the
+            # background", the helper died, the tunnel went FAILED, and the
+            # only explanation was buried in helper stdout - a stream the
+            # dashboard reads for [GEO-*] markers and rarely surfaces to the
+            # user. The dashboard now refuses the value where it is typed; the
+            # helper still degrades rather than exits, so a command-line
+            # invocation with the same mistake keeps its primary tunnel.
+            print(f"[!] --proxy2-port {args.proxy2_port} equals the primary "
+                  "--port; a second pipe to the same proxy is pointless and "
+                  "only adds a second adapter. Skipping the second hop - the "
+                  "primary tunnel is unaffected. Choose a different port to "
+                  "enable proxy2.")
+            args.proxy2_port = None
         if not args.proxy2_server:
             print("[!] --proxy2-port given without --proxy2-server: the second "
                   "proxy's own upstream connection has NO direct bypass route "
@@ -5461,7 +5817,41 @@ def main():
                 v6iface, v6gw = TUN, TUN6
                 print(f"[*] geoip:{code} tunneled via Wintun ({TUN}) - "
                       f"country traffic will use the VPN IP.")
+            elif getattr(args, "geoip_via_proxy2", False) and tun2_proc is not None:
+                # Mode "via the second proxy": the country ranges ride wintun2,
+                # the SECOND TUN adapter, exactly how a proxy2-tagged bypass
+                # entry is routed (wintun2's own address is its next hop).
+                #
+                # This branch was MISSING, and that is worse than a missing
+                # feature. The dashboard's live [R]/[F] path honours the target
+                # (so the user sees "GEO IR · via second proxy" and the routes
+                # land on wintun2), but every RESTART went through here and
+                # fell to the else-branch below: change the SOCKS port with [Z],
+                # switch server with [U], or let the recovery engine restart the
+                # helper after a crash, and the new helper installed every
+                # country CIDR via Wi-Fi with the next hop 192.168.1.1 - the
+                # exact opposite of the configured intent, silently, while the
+                # status bar kept reading proxy2 because that row is rendered
+                # from config and not from the routing table. The winvpn target
+                # IS passed here (--geoip-via-win-vpn) and DOES survive
+                # restarts, which is the inconsistency that made this a defect
+                # rather than a documented live-only limitation.
+                #
+                # Guarded on `tun2_proc is not None` - CONFIGURED IS NOT UP.
+                # If the second SOCKS5 was not listening the pipe was skipped
+                # above, and installing onto wintun2 would fail every route
+                # while the bypass silently did nothing.
+                g_iface, g_gw = TUN2, TUN2_IP4
+                v6iface, v6gw = TUN2, TUN2_IP6
+                print(f"[*] geoip:{code} routed via the second proxy ({TUN2}) - "
+                      f"country traffic will use the second hop.")
             else:
+                if getattr(args, "geoip_via_proxy2", False) and \
+                        tun2_proc is None:
+                    print(f"[!] geoip:{code} requested via the second proxy but "
+                          f"the wintun2 pipe is not running (nothing is "
+                          f"listening on 127.0.0.1:{args.proxy2_port}) - "
+                          f"installing via the physical adapter instead.")
                 v6iface = v6gw = None
                 d6 = get_ipv6_default()
                 if d6:
@@ -5491,6 +5881,17 @@ def main():
                 )
             except Exception as e:
                 print(f"[!] geoip bypass install failed ({code}): {e}; continuing without it.")
+                return
+            # Un-shadow any VPN route that is now a geo prefix - see
+            # unshadow_geo_prefixes for why this cannot be done at the shadow
+            # pass itself. The geo CIDR set is only knowable AFTER the .dat has
+            # been decoded, which is precisely why the shadow pass cannot see it.
+            try:
+                unshadow_geo_prefixes({r[1] for r in geoip_added}, code)
+            except Exception as e:
+                print(f"[!] could not reconcile the VPN shadow with the "
+                      f"geoip:{code} ranges: {e}; some country ranges may stay "
+                      "tunneled.")
 
     if args.geoip or args.geoip_code:
         # Validate the pair BEFORE spawning anything. The "[!] --geoip given

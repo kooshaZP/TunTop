@@ -11,11 +11,13 @@ is mocked. Run:
 """
 import ipaddress
 import os
+import tempfile
 import unittest
 from unittest import mock
 
 from tuntop.geo import geoip
 from tuntop.network import dns_guard
+from tuntop.network import residue
 from tuntop.psshell import ps_quote
 from tuntop.tunnel import helper as H
 
@@ -857,6 +859,17 @@ class TestDohRegistrationIsVerified(unittest.TestCase):
     NON-TERMINATING, so execution fell through to DOH_OK and the catch could
     never fire. The caller then reported "Wintun DNS set to DoH" while
     resolution was still raw UDP/53 into a TUN with no UDP relay."""
+
+    def setUp(self):
+        # A SUCCESSFUL registration now writes the residue record (that is
+        # the only way a later owner can learn which machine-wide DoH mappings
+        # to remove). Redirect it, so this suite never leaves a record naming
+        # an address it only pretended to register.
+        p = mock.patch.object(residue, "residue_path",
+                              return_value=os.path.join(
+                                  tempfile.mkdtemp(), ".tuntop_residue.json"))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _register(self, ps_output):
         # run_ps returns (code, out, err) - out is the SECOND element.

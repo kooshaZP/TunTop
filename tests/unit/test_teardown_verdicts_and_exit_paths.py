@@ -804,6 +804,17 @@ class TestBypassRePointIsBatched(unittest.TestCase):
         app._live_bypass_added = list(rows)
         app._SWEEP_CHUNK = 250
         app._SWEEP_WORKERS = 6
+        # Authorise every row. Since 1.0.51 the BYPASS LIST is the authority for
+        # what the re-point may keep, not the ledger: `_live_bypass_added` is a
+        # cache of what was installed, and the [X] path that used to leave a row
+        # behind in it meant the next gateway change re-added a bypass the user
+        # had deleted. So `_reroute_own_bypass_live` membership-tests each row
+        # against the resolved IPs the lists still authorise - a test that seeds
+        # the ledger alone is now seeding a row nothing authorises, and the
+        # re-point correctly drops it.
+        ips = sorted({r[1].split("/")[0] for r in rows})
+        app._bypass_res_state = {"example.test": {"status": "ok", "ips": ips,
+                                                  "next": 0.0}}
         return app
 
     def _run(self, app):

@@ -45,6 +45,7 @@ import time
 import traceback         # sweep failure diagnosis (full stack in the log)
 
 from tuntop import procidentity   # PID identity, not just liveness
+from tuntop.psshell import ps_quote
 
 # When executed as a script (`python cleanup_watchdog.py --pid N`), the
 # package root is NOT on sys.path (sys.path[0] is this file's directory).
@@ -305,6 +306,19 @@ def _lan_victims(rows, iface, gw):
     return lan_victims(rows, iface, gw, prefixes=LAN_BYPASS_PREFIXES)
 
 
+def _lan_victim_deletes(rows, iface, gw):
+    """Victim SELECTION plus the netsh delete token for each row.
+
+    Delegates to `lan_victim_deletes`, the same shared rule the dashboard's
+    `_sweep_lan_leftovers` uses, so the two owners cannot disagree about a
+    leftover: an on-link or current-gateway row needs the widened (next-hop-less)
+    token because netsh rejects an on-link spelling, while a real next hop that
+    is not the current gateway must be deleted next-hop-EXACT so a corporate
+    static route or a VPN split tunnel is never caught by it."""
+    from tuntop.network.routeops.sweeps import lan_victim_deletes
+    return lan_victim_deletes(rows, iface, gw, prefixes=LAN_BYPASS_PREFIXES)
+
+
 #: Total wall-clock budget for the geo sweep's chunked netsh deletes. It used
 #: to be per-chunk (180 s EACH), so 4096 leftover routes was 16 chunks and up
 #: to 48 minutes of a half-cleaned table - while default traffic still pointed
@@ -370,9 +384,16 @@ def sweep_lan_routes(log=None) -> int:
             _log("watchdog: could not read the routing table for the LAN "
                  "sweep - marker retained", log)
             return None
-        victims = _lan_victims(rows, iface, gw)
+        victims = _lan_victim_deletes(rows, iface, gw)
         if not victims:
             return 0
+        # The widening rule - which next-hop token each class of leftover needs -
+        # is routeops.sweeps.lan_victim_deletes', the SAME copy the dashboard
+        # uses. This function used to call lan_victims() and build the token
+        # itself, keeping the next hop for the current-gateway class, so the two
+        # owners disagreed about the same leftover: netsh rejects an on-link
+        # spelling as a token, and the widening is the only form that removes
+        # those rows at all.
         lines = [f'interface ipv4 delete route {dp} "{alias}"'
                  f'{"" if nh in ("0.0.0.0", "On-link") else (" " + nh if nh else "")}'
                  for dp, alias, nh in victims]
@@ -430,7 +451,8 @@ def sweep_lan_routes(log=None) -> int:
         return None
 
 
-def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
+def sweep_geo_routes(geoip: str, geoip_code: str, log=None,
+                     geoip_codes=None) -> int:
     """Remove every live route whose DestinationPrefix is one of the geoip
     country's CIDRs. Geo bypass routes live on the PHYSICAL adapter, so the
     Wintun teardown above never sees them - after a hard kill they keep
@@ -439,19 +461,49 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
     armed for the next session. Batch netsh -f deletes, same fast path the
     dashboard's own sweep uses. Returns how many were removed (VERIFIED from
     netsh's own per-line answers), or None when the sweep could not be
-    trusted."""
+    trusted.
+
+    `geoip_codes` widens the set to every country this session applied a bypass
+    for. `geo_victims` identifies a leftover by comparing its prefix against a
+    CIDR set, so a single `geoip_code` can only ever name THAT country's routes:
+    after a `[F]` country switch, the previous country's routes were still
+    installed (switching does not remove them) and no sweep could name them, so
+    a hard kill stranded them indefinitely. The union costs one extra
+    `parse_geoip` per code and closes the gap."""
     log = log or (lambda m: None)
     try:
         if not geoip or not os.path.isfile(geoip):
             return 0
-        # A geoip file without a country code means geo bypass was never
-        # active this session - nothing to sweep, and NOT an error (the
-        # empty code used to reach parse_geoip and be logged as a scary
-        # "no CIDR entries found for geoip code ''" failure).
-        if not geoip_code:
+        # Collect every code to sweep. An empty set means geo bypass was never
+        # active this session - nothing to sweep, and NOT an error (the empty
+        # code used to reach parse_geoip and be logged as a scary "no CIDR
+        # entries found for geoip code ''" failure).
+        codes = []
+        for cc in list(geoip_codes or ()) + [geoip_code]:
+            s = str(cc or "").strip().lower()
+            if s and s not in codes:
+                codes.append(s)
+        if not codes:
             return 0
         from tuntop.geoip import parse_geoip          # repo root on sys.path
-        cidrs = set(parse_geoip(geoip, geoip_code))
+        cidrs = set()
+        parsed = 0
+        for cc in codes:
+            try:
+                got = parse_geoip(geoip, cc)
+            except Exception as e:
+                # A code that FAILS to parse is a real error, not an empty
+                # country: swallowing it made an unreadable geoip.dat look
+                # exactly like "geo bypass was never active", so the caller
+                # got 0 = "nothing to sweep" and retired the crash marker over
+                # routes that were still installed.
+                _log(f"watchdog: could not read the geoip file for '{cc}' "
+                     f"({e.__class__.__name__}: {e})", log)
+                continue
+            parsed += 1
+            cidrs.update(got)
+        if not parsed:
+            return None
         if not cidrs:
             return 0
         # Compare CIDRs as NETWORKS, not strings. parse_geoip renders IPv6 in
@@ -495,52 +547,12 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
                 if nh and nh not in ("0.0.0.0", "::"):
                     nh_tok = f" {nh}"
                 lines.append(f'interface {verb} delete route {dp} "{alias}"{nh_tok}')
-            try:
-                fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="wd_geo_")
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines))
-                    proc = subprocess.run(["netsh", "-f", tmp],
-                                          capture_output=True, timeout=180,
-                                          creationflags=_NO_WINDOW)
-                    # netsh -f reports per-line failures in its OUTPUT and
-                    # still exits 0, so a non-zero code (or no output at all,
-                    # which means the file was not read) means the chunk did
-                    # NOT go through. Counting the chunk anyway cleared the
-                    # crash marker while the routes were still installed.
-                    out_txt = (proc.stdout or b"").decode(
-                        "utf-8", "replace") + (proc.stderr or b"").decode(
-                        "utf-8", "replace")
-                finally:
-                    try:
-                        os.unlink(tmp)
-                    except Exception:
-                        pass
-                if proc.returncode != 0:
-                    _log(f"watchdog: geo sweep chunk failed (netsh rc="
-                         f"{proc.returncode}) - {len(chunk)} route(s) kept, "
-                         "marker retained", log)
-                    return None
-                if not out_txt.strip():
-                    _log(f"watchdog: geo sweep chunk produced no netsh output "
-                         f"- {len(chunk)} route(s) unconfirmed, marker "
-                         "retained", log)
-                    return None
-                # VERIFIED count. netsh answers each successful line with
-                # "Ok." and reports per-line failures in the SAME output, while
-                # still exiting 0 - so len(chunk) was never a removal count,
-                # and the "removed N routes" line above was fiction whenever a
-                # line was refused.
-                removed += sum(1 for ln in out_txt.splitlines()
-                               if ln.strip() == "Ok.")
-            except subprocess.TimeoutExpired:
-                _log(f"watchdog: geo sweep chunk timed out - {len(chunk)} "
-                     "route(s) may remain, marker retained", log)
+            n, why = _run_netsh_batch(lines)
+            if n is None:
+                _log(f"watchdog: geo sweep chunk failed ({why}) - "
+                     f"{len(chunk)} route(s) kept, marker retained", log)
                 return None
-            except Exception as e:
-                _log(f"watchdog: geo sweep chunk error ({e}) - marker "
-                     "retained", log)
-                return None
+            removed += n
         return removed
     except Exception as e:
         _log(f"watchdog: geo sweep failed: {e}\n"
@@ -551,10 +563,119 @@ def sweep_geo_routes(geoip: str, geoip_code: str, log=None) -> int:
         return None
 
 
+def _run_netsh_batch(lines, timeout=180):
+    """Delete routes through one `netsh -f` script.
+
+    Returns `(verified_removed, "")` or `(None, reason)` for every failure. The
+    distinction is load-bearing and is the whole reason this is a function:
+    `netsh -f` reports per-line failures in its OUTPUT and still exits 0, so
+    neither the return code nor the line count is a removal count - only the
+    "Ok." lines are. A None is what makes the caller RETAIN the crash marker,
+    so a failed chunk must never be reported as a partial success.
+    """
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="wd_geo_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            proc = subprocess.run(["netsh", "-f", tmp],
+                                  capture_output=True, timeout=timeout,
+                                  creationflags=_NO_WINDOW)
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+        out_txt = ((proc.stdout or b"").decode("utf-8", "replace")
+                   + (proc.stderr or b"").decode("utf-8", "replace"))
+        if proc.returncode != 0:
+            return None, f"netsh rc={proc.returncode}"
+        if not out_txt.strip():
+            return None, "no netsh output - the file was not read"
+        return sum(1 for ln in out_txt.splitlines()
+                   if ln.strip() == "Ok."), ""
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {timeout}s"
+    except Exception as e:
+        return None, f"{e.__class__.__name__}: {e}"
+
+
+def sweep_residue(log=None) -> bool:
+    """Undo the machine-wide changes the DEAD session made, from the record it
+    left on disk.
+
+    Two of them, both invisible to every route sweep:
+
+      * the physical adapter's InterfaceMetric, lowered by
+        `ensure_physical_metric_below_vpn()` so geo bypass routes beat a
+        connected Windows VPN's identical-prefix routes. The original value
+        used to live in the helper's module globals, so a hard kill left the
+        user's Wi-Fi at a metric TunTop chose - permanently - with nothing
+        remembering what it had been;
+      * the machine-wide DoH templates, written by `Add-DnsClientDohServer`
+        into the DNS client's registry store. They outlive the adapter and the
+        process alike, and nothing removed them at all before this.
+
+    Both are recorded in tuntop/network/residue.py by the process that made
+    them, which is the only reason a process that did NOT make them can undo
+    them. Returns False when either could not be verified removed, so the caller
+    keeps the crash marker and the next launch retries."""
+    log = log or (lambda m: None)
+    ok = True
+    try:
+        from tuntop.network import residue as _residue
+    except Exception as e:
+        _log(f"watchdog: residue module unavailable ({e})", log)
+        return False
+    try:
+        record = _residue.load()
+    except Exception:
+        record = {}
+    if not record:
+        return True
+    # A record naming a LIVE process we are not is a running session's, not a
+    # leftover: leave its settings alone (same gate dns_guard uses for its
+    # install record).
+    try:
+        if _residue.record_owner_alive(record):
+            return True
+    except Exception:
+        pass
+    try:
+        entry = _residue.load_physical_metric()
+    except Exception:
+        entry = None
+    if entry:
+        iface, metric = entry
+        try:
+            import tuntop.network.routing as routing
+            routing._ps(
+                f"Set-NetIPInterface -InterfaceAlias '{ps_quote(iface)}' "
+                f"-AddressFamily IPv4 -InterfaceMetric {int(metric)} "
+                "-ErrorAction SilentlyContinue")
+            _residue.clear_physical_metric()
+            _log(f"watchdog: restored the physical adapter metric on "
+                 f"'{iface}' to {metric}", log)
+        except Exception as e:
+            _log(f"watchdog: could not restore the physical adapter metric "
+                 f"on '{iface}' ({e}) - left in place", log)
+            ok = False
+    try:
+        from tuntop.tunnel.helper import _remove_doh_servers
+        if not _remove_doh_servers():
+            _log("watchdog: a DoH template this session registered is still "
+                 "registered", log)
+            ok = False
+    except Exception as e:
+        _log(f"watchdog: DoH template removal skipped ({e})", log)
+        ok = False
+    return ok
+
+
 def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
                              marker_path: str = MARKER_FILE, log=None,
                              probes=None, geoip: str = None,
-                             geoip_code: str = "",
+                             geoip_code: str = "", geoip_codes=None,
                              marker_live=None) -> bool:
     """The watchdog's whole decision, in one testable function.
 
@@ -565,7 +686,10 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
     `probes` is passed straight through to startup_recovery's scan/recover
     so tests can run the whole path with fakes and no Windows. When
     `geoip`/`geoip_code` are given, geo-bypass routes on the PHYSICAL
-    adapter are swept too (the Wintun teardown can't see them).
+    adapter are swept too (the Wintun teardown can't see them). `geoip_codes`
+    is every country the session applied a bypass for, not just the current
+    one - see sweep_geo_routes for why a single code cannot name the previous
+    country's leftovers.
 
     `marker_live` is passed straight through to scan as well, so a caller
     can STATE whether the marker's dashboard PID is still running instead of
@@ -639,7 +763,8 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
     # launch retries" and then immediately followed by a cleared marker, so
     # the next launch never retried anything.
     sweeps_ok = bool(recovery_ok)
-    n_geo = sweep_geo_routes(geoip, geoip_code, log=log)
+    n_geo = sweep_geo_routes(geoip, geoip_code, log=log,
+                             geoip_codes=geoip_codes)
     if n_geo is None:
         sweeps_ok = False
     elif n_geo:
@@ -651,6 +776,18 @@ def sweep_after_unclean_exit(pid: int, hosts=(), helper_pid=None,
         sweeps_ok = False
     elif n_lan:
         _log(f"watchdog: removed {n_lan} leftover LAN bypass route(s)", log)
+
+    # NON-ROUTE residue. Both are machine-wide changes recorded by the helper
+    # (tuntop/network/residue.py) precisely so that a process which did not make
+    # them can undo them - which is this one. Neither is reachable from the
+    # route sweeps: the physical adapter's InterfaceMetric is not a route, and
+    # the DoH templates live in the DNS client's registry store rather than on
+    # the wintun adapter. Before this, a hard kill left the user's Wi-Fi
+    # permanently at the lowered metric and every DoH address the session had
+    # enabled registered machine-wide, with the crash marker cleared and the
+    # next launch believing the system was clean.
+    if not sweep_residue(log):
+        sweeps_ok = False
 
     # Clear the marker ONLY if it is still ours AND the sweeps ran clean - a session started while
     # we swept has written its own by now and owns the system.
@@ -710,6 +847,11 @@ def main(argv=None) -> int:
         from tuntop.geoip import parse_geoip as _pg  # noqa: F401
         from tuntop.startup_recovery import scan as _scan  # noqa: F401
         from tuntop.startup_recovery import recover as _recover  # noqa: F401
+        # The residue sweep and the adapter-removal helper's own imports. Both
+        # run AFTER the dashboard died, in a child whose _MEI dir may already
+        # have been wiped - so every module they need must be resident now.
+        from tuntop.network import residue as _residue  # noqa: F401
+        from tuntop.tunnel import helper as _helper  # noqa: F401
         # Codec warm-up (belt & braces for the _MEI class): encoding to
         # 'utf-16-le' inside routing._ps is a LAZY codec import - it reads
         # base_library.zip from the extraction dir on FIRST use. Do it now,
@@ -773,11 +915,20 @@ def main(argv=None) -> int:
             hosts + [h for h in (state.get("hosts") or []) if h]))
         geoip = state.get("geoip") or args.geoip
         geoip_code = state.get("geoip_code") or args.geoip_code or ""
+        # EVERY country this session applied a bypass for, not just the current
+        # one. A `[F]` switch does not remove the previous country's routes, and
+        # `geo_victims` identifies a leftover by comparing its prefix against a
+        # CIDR set - so with only the current code, a hard kill after a switch
+        # stranded the previous country's routes with nothing able to name them.
+        geoip_codes = [str(c).strip().lower()
+                       for c in (state.get("geoip_codes") or [])
+                       if c and str(c).strip()]
         sweep_after_unclean_exit(args.pid, hosts=hosts,
                                  helper_pid=helper_pid,
                                  marker_path=args.marker,
                                  geoip=geoip,
-                                 geoip_code=geoip_code)
+                                 geoip_code=geoip_code,
+                                 geoip_codes=geoip_codes)
     except Exception as e:
         _log(f"watchdog: unexpected failure: {e}")
         return 1

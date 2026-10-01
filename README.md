@@ -382,6 +382,16 @@ intended behaviour in the voice of a delivered one.**
 | Behaviour you can rely on | Status | Enforced in | If it fails |
 |---|---|---|---|
 | A clean exit (`[T]`, `[Q]`, Ctrl-C) removes every route TunTop installed | verified | `helper.cleanup()`; bulk `netsh -f` deletion | `[Q]` prints the verified route count; startup recovery sweeps the next launch |
+| A clean exit also removes the machine-wide **DoH templates** | verified | every successful `Add-DnsClientDohServer` is recorded in `.tuntop_residue.json`; `_remove_doh_servers` deletes exactly those addresses and re-enumerates the store to confirm | a refusal prints `DoH template removal incomplete` and keeps the record, so the next launch retries |
+| A **crash / BSOD / power loss** also removes the DoH templates | verified | the residue record is the crash-recovery contract: the cleanup watchdog and startup recovery both read it | same; a record naming a *live* session is left alone |
+| DoH templates TunTop did **not** register are never removed | verified | only addresses in the record are named in the `Where-Object` | — |
+| A clean exit restores the physical adapter's `InterfaceMetric` | verified | the original value is recorded when the VPN-shadow pass lowers it, and restored by the same teardown | a refused write keeps the record |
+| A **crash** also restores the physical adapter's `InterfaceMetric` | verified | startup recovery and the watchdog read the record — before 1.0.51 the original lived only in the helper's memory, so a hard kill left Wi-Fi permanently at ~9 | a refused write keeps the record for the next launch |
+| A clean exit removes the `wintun` adapter **and its PnP device node** | verified | `routing.remove_tunnel_adapters()`: `Remove-NetAdapter` first, then `remove_stale_wintun_devices()`, then a `-ErrorAction Stop` re-read to confirm | a surviving adapter prints `Leftover wintun adapter could not be fully removed`; the next `[S]` preflight removes it |
+| The adapter's PnP pass runs **after** the adapter removal | verified | Wintun otherwise enumerates the cleared node, tun2socks finds no interface, and the bring-up retries forever | — |
+| A crash leaves the adapter in place, and the next launch removes it | verified | `preflight_cleanup` has always owned the adapter on the *start* path | — |
+| Every non-route teardown step runs **after** the table has settled | verified | ordering in the `[Q]` checklist, `[T]`, the close handler, `atexit` and the crash handler | a kill mid-sweep leaves the next launch's preflight as the backstop |
+| A failed residue step **keeps the crash marker** | verified | `sweeps_ok` veto in the watchdog, and the same verdict gates `atexit`'s marker clear | the next launch retries |
 | A teardown already in progress is not aborted by a second Ctrl+C | verified | `helper._step` catches `KeyboardInterrupt`/`SystemExit`; `cleanup()` latches re-entrance | — |
 | Geo install threads are joined before the route ledger is snapshotted | verified | `helper._stop_geo_installer` escalates 30s → 120s and says so if it gives up | a loud `[!] geo thread did not stop` line names the risk |
 | Every geo route has a ledger receipt, even if a teardown races a gateway re-point | verified | registration happens *before* install in both the install and re-point paths | a partial re-point rolls back its own receipts and keeps the originals |
@@ -398,6 +408,21 @@ intended behaviour in the voice of a delivered one.**
 | VPN-override shadows never survive a reboot | verified | `store=active` on every install (netsh defaults to *persistent*) | a pre-1.0.48 leftover is removed by the next clean exit |
 | Geo data is verified before it is installed | verified | SHA-256 mismatch **and** an unreachable checksum both refuse | pass `strict_checksum=False` to opt out |
 | No `//` in any embedded PowerShell | verified | `tests/unit/test_correctness_pass.py` scans the generated scripts | CI fails |
+| A `[F]` country switch does not strand the previous country's routes after a crash | verified | the sidecar carries `geoip_codes` (every code this session applied), not just the current one — `geo_victims` matches prefixes, so one code cannot name the other country's | — |
+| The LAN leftover sweep gives the dashboard and the watchdog the same verdict | verified | one shared rule, `routeops.sweeps.lan_victim_deletes`; the dashboard's inline copy is gone | — |
+| A LAN pin on a *foreign* adapter is never deleted | verified | `lan_victims` matches on the current gateway's interface | — |
+| A stale-gateway LAN pin is **not** a victim | not enforced | refused as a class: a corporate static route, a VPN split tunnel and a NAS subnet are indistinguishable from one of our own pins, so a coin flip against the user's own routes is the wrong trade | remove it by hand, or restart on the same network |
+| An **on-link** next hop (`0.0.0.0`, `::`) is never handed to netsh | verified | normalised at the SOURCE (`get_vpn_ipv4_default`, `routing._get_ipv4_default`, `_get_vpn_ipv4_default`) and again at every netsh boundary via `egress_scripts.netsh_gw_token` | — |
+| A route netsh **wholly refused** is not recorded as installed | verified | `add_geoip_bypass` withdraws a sub-batch that installed nothing from `geoip_added` and from its return value; a *partial* batch is kept, because "might exist" is the safe direction for teardown | a `netsh` exit of 0 with per-line failures is a failure, not a success — only genuinely empty output is read as success |
+| The **VPN-route shadow never captures a geo country range** | verified | `unshadow_geo_prefixes()` reconciles after the geo install, deleting the shadow and restoring the VPN's own route | a reconciliation failure is reported; the country may stay tunneled |
+| `[X]` cannot be undone by a gateway change | verified | the bypass **lists** are the authority: `_remove_bypass_ip` prunes the ledger, and `_reroute_own_bypass_live` membership-tests every row against what the lists still authorise | — |
+| A stale ledger row cannot make a clean `[Q]` report failure | verified | the same membership filter drops it before the sweep, so netsh is never asked to delete a route that is not there | — |
+| `geoip via proxy2` **survives a tunnel restart** | verified | `--geoip-via-proxy2` is passed by the launch builder and honoured by the helper, exactly as `--geoip-via-win-vpn` is | falls back to the physical adapter when the wintun2 pipe is not running |
+| `[R]` never destroys a working bypass it cannot replace | verified | every egress branch returns *before* the sweep; only a verified egress sweeps | — |
+| The panels report **effective** state, not configured intent | verified | the GEO row is `DOT_WARN` when proxy2 is unconfigured or its pipe is down; the CONFIG DNS row resolves the effective pair | — |
+| `proxy2_port == port` is refused, not fatal | verified | both entry points refuse it where it is typed; the helper degrades to no-second-hop instead of `sys.exit()` | — |
+| The geo sweeps refuse non-public ranges | verified | `egress_scripts.is_globally_routable()` — an explicit IANA special-purpose registry, so `100.64.0.0/10` is refused on every supported Python | — |
+| `[A]` on a working entry really re-applies | verified | forces `next = 0.0`, the same idiom `_on_vpn_arrived` uses | — |
 | Probe timeouts are real | verified | explicit `shutdown(wait=False)`; a `with` block would void them | — |
 | DNS server registration is confirmed, not assumed | verified | DoH registration re-reads the OS list; `-ErrorAction SilentlyContinue` no longer hides failure | the dashboard shows the real state |
 
@@ -413,6 +438,13 @@ These cannot be covered by the CI matrix and are worth knowing:
 - **`netsh` output is localised.** The geo installer's progress counter parses
   English success lines, so on a non-English Windows the *progress display* is
   unreliable — the routes themselves install correctly.
+- **`.tuntop_residue.json` is a live file while a tunnel is up.** It is the
+  crash-recovery contract for the two non-route edits TunTop makes (the lowered
+  physical-adapter `InterfaceMetric` and the DoH templates it registered), and
+  the dashboard, the helper child and the watchdog are three processes writing
+  it. It is written atomically and read-modify-written, and it is deleted on a
+  clean exit — so an empty or absent file is the correct end state, not a
+  leftover.
 - **Administrator really is required.** TunTop rewrites the machine routing
   table; launch it with `Start_TunTop.bat` (or `Run_Helper.ps1`).
 - **The boot cleanup task needs Task Scheduler.** `TunTop-DnsGuard-Removal` is

@@ -130,6 +130,67 @@ def _teardown_wintun():
         pass
 
 
+def remove_tunnel_adapters():
+    """Remove the Wintun NETWORK ADAPTERS themselves, and their device nodes.
+
+    Distinct from _teardown_wintun(), which only deletes routes and owned
+    processes. The adapter is a PnP device, not a process: it does NOT "die with
+    the process tree", and until now nothing removed it on an exit path at all -
+    `Remove-NetAdapter` appeared only in the helper's preflight_cleanup, i.e. at
+    the START of the NEXT launch. So after a perfectly clean [Q] the machine was
+    left holding a connected-looking `wintun` adapter carrying our static
+    192.168.123.1/24 and fd00:dead:beef::1/64, our static resolvers, our
+    lowered InterfaceMetric and a disabled NetBIOS binding. That is the single
+    most visible piece of residue this project leaves behind, and
+    `Get-NetAdapter` / the Network Connections list shows it to anyone looking.
+
+    The PnP pass is NOT redundant with the adapter removal, and it must come
+    AFTER it: `Remove-NetAdapter` clears the network adapter, but the device node
+    itself survives in the device tree as `SWD\\WINTUN\\{GUID}`. Wintun then
+    enumerates that stale node instead of creating a fresh adapter, the next
+    tun2socks finds no interface and exits, and the dashboard restarts it into a
+    loop that never converges. remove_stale_wintun_devices() already implements
+    that sweep and only touches nodes whose Status is NOT OK, so a foreign
+    Wintun adapter another tool is actually running keeps its device.
+
+    Best-effort and idempotent: removing an absent adapter is a no-op, and every
+    command is silenced so a refusal is reported as "not removed" rather than
+    raised into a teardown. Callers run it AFTER the route sweeps, so a
+    partially-failed sweep still leaves the adapter for the next launch's
+    preflight_cleanup to deal with. Returns True when both aliases are gone or
+    were never there."""
+    for adapter in TUNNEL_ALIASES:
+        try:
+            _ps(f"Remove-NetAdapter -Name '{adapter}' -Force -Confirm:$false "
+                "-ErrorAction SilentlyContinue")
+        except Exception:
+            pass
+    # Adapter first, THEN the device node - see the docstring.
+    try:
+        from tuntop.tunnel.helper import remove_stale_wintun_devices
+        remove_stale_wintun_devices()
+    except Exception:
+        pass
+    try:
+        ps = ("@(" + ", ".join(f"Get-NetAdapter -Name '{a}' -ErrorAction "
+                              f"Stop" for a in TUNNEL_ALIASES)
+               + ") | Where-Object { $null -ne $_ } | "
+                 "ForEach-Object { $_.Name }")
+        # -ErrorAction Stop, and the verdict is `ok` AND nothing left. Every
+        # cmdlet above is silenced, so a non-elevated read (or a denied
+        # adapter key) returns nothing at all and "no rows" would read as
+        # "both adapters are gone" - the exact success verdict that must not
+        # be produced without evidence. An unreadable read is a leftover.
+        ok, out = _ps(ps)
+        if not ok:
+            return False
+        left = [ln.strip() for ln in str(out or "").splitlines()
+                if ln.strip() and ln.strip() != "No result"]
+        return not left
+    except Exception:
+        return False
+
+
 # ─── Fast route-table dumps (text, not ConvertTo-Json) ────────────────────────
 
 def _dump_route_table_ps(timeout=90):
@@ -221,7 +282,10 @@ def _get_ipv4_default():
         return None
     try:
         d = json.loads(out)
-        return d["InterfaceAlias"], d["NextHop"]
+        # Normalised at the source: an on-link IPv4 default is reported as
+        # '0.0.0.0', and netsh rejects that literal. See
+        # _get_vpn_ipv4_default for the same fix on the VPN twin.
+        return d["InterfaceAlias"], egress_scripts.norm_next_hop(d["NextHop"])
     except Exception:
         return None
 
@@ -378,7 +442,13 @@ $best | Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress
         return None
     try:
         d = json.loads(out)
-        return d["InterfaceAlias"], d["NextHop"]
+        # Normalise the on-link spelling ('0.0.0.0') to '' HERE, at the source,
+        # not at each netsh writer. A PPP/PPTP VPN reports no gateway, and
+        # every netsh add that was handed the raw value emitted a literal
+        # 0.0.0.0 token, which netsh rejects - so the whole batch failed while
+        # the code believed the gateway was known. The IPv6 twin
+        # (_get_vpn_ipv6_default) has done this for '::' all along.
+        return d["InterfaceAlias"], egress_scripts.norm_next_hop(d["NextHop"])
     except Exception:
         return None
 

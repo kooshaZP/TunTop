@@ -13,10 +13,99 @@ mirrored wrappers keep resolving to this module.
 Pure strings: no Windows imports, no execution. Callers embed these
 preambles in their own script and run them through their own runner.
 """
+import ipaddress
 import re
 
 from tuntop.config.defaults import TUN, TUN2, VPN_IFACE_RE
 from tuntop.psshell import ps_quote
+
+#: IANA IPv4 Special-Purpose Address Registry - the ranges that are NOT public
+#: address space, listed EXPLICITLY rather than left to
+#: `ipaddress.IPv4Network.is_private`.
+#:
+#: The explicit list is not redundancy. `is_private` tracks the CPython
+#: special-address table, which changed in 3.13: 100.64.0.0/10 (RFC 6598
+#: shared address space - CGNAT) is `is_private` on 3.13+ and is NEITHER
+#: private nor reserved on 3.10-3.12, the versions this project supports. A
+#: predicate whose answer depends on the interpreter version is not a predicate
+#: you can reason about in a routing path, so the registry is spelled out here
+#: and the version-specific `is_private` is applied only as an extra filter.
+#:
+#: CGNAT is not academic here: it is in LAN_BYPASS_PREFIXES, so `_add_lan_bypass`
+#: installs 100.64.0.0/10 on the physical adapter on every single run, while
+#: geoip.dat country lists can also name it. Any consumer that decides by
+#: "is this a public range?" must therefore agree on CGNAT or it will install a
+#: geo route over the LAN bypass, or delete the LAN bypass as a geo leftover.
+SPECIAL_PURPOSE_V4 = (
+    "0.0.0.0/8",          # "this network"
+    "10.0.0.0/8",         # private use
+    "100.64.0.0/10",      # shared address space (CGNAT) - the 3.13 gap
+    "127.0.0.0/8",        # loopback
+    "169.254.0.0/16",     # link local
+    "172.16.0.0/12",      # private use
+    "192.0.0.0/24",       # IETF protocol assignments
+    "192.0.2.0/24",       # TEST-NET-1
+    "192.88.99.0/24",     # 6to4 relay anycast (deprecated)
+    "192.168.0.0/16",     # private use
+    "198.18.0.0/15",      # benchmarking
+    "198.51.100.0/24",    # TEST-NET-2
+    "203.0.113.0/24",     # TEST-NET-3
+    "224.0.0.0/4",        # multicast
+    "240.0.0.0/4",        # reserved (includes the broadcast address)
+)
+
+#: The IPv6 equivalent. 2001::/23 covers the IETF protocol assignments -
+#: including 2001:db8::/32 (documentation) and 2001:2::/48 (benchmarking) - and
+#: 2001:db8::/32 becoming `is_private` in 3.13+ is what broke a test fixture
+#: built on it, so it is pinned here too.
+SPECIAL_PURPOSE_V6 = (
+    "::/128",             # unspecified
+    "::1/128",            # loopback
+    "::ffff:0:0/96",      # IPv4-mapped
+    "64:ff9b::/96",       # NAT64
+    "100::/64",           # discard-only
+    "2001::/23",          # IETF protocol assignments (incl. db8, 2::/48)
+    "2001:10::/28",       # ORCHID
+    "fc00::/7",           # unique local
+    "fe80::/10",          # link local
+    "ff00::/8",           # multicast
+)
+
+_SPECIAL_V4 = tuple(ipaddress.ip_network(c) for c in SPECIAL_PURPOSE_V4)
+_SPECIAL_V6 = tuple(ipaddress.ip_network(c) for c in SPECIAL_PURPOSE_V6)
+
+
+def is_special_purpose(net) -> bool:
+    """True when `net` is IANA special-purpose address space in either
+    direction: one of the explicit registries above, OR - on interpreters new
+    enough to know it - something `is_private`/`is_reserved` also considers
+    non-public. Both halves matter, and they are ORed on purpose: the explicit
+    table is the floor that must hold on every supported Python, and
+    `is_private` is the ceiling that tracks whatever CPython learns next."""
+    try:
+        n = (net if isinstance(net, ipaddress._BaseNetwork)
+             else ipaddress.ip_network(str(net).strip(), strict=False))
+    except ValueError:
+        return True          # unparseable: refuse, never guess
+    if n.is_private or n.is_loopback or n.is_link_local or n.is_multicast \
+            or n.is_reserved or n.is_unspecified:
+        return True
+    table = _SPECIAL_V4 if n.version == 4 else _SPECIAL_V6
+    return any(n.subnet_of(s) for s in table)
+
+
+def is_globally_routable(cidr) -> bool:
+    """True when `cidr` is public address space a geo country list may name as
+    a bypass route, and the geo sweeps may therefore remove.
+
+    ONE predicate for BOTH the install boundary
+    (`helper._is_routable_bypass_cidr`) and the sweep boundary
+    (`routeops.sweeps.is_sweepable_geo_cidr`). geoip.py states the invariant -
+    "install is protected, but the SWEEP is not; the sweep boundary has to
+    refuse them too" - and the way to keep it true is to have ONE answer rather
+    than two hand-synchronised copies of it. The prefix-length floor is applied
+    by the callers (they differ) because it is a separate concern."""
+    return not is_special_purpose(cidr)
 
 #: Foreign full-tunnel TUN detection. 'Wintun' alone was NOT enough: Throne's
 #: 'sing-tun Tunnel' adapter (a sing-box TUN) owns 176.0.0.0/4 - a quarter of
@@ -80,6 +169,54 @@ def is_vpn_iface(alias):
     transport may ride the VPN only in [V] vless-over-vpn mode. Plain
     physical NIC descriptions never match."""
     return bool(alias) and bool(re.search(VPN_IFACE_RE, str(alias)))
+
+
+#: Every spelling Windows uses for "this route has no next hop" - resolve by
+#: neighbour discovery. IPv4 reports '0.0.0.0' (the normal form on a PPP/PPTP
+#: VPN), IPv6 reports '::'.
+ON_LINK_NEXT_HOPS = frozenset({"", "0.0.0.0", "::", "0", "on-link"})
+
+
+def norm_next_hop(gw):
+    """Canonical form of a next hop: '' for on-link, else the address itself.
+
+    netsh must be given NO next-hop token at all for an on-link route; a
+    literal `0.0.0.0` is rejected with "The filename, directory name, or volume
+    label syntax is incorrect", which silently fails the whole add. That has
+    bitten this project repeatedly and asymmetrically, because the IPv6 side
+    was normalised first (1.0.30) and every IPv4 writer that grew later copied
+    the wrong half:
+
+      * `helper.get_vpn_ipv4_default` returned the raw `NextHop`, so
+        `add_geoip_bypass` emitted a literal `0.0.0.0` and geo-via-VPN
+        installed **nothing** on any on-link-default VPN (PPTP, L2TP, IKEv2,
+        SSTP - the normal case per the helper's own comment);
+      * `routing._get_ipv4_default` / `_get_vpn_ipv4_default` did the same,
+        so the dashboard's re-point batch and every [A] entry tagged `vpn`
+        failed the same way;
+      * `dashboard._batch_add_routes` emitted the raw value while
+        `_batch_delete_routes` beside it normalised - so the row could be
+        deleted but never added.
+
+    Normalising at the SOURCE (here, plus at every netsh boundary) makes the
+    value comparable to a table read, which is what stops the
+    add / re-add / re-fail loop the endpoint self-heal used to sit in."""
+    g = str(gw or "").strip()
+    return "" if g.lower() in ON_LINK_NEXT_HOPS else g
+
+
+def netsh_gw_token(gw, family=None):
+    """The next-hop fragment to append to a `netsh ... add|delete route`
+    command: `''` when the route is on-link (the token is *omitted* - a bare
+    double-space is rejected), else `' <address>'`.
+
+    `family` is accepted so a caller can assert it: an IPv6 spelling on an
+    IPv4 prefix, or the reverse, is a caller bug rather than an on-link route
+    and must be refused rather than normalised away."""
+    g = norm_next_hop(gw)
+    if not g:
+        return ""
+    return " " + g
 
 #: VPN alias regex as embedded PS literal (built from the single-source
 #: config.defaults.VPN_IFACE_RE - never re-hardcode it).

@@ -121,6 +121,16 @@ class TestKillPid(unittest.TestCase):
 # ── sweep_after_unclean_exit ─────────────────────────────────────────
 
 class TestSweepAfterUncleanExit(unittest.TestCase):
+    def setUp(self):
+        # The non-route residue sweep (physical adapter metric + DoH
+        # templates) reads the real on-disk record and issues real PowerShell.
+        # Patch it for this whole class; the one test that cares about its
+        # verdict overrides it.
+        p = patch("tuntop.core.cleanup_watchdog.sweep_residue",
+                  return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def _make_probes(self, killed=0, torn_down=False, swept=0):
         """Fake probes with call recording."""
         state = {"killed": None, "torn_down": torn_down, "swept": None}
@@ -201,6 +211,26 @@ class TestSweepAfterUncleanExit(unittest.TestCase):
                                      marker_path=path, probes=p,
                                      marker_live=dead_session)
         self.assertIsNotNone(read_marker(path))  # marker KEPT
+
+    def test_residue_sweep_failure_keeps_marker(self):
+        """The physical adapter's InterfaceMetric and the machine-wide DoH
+        templates are not routes, so no route sweep reaches them - and before
+        the residue record existed nothing could undo them at all. A failed
+        restore must therefore hold the marker exactly like a failed route
+        sweep does, or the next launch is told the machine is clean."""
+        path = make_marker(pid=999, helper_pid=5555)
+        p, state = self._make_probes()
+        with patch("tuntop.core.cleanup_watchdog.sweep_geo_routes",
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.sweep_lan_routes",
+                   return_value=0), \
+             patch("tuntop.core.cleanup_watchdog.sweep_residue",
+                   return_value=False), \
+             patch("tuntop.core.cleanup_watchdog.kill_pid"):
+            sweep_after_unclean_exit(999, hosts=(), helper_pid=5555,
+                                     marker_path=path, probes=p,
+                                     marker_live=dead_session)
+        self.assertIsNotNone(read_marker(path))
 
     def test_geo_sweep_failure_keeps_marker_too(self):
         path = make_marker(pid=999)
