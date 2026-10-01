@@ -18,6 +18,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tuntop.config import updates as br_sums
+
 _BUILD = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "build_release.py")
 
@@ -340,6 +342,171 @@ class TestOnedirArtifactIsPublishable(unittest.TestCase):
         base = self._tree()
         text = open(br.write_checksums("1.0.51", [base]), encoding="utf-8").read()
         self.assertIn("zip", text.lower())
+
+
+class TestEveryPublishedAssetIsChecksummed(unittest.TestCase):
+    """checksums.txt and release.yml's upload list must be the SAME list.
+
+    They are two hand-maintained lists that were never compared, and they
+    drifted for exactly one release. When onedir became the default,
+    build_release's artifact list gained the packaged zip and the collected
+    tree but not the exe, while release.yml kept uploading
+    `dist/TunTop/TunTop.exe`. Every release since then advertised a binary no
+    downloader could verify, and `config.updates.download_release` - which
+    refuses to stage anything without a `TunTop.exe` line - failed on every
+    user with "checksums.txt has no entry for TunTop.exe".
+
+    It went unnoticed because the updater's own tests SYNTHESISE that line, so
+    they encode the onefile world, and nothing compared them with what the
+    build actually writes. This class is that comparison: it reads the real
+    release.yml, drives the real artifact-assembly function, and requires every
+    uploaded name to have a checksum line.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+    def _uploaded_names(self):
+        """The basenames release.yml uploads, globs resolved."""
+        import fnmatch
+        path = os.path.join(self.ROOT, ".github", "workflows", "release.yml")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        block = src.split("files:", 1)[1].split("generate_release_notes", 1)[0]
+        out = []
+        for raw in block.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "dist/" not in line:
+                continue
+            pattern = line.split()[-1].strip()
+            if "*" in pattern:
+                out.append(fnmatch.fnmatch("TunTop-1.0.51-x64-standalone.zip",
+                                          os.path.basename(pattern))
+                           and "TunTop-1.0.51-x64-standalone.zip")
+            else:
+                out.append(os.path.basename(pattern))
+        return [n for n in out if n]
+
+    def _fake_dist(self):
+        dist = tempfile.mkdtemp()
+        folder = os.path.join(dist, "TunTop")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "TunTop.exe"), "wb") as f:
+            f.write(b"MZ")
+        for name in ("TunTop-x64.zip", "TunTop-1.0.51-x64-standalone.zip"):
+            with open(os.path.join(dist, name), "wb") as f:
+                f.write(b"PK")
+        return dist, folder
+
+    def test_the_two_lists_agree_for_the_default_onedir_layout(self):
+        dist, folder = self._fake_dist()
+        exe = os.path.join(folder, "TunTop.exe")
+        with mock.patch.object(br, "get_version", return_value="1.0.51"), \
+             mock.patch.object(br, "zip_onedir",
+                               return_value=os.path.join(
+                                   dist, "TunTop-1.0.51-x64-standalone.zip")), \
+             mock.patch.object(br, "DIST", dist):
+            paths = br.published_asset_paths(
+                os.path.join(dist, "TunTop-x64.zip"), exe, onedir=True)
+            checksums = br.write_checksums("1.0.51", paths)
+        with open(checksums, encoding="utf-8") as f:
+            text = f.read()
+        for name in self._uploaded_names():
+            if name == "checksums.txt":
+                continue          # it IS the checksum file
+            self.assertIn(name, text,
+                          f"release.yml publishes {name} but checksums.txt "
+                          f"has no line for it - a download nobody can verify")
+
+    def test_the_updater_can_always_find_the_line_it_verifies(self):
+        """The one line the in-app updater hard-requires, stated directly so the
+        failure mode has a name rather than only appearing in the wild.
+
+        It is the STANDALONE ZIP's line, and that is the whole point: an onedir
+        exe is a 2.8 MB launcher that cannot start without its sibling
+        `_internal/`, so verifying and staging the exe verified a file that did
+        not work. The zip is the only self-contained artifact."""
+        dist, folder = self._fake_dist()
+        exe = os.path.join(folder, "TunTop.exe")
+        with mock.patch.object(br, "get_version", return_value="1.0.51"), \
+             mock.patch.object(br, "zip_onedir",
+                               return_value=os.path.join(
+                                   dist, "TunTop-1.0.51-x64-standalone.zip")), \
+             mock.patch.object(br, "DIST", dist):
+            paths = br.published_asset_paths(
+                os.path.join(dist, "TunTop-x64.zip"), exe, onedir=True)
+            checksums = br.write_checksums("1.0.51", paths)
+        with open(checksums, encoding="utf-8") as f:
+            parsed = br_sums._parse_checksums(f.read().encode())
+        for needed in ("TunTop-1.0.51-x64-standalone.zip", "TunTop-x64.zip"):
+            self.assertIn(needed, parsed,
+                          f"config.updates needs the {needed} line to verify "
+                          f"an update at all")
+
+    def test_the_bare_exe_is_not_published(self):
+        """It cannot run on its own - verified on the published v1.0.51 asset,
+        which dies with "Failed to load Python DLL '.../_internal/python312.dll'"
+        when downloaded by itself. Shipping it is what put a broken download on
+        the release page and kept it there (the updater fetched it by name)."""
+        dist, folder = self._fake_dist()
+        exe = os.path.join(folder, "TunTop.exe")
+        for onedir in (True, False):
+            with mock.patch.object(br, "get_version", return_value="1.0.51"), \
+                 mock.patch.object(br, "zip_onedir",
+                                   return_value=os.path.join(
+                                       dist,
+                                       "TunTop-1.0.51-x64-standalone.zip")), \
+                 mock.patch.object(br, "DIST", dist):
+                paths = br.published_asset_paths(
+                    os.path.join(dist, "TunTop-x64.zip"), exe, onedir=onedir)
+            self.assertNotIn(exe, paths,
+                             f"onedir={onedir}: the bare exe is back in the "
+                             f"published set")
+            self.assertNotIn("TunTop.exe", [os.path.basename(p) for p in paths],
+                             f"onedir={onedir}: a checksum line for an exe "
+                             f"nobody can download is a promise no one can check")
+
+    def test_release_yml_does_not_upload_the_bare_exe(self):
+        """The upload list and the checksum list are the same contract; this is
+        the upload half, read from the real workflow file."""
+        path = os.path.join(self.ROOT, ".github", "workflows", "release.yml")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        block = src.split("files:", 1)[1].split("generate_release_notes", 1)[0]
+        uploads = [ln.strip().split()[-1] for ln in block.splitlines()
+                   if "dist/" in ln and not ln.strip().startswith("#")]
+        self.assertTrue(uploads, "could not read release.yml's files: block")
+        for entry in uploads:
+            self.assertNotIn("TunTop/TunTop.exe", entry,
+                             "the non-runnable onedir launcher is uploaded "
+                             "again")
+
+    def test_no_exe_means_only_the_source_zip(self):
+        """--with-exe omitted: nothing to publish but the zip, and no line
+        naming an exe that does not exist."""
+        paths = br.published_asset_paths("TunTop-x64.zip", None, onedir=True)
+        self.assertEqual(paths, ["TunTop-x64.zip"])
+
+
+class TestUpdaterChecksumsParserContract(unittest.TestCase):
+    def test_the_line_format_write_checksums_emits_is_the_one_the_updater_parses(self):
+        """The two sides of that contract live in different modules, and the
+        updater's tests hand-write their fixture - so nothing noticed when the
+        build stopped emitting the line at all. Drive both together.
+
+        The parser preserves the NAME's case (only the hash is lower-cased),
+        which is load-bearing: the updater looks up `_EXE_NAME`, the literal
+        "TunTop.exe", so a parser that folded case would only match if the
+        asset name happened to be lowercase."""
+        import hashlib
+        from tuntop.config import updates
+        blob = b"MZ" + b"\0" * 64
+        line = (f"{hashlib.sha256(blob).hexdigest()}  TunTop.exe  "
+                f"({len(blob):,} bytes)\n")
+        parsed = updates._parse_checksums(line.encode())
+        self.assertEqual(parsed, {"TunTop.exe": hashlib.sha256(blob).hexdigest()})
+        self.assertIn(updates._EXE_NAME, parsed,
+                      "the updater looks the asset up by this exact name")
 
 
 class TestExclusionIsNarrowedAndDeprioritised(unittest.TestCase):

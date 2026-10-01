@@ -556,6 +556,60 @@ def write_checksums(version: str, artifacts: list[str]) -> str:
     return path
 
 
+def published_asset_paths(zip_path: str, exe: str | None,
+                          onedir: bool) -> list[str]:
+    """Every path this release PUBLISHES, in the order they are checksummed.
+
+    ONE function because two lists must not exist independently: the checksum
+    file and release.yml's upload list. An asset published with no checksum
+    line is a download nobody can verify; a path in the checksum file that is
+    never uploaded is a promise nobody can check. Both have shipped.
+
+    They drifted for exactly one release. When onedir became the default,
+    `artifacts` gained the packaged zip and the collected tree but NOT the exe
+    itself - while release.yml kept uploading `dist/TunTop/TunTop.exe`. So every
+    release since has advertised an unverifiable binary, and
+    `config.updates.download_release`, which requires a `TunTop.exe` line
+    before it will stage anything, failed on EVERY user with
+    "checksums.txt has no entry for TunTop.exe". The in-app updater has been
+    dead since the layout change and nothing said so, because the updater's
+    own tests encode the onefile world (they synthesise the TunTop.exe line)
+    and no test ever compared them against what the build actually writes.
+
+    WHY THE EXE IS NOT IN THIS LIST
+    -------------------------------
+    It used to be, and that was wrong twice over. `release.yml` uploaded
+    `dist/TunTop/TunTop.exe`, but an onedir exe is a 2.8 MB launcher whose
+    interpreter, DLLs and the vendored binaries live in the sibling
+    `_internal/` tree (34 MB across 63 files) - so the release page offered a
+    download that could not start. Verified on the published v1.0.51 asset:
+    downloaded alone it dies with "Failed to load Python DLL
+    '.../_internal/python312.dll'". And `config.updates` fetched that same file
+    by name, which is the only thing keeping a broken artifact in the set: the
+    exe was checksummed only so the updater could "verify" a file that still
+    could not run.
+
+    The standalone zip IS the whole directory, is already in this list, and
+    does run on its own - so it is what release.yml publishes and what the
+    updater now fetches, verifies and extracts. One list, no broken member.
+    """
+    paths = [zip_path]
+    if exe:
+        if onedir:
+            folder = os.path.dirname(exe)
+            zipped = zip_onedir(folder, get_version())
+            if not zipped:
+                print("ERROR: the onedir build produced no "
+                      "distributable zip.", file=sys.stderr)
+                raise SystemExit(1)
+            paths.append(zipped)
+            # The directory, as a content digest - it is not itself an
+            # uploadable asset, but it is what the zip contains and the one
+            # way to state what the tree's own integrity is.
+            paths.append(folder)
+    return paths
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI. Extracted from main() so the flag semantics are testable
     without building anything - the default layout in particular is a
@@ -630,23 +684,7 @@ def main():
             # alive through the scan window and return the best surviving one.
             exe = _guard_exe(exe, version, protect=not onedir)
             if exe:
-                if onedir:
-                    # _guard_exe returns the EXE, so the onedir DIRECTORY is
-                    # one level up from it. Zip it: a directory is not a
-                    # release asset, and the zip is what users download and
-                    # verify. The directory itself is checksummed as a content
-                    # digest, so the checksummed name is `TunTop/`, distinct
-                    # from the onefile `TunTop.exe`.
-                    folder = os.path.dirname(exe)
-                    zipped = zip_onedir(folder, version)
-                    if not zipped:
-                        print("ERROR: the onedir build produced no "
-                              "distributable zip.", file=sys.stderr)
-                        raise SystemExit(1)
-                    artifacts.append(zipped)
-                    artifacts.append(folder)
-                else:
-                    artifacts.append(exe)
+                artifacts = published_asset_paths(zip_path, exe, onedir)
                 exe_built = True
 
     if args.with_exe and not exe_built:

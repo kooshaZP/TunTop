@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import ssl
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 from tuntop.config import updates
 
@@ -32,6 +34,27 @@ def _exe_blob():
     return bytes(blob)
 
 
+def _zip_blob(exe=None, extra=None, name="evil"):
+    """A standalone-style archive: TunTop/TunTop.exe plus a sibling tree.
+
+    Mirrors what build_release.zip_onedir produces - a top-level folder holding
+    the launcher and its _internal/ payload - because the layout is the whole
+    reason the updater takes a zip rather than an exe."""
+    if exe is None:
+        exe = _exe_blob()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("TunTop/TunTop.exe", exe)
+        zf.writestr("TunTop/_internal/python312.dll", b"\x00" * 32)
+        for member, data in (extra or {}).items():
+            zf.writestr(member, data)
+    return buf.getvalue()
+
+
+def _zip_name(version):
+    return f"TunTop-{version}-x64-standalone.zip"
+
+
 def _release(version="9.9.9"):
     tag = "v" + version
     return {
@@ -39,9 +62,10 @@ def _release(version="9.9.9"):
         "draft": False,
         "prerelease": False,
         "assets": [
-            {"name": "TunTop.exe",
+            {"name": _zip_name(version),
              "browser_download_url": "https://github.com/kooshaZP/TunTop/"
-                                     f"releases/download/{tag}/TunTop.exe"},
+                                     f"releases/download/{tag}/"
+                                     + _zip_name(version)},
             {"name": "checksums.txt",
              "browser_download_url": "https://github.com/kooshaZP/TunTop/"
                                      f"releases/download/{tag}/checksums.txt"},
@@ -49,10 +73,10 @@ def _release(version="9.9.9"):
     }
 
 
-def _checksums(blob):
+def _checksums(blob, name=None):
     # The EXACT line format build_release.write_checksums emits:
     # "<sha256>  <name>  (<size> bytes)"
-    return (f"{hashlib.sha256(blob).hexdigest()}  TunTop.exe  "
+    return (f"{hashlib.sha256(blob).hexdigest()}  {name or 'TunTop.exe'}  "
             f"({len(blob):,} bytes)\n").encode()
 
 
@@ -89,7 +113,32 @@ class TestCheckLatest(unittest.TestCase):
             info = updates.check_latest("1.0.32")
         self.assertTrue(info["update_available"])
         self.assertEqual(info["version"], "9.9.9")
-        self.assertTrue(info["exe_url"].endswith("/TunTop.exe"))
+        self.assertTrue(info["zip_url"].endswith(_zip_name("9.9.9")))
+
+    def test_the_updater_no_longer_asks_for_a_bare_exe(self):
+        """An onedir exe cannot run on its own, so a release must not be asked
+        for one. This is the selection half of the defect: the published asset
+        existed only because the updater looked it up by that name."""
+        body = json.dumps(_release("9.9.9")).encode()
+        with mock.patch.object(updates._OPENER, "open",
+                               lambda req, timeout=None: _FakeResp(body)):
+            info = updates.check_latest("1.0.32")
+        self.assertNotIn("exe_url", info)
+        self.assertIn("zip_url", info)
+
+    def test_a_release_offering_only_a_bare_exe_is_rejected(self):
+        """Without the zip there is nothing that can actually be installed, so
+        the check must fail loudly rather than fall back to the broken exe."""
+        rel = _release("9.9.9")
+        rel["assets"] = [a for a in rel["assets"] if "standalone" not in a["name"]]
+        rel["assets"].append({
+            "name": "TunTop.exe",
+            "browser_download_url": "https://github.com/kooshaZP/TunTop/"
+                                    "releases/download/v9.9.9/TunTop.exe"})
+        body = json.dumps(rel).encode()
+        with mock.patch.object(updates._OPENER, "open",
+                               lambda req, timeout=None: _FakeResp(body)):
+            self.assertRaises(updates.UpdateError, updates.check_latest, "1.0.32")
 
     def test_same_or_older_version_is_no_update(self):
         body = json.dumps(_release("1.0.32")).encode()
@@ -129,7 +178,7 @@ class TestCheckLatest(unittest.TestCase):
 class TestDownloadRelease(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="tuntop_upd_test_")
-        self.blob = _exe_blob()
+        self.blob = _zip_blob()
         self.addCleanup(os.rmdir_guard if False else self._cleanup)
 
     def _cleanup(self):
@@ -138,14 +187,15 @@ class TestDownloadRelease(unittest.TestCase):
 
     def _install(self, blob=None, sums=None):
         blob = self.blob if blob is None else blob
-        sums = _checksums(blob) if sums is None else sums
+        sums = (_checksums(blob, _zip_name("9.9.9")) if sums is None
+                else sums)
         rel = _release("9.9.9")
 
         def fake_open(req, timeout=None):
             url = req.full_url
             if url.endswith("releases/latest"):
                 return _FakeResp(json.dumps(rel).encode())
-            if url.endswith("/TunTop.exe"):
+            if url.endswith(_zip_name("9.9.9")):
                 return _FakeResp(blob)
             if url.endswith("/checksums.txt"):
                 return _FakeResp(sums)
@@ -153,21 +203,25 @@ class TestDownloadRelease(unittest.TestCase):
 
         return fake_open
 
-    def test_stages_verified_versioned_exe(self):
+    def test_stages_a_complete_verified_install(self):
+        """The result is a FOLDER, because a folder is the only thing that
+        runs: the launcher is meaningless without its sibling _internal/."""
         with mock.patch.object(updates._OPENER, "open",
                                self._install()):
             staged = updates.prepare_update("1.0.32", self.tmp)
         self.assertIsNotNone(staged)
         self.assertEqual(staged.version, "9.9.9")
-        name = os.path.basename(staged.path)
-        self.assertTrue(name.startswith("TunTop-9.9.9"))
-        self.assertTrue(name.endswith(".exe"))
-        self.assertEqual(os.path.dirname(os.path.abspath(staged.path)),
-                         os.path.abspath(self.tmp))
-        with open(staged.path, "rb") as f:
-            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), staged.sha256)
+        self.assertTrue(os.path.basename(staged.path) == "TunTop.exe")
+        install = os.path.dirname(os.path.dirname(staged.path))
+        self.assertEqual(os.path.basename(install), "TunTop-9.9.9")
+        # The payload the exe needs must be there, or the staged install is
+        # the same broken 2 MB artifact this change exists to stop shipping.
+        self.assertTrue(os.path.isfile(os.path.join(
+            install, "TunTop", "_internal", "python312.dll")))
+        self.assertEqual(hashlib.sha256(self.blob).hexdigest(), staged.sha256)
         self.assertEqual([n for n in os.listdir(self.tmp)
-                          if n.startswith("tuntop_upd_")], [])
+                          if n.startswith("tuntop_upd_")
+                          or n.startswith(".tuntop-")], [])
 
     def test_up_to_date_returns_none(self):
         rel = _release("1.0.32")
@@ -177,35 +231,71 @@ class TestDownloadRelease(unittest.TestCase):
             self.assertIsNone(updates.prepare_update("1.0.32", self.tmp))
 
     def test_checksum_mismatch_leaves_nothing_behind(self):
-        bad_sums = f"TunTop.exe  {'0' * 64}\n".encode()
+        bad_sums = (f"{'0' * 64}  {_zip_name('9.9.9')}\n").encode()
         with mock.patch.object(updates._OPENER, "open",
                                self._install(sums=bad_sums)):
             self.assertRaises(updates.UpdateError,
                               updates.prepare_update, "1.0.32", self.tmp)
-        self.assertEqual([n for n in os.listdir(self.tmp)
-                          if not n.startswith("tuntop_upd_")], [])
+        self.assertEqual(os.listdir(self.tmp), [])
 
-    def test_not_a_pe_is_rejected(self):
+    def test_a_checksum_naming_the_old_exe_does_not_satisfy_the_zip(self):
+        """The exact line that shipped on v1.0.51. If this passed, the updater
+        would accept a zip nobody vouched for."""
+        sums = _checksums(self.blob, "TunTop.exe")
         with mock.patch.object(updates._OPENER, "open",
-                               self._install(blob=b"not an executable")):
+                               self._install(sums=sums)):
             self.assertRaises(updates.UpdateError,
                               updates.prepare_update, "1.0.32", self.tmp)
+        self.assertEqual(os.listdir(self.tmp), [])
 
-    def test_32bit_pe_is_rejected(self):
+    def test_not_a_pe_inside_the_archive_is_rejected(self):
+        with mock.patch.object(updates._OPENER, "open",
+                               self._install(blob=_zip_blob(exe=b"nope"))):
+            self.assertRaises(updates.UpdateError,
+                              updates.prepare_update, "1.0.32", self.tmp)
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_32bit_pe_inside_the_archive_is_rejected(self):
         blob = bytearray(_exe_blob())
         off = int.from_bytes(blob[0x3C:0x40], "little")
         blob[off + 4:off + 6] = (0x014C).to_bytes(2, "little")
         with mock.patch.object(updates._OPENER, "open",
-                               self._install(blob=bytes(blob))):
+                               self._install(blob=_zip_blob(exe=bytes(blob)))):
             self.assertRaises(updates.UpdateError,
                               updates.prepare_update, "1.0.32", self.tmp)
+        self.assertEqual(os.listdir(self.tmp), [])
 
-    def test_oversized_exe_is_rejected(self):
-        with mock.patch.object(updates, "_MAX_EXE_BYTES", 16):
+    def test_an_archive_with_no_exe_is_rejected(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("TunTop/readme.txt", b"no exe here")
+        with mock.patch.object(updates._OPENER, "open",
+                               self._install(blob=buf.getvalue())):
+            self.assertRaises(updates.UpdateError,
+                              updates.prepare_update, "1.0.32", self.tmp)
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_oversized_archive_is_rejected(self):
+        with mock.patch.object(updates, "_MAX_ZIP_BYTES", 16):
             with mock.patch.object(updates._OPENER, "open",
                                    self._install()):
                 self.assertRaises(updates.UpdateError,
                                   updates.prepare_update, "1.0.32", self.tmp)
+
+    def test_a_traversing_member_is_refused_before_anything_is_written(self):
+        """Zip-slip: a verified archive can still be malformed, and a member
+        escaping the target would write outside it."""
+        for member in ("../escaped.txt", "TunTop/../../escaped.txt",
+                       "/abs/escaped.txt"):
+            blob = _zip_blob(extra={member: b"x"})
+            stage = tempfile.mkdtemp(prefix="tuntop_slip_")
+            self.addCleanup(shutil.rmtree, stage, True)
+            with mock.patch.object(updates._OPENER, "open",
+                                   self._install(blob=blob)):
+                self.assertRaises(updates.UpdateError,
+                                  updates.prepare_update, "1.0.32", stage)
+            self.assertEqual(os.listdir(stage), [],
+                             f"{member} was extracted")
 
     def test_existing_identical_stage_is_reused(self):
         with mock.patch.object(updates._OPENER, "open",
@@ -214,16 +304,20 @@ class TestDownloadRelease(unittest.TestCase):
             second = updates.prepare_update("1.0.32", self.tmp)
         self.assertEqual(first.path, second.path)
 
-    def test_existing_conflicting_stage_is_rejected(self):
+    def test_existing_conflicting_stage_is_replaced_not_trusted(self):
+        """A staged folder whose exe is not a real PE - a truncated extraction,
+        say - must not be reported as an already-applied update."""
         with mock.patch.object(updates._OPENER, "open",
                                self._install()):
-            updates.prepare_update("1.0.32", self.tmp)
-        other = bytearray(_exe_blob())
-        other[-1] ^= 0xFF
+            staged = updates.prepare_update("1.0.32", self.tmp)
+        with open(staged.path, "wb") as f:
+            f.write(b"corrupt")
         with mock.patch.object(updates._OPENER, "open",
-                               self._install(blob=bytes(other))):
-            self.assertRaises(updates.UpdateError,
-                              updates.prepare_update, "1.0.32", self.tmp)
+                               self._install()):
+            again = updates.prepare_update("1.0.32", self.tmp)
+        with open(again.path, "rb") as f:
+            self.assertEqual(f.read()[:2], b"MZ",
+                             "the corrupt staged exe was accepted as complete")
 
     def test_offline_returns_none(self):
         def offline(req, timeout=None):

@@ -215,6 +215,15 @@ Press **[S]** to start the tunnel, **[C]** to run a health scan, **[L]** for a l
 > single file to hand around, `python build_release.py --with-exe --onefile`
 > still builds the old one deliberately.
 
+> **There is deliberately no bare `TunTop.exe` asset.** v1.0.51 published one
+> and it **could not run**: with the folder layout the exe is a 2.8 MB launcher
+> whose interpreter and DLLs live in the sibling `_internal/` tree (34 MB). Copied
+> out on its own it dies immediately with `Failed to load Python DLL
+> '.../_internal/python312.dll'`. A release publishes only artifacts that work
+> on their own, and the zip is the whole folder — so the zip is what the page
+> offers, what `checksums.txt` vouches for, and what the in-app updater
+> downloads, verifies and unpacks.
+
 #### Changing servers and settings live (no restart)
 
 The dashboard edits a RUNNING tunnel in place:

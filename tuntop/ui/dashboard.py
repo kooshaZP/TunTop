@@ -10851,7 +10851,7 @@ def _startup_update_check(args, timeout=_STARTUP_UPDATE_TIMEOUT,
              f"(v{_pkg.__version__}).")
         return None
     version = str(info.get("version") or "?")
-    emit(f"[+] Update {version} available - downloading the verified exe "
+    emit(f"[+] Update {version} available - downloading the verified package "
          "in the background.")
     exe_dir = os.path.dirname(os.path.abspath(_sys.executable))
 
@@ -10863,9 +10863,16 @@ def _startup_update_check(args, timeout=_STARTUP_UPDATE_TIMEOUT,
             emit(f"[!] Update {version} could not be downloaded: {e}")
             return
         if staged is not None:
+            # The staged path is the exe inside a NEW folder beside the running
+            # install, not a replacement for it. Saying so matters: the old
+            # wording ("run that exe to apply it") read as a swap, and with the
+            # onedir layout an exe on its own cannot run at all - it needs the
+            # _internal/ tree unpacked beside it, which is what the folder is.
             emit(f"[+] Update {staged.version} downloaded and verified "
-                 f"(SHA-256): {staged.path} - close TunTop and run that exe "
-                 "to apply it.")
+                 f"(SHA-256 {staged.sha256[:12]}...): {staged.path}")
+            emit("[i] That is a separate, complete install - close TunTop and "
+                 "run the exe in its own folder. Your current install is "
+                 "untouched.")
         else:
             emit(f"[i] Update {version} staging reported nothing - "
                  "run TunTop again to retry.")

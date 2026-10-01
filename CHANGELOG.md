@@ -156,8 +156,34 @@ Three tests asserted the *literal source string* `creationflags=subprocess.CREAT
 
 Verified with the Windows-only constants **deleted** from the `subprocess` module (the POSIX condition): 147 tests, 0 failures. 1447 pass locally, `ruff` clean.
 
-## [1.0.50] - 2026-09-30
+### The published exe could not run, and the updater could not verify anything
 
+Two field reports in one: `[!] Update 1.0.51 could not be downloaded: checksums.txt has no entry for TunTop.exe`, and then the observation that the exe on the release page is only 2 MB. Both are the same defect seen from two ends.
+
+**The exe on the page could not start.** Since 1.0.51 the shipped layout is onedir, where `TunTop.exe` is a launcher and its interpreter, DLLs and the vendored binaries live in a sibling `_internal/` tree — 2.8 MB beside 34 MB across 63 files. Verified on the published v1.0.51 asset: copied alone into an empty directory and run, it dies instantly with `Failed to load Python DLL '.../_internal/python312.dll'`. The **same bytes** (SHA-256 `880573c0…`, 2,775,682) beside their `_internal/` tree start normally and reach TunTop's own code. So the release page offered a download that could never work, and the only reason that file was on the page at all is that `config.updates` fetched it by that name.
+
+**The updater could not verify anything.** `checksums.txt` and `release.yml`'s upload list are two hand-maintained lists, and they drifted for exactly one release: when onedir became the default, the checksum list gained the packaged zip and the collected tree but not the exe, while the upload list kept the exe. So every release advertised an unverifiable binary, and `download_release` — which refuses to stage anything without a `TunTop.exe` line — failed on **every** user. Nothing said so, because the updater's own tests hand-write that line and no test ever compared them against what the build emits.
+
+Both lists now come from one place, and neither contains the exe:
+
+- `build_release.published_asset_paths()` decides what is published and what is checksummed, so they cannot drift.
+- `release.yml` no longer uploads `dist/TunTop/TunTop.exe`, and `build_release` no longer checksums it. A line for a file no downloader can fetch is a promise nobody can check — the same reasoning that had already been applied to three other paths in this file.
+- `config.updates` fetches **`TunTop-<version>-x64-standalone.zip`** instead: the whole directory, and the only artifact that runs on its own. It verifies that zip's SHA-256 against the zip line already in `checksums.txt`, extracts it to `TunTop-<version>/`, and re-checks the PE header on the exe *inside* — so the launcher is still proven to be a real x64 binary, and a folder missing it is an error rather than a broken install.
+
+An update therefore lands as a **new folder** rather than a swapped exe, which is inherent to a multi-file install; the dashboard says so instead of the old "run that exe to apply it", which read as a swap. Extraction goes through a sibling staging directory and is moved into place, so a failure part-way cannot leave a half-written folder the next run treats as applied — and a staged folder whose exe is not a valid PE is discarded and re-extracted rather than reported as done. Every archive member is resolved against the target and refused if it lands outside, and symlink members are refused outright: the hash proves the bytes are the ones published, not that the archive is well-formed, and extraction is new.
+
+The self-extracting onefile exe is deliberately **not** restored to get a single-file download back. `TunTop.spec` documents it as the most AV-false-positive-prone PyInstaller layout — a local 1.0.50 build was quarantined as `Trojan:Win32/Bearfoos.A!ml` with four child processes flagged — and its temp-dir self-extraction is exactly the behaviour ML detectors key on. The standalone zip is the same application with no self-extraction and needs no AV exclusion.
+
+**The published v1.0.51 release was fixed in place**, in two steps, and each was verified by downloading the bytes rather than trusting the API:
+
+1. `checksums.txt` gained the missing `TunTop.exe` line, every hash claim on the page re-verified (the two zips by SHA-256, the `TunTop/` line by unpacking the standalone zip and re-running the build's content digest). The original 463 bytes were preserved verbatim — recovered by regenerating the file from `write_checksums`' format and proving it against the published SHA-256, which is also how its **CRLF** line endings became known: `open(path, "w")` translates them on `windows-latest`, so an LF rebuild hashes differently while looking identical.
+2. That intermediate state was then superseded. With the exe unpublished, the exe line became exactly the thing the build's own comment forbids, so the asset was deleted and the original `checksums.txt` restored — byte-identical to what shipped. The release now publishes only artifacts that run, and every published asset has a line.
+
+Repairing it honestly took four attempts, each stopped by a check rather than by luck. The first posted to `api.github.com`, which is not the asset-upload route, and deleted the file before failing — leaving the release with no `checksums.txt`; the rollback failed identically. The second used the right host but doubled the path (`upload_url` already ends in `/assets`). The third sent `multipart/form-data` and **GitHub stored the envelope verbatim** — a 725-byte asset beginning `--tuntopReleaseRepairBoundary` in place of the 560-byte file, i.e. a checksum file that lies about its own hashes is worse than a missing one. That was caught only because the upload was verified by downloading and hashing it, which is why the replacement deletes the asset and takes it back out if the new bytes cannot be proven correct. Raw bytes to the correct `upload_url` — what `softprops/action-gh-release` does — worked.
+
+**Tests** — 1458 pass, `ruff` clean. The updater suite is rewritten around the zip, and its assertions are the ones that would have caught this: that `check_latest` returns no `exe_url` at all, that a release offering only a bare exe is **refused** rather than used as a fallback, that a `checksums.txt` line naming the old exe does not satisfy the zip, that the staged folder contains the `_internal/` payload (without it the staged install is the same broken artifact this change removes), and that a traversing member is refused with nothing written outside the target. In `test_build_guard.py`, a test reads the real `release.yml` and requires every uploaded name to have a checksum line, and two more assert the bare exe is absent from both lists.
+
+## [1.0.50] - 2026-09-30
 Two defects in 1.0.49's own audit, found by the release that shipped it - both of them in the machinery the audit had just declared sound.
 
 **Critical**

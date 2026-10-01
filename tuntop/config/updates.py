@@ -11,14 +11,17 @@ Pure stdlib, zero pip dependencies, no subprocess, no elevation.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from typing import Optional
 
 __all__ = [
@@ -30,7 +33,10 @@ _API_URL = "https://api.github.com/repos/kooshaZP/TunTop/releases/latest"
 _ASSET_BASE = "https://github.com/kooshaZP/TunTop/releases/download/"
 _EXE_NAME = "TunTop.exe"
 _CHECKSUM_NAME = "checksums.txt"
-_MAX_EXE_BYTES = 64 * 1024 * 1024
+#: The standalone zip is the only self-contained artifact, and it is the whole
+#: collected tree - so the cap has to cover it (14.7 MB at 1.0.51) with room to
+#: grow, while still refusing an absurd response.
+_MAX_ZIP_BYTES = 128 * 1024 * 1024
 _MAX_CHECKSUM_BYTES = 64 * 1024
 _TIMEOUT = 20
 _UA = {"User-Agent": "TunTop-Updater"}
@@ -186,6 +192,24 @@ def _parse_version(tag: str) -> str:
     return v
 
 
+def _standalone_zip_name(version: str) -> str:
+    """The ONE self-contained artifact a release publishes.
+
+    It has to be this, and not the exe, because of what the onedir layout is.
+    A collected PyInstaller build is not relocatable: `TunTop.exe` is a small
+    launcher (2.8 MB) and its interpreter, DLLs and the vendored binaries live in
+    the sibling `_internal/` tree (34 MB). Downloading the exe alone yields a
+    program that cannot start - verified on the published v1.0.51 asset, which
+    dies with "Failed to load Python DLL '.../_internal/python312.dll'". The zip
+    is the whole directory, so it is the only artifact that works on its own.
+
+    That is also why the exe is no longer published: it was on the release page
+    as a download that could not run, and the updater fetched it by name, which
+    is the one thing keeping a broken file in the set. Both lists changed
+    together - see build_release.published_asset_paths."""
+    return f"TunTop-{version}-x64-standalone.zip"
+
+
 def _version_gt(a: str, b: str) -> bool:
     ka = tuple(int(x) for x in a.split("."))
     kb = tuple(int(x) for x in b.split("."))
@@ -214,11 +238,13 @@ def check_latest(current_version: str,
     assets = rel.get("assets") or []
     urls = {a.get("name"): a.get("browser_download_url") for a in assets
             if isinstance(a, dict)}
-    exe_url = urls.get(_EXE_NAME)
+    zip_name = _standalone_zip_name(version)
+    zip_url = urls.get(zip_name)
     sum_url = urls.get(_CHECKSUM_NAME)
-    if not exe_url or not sum_url:
-        raise UpdateError("release is missing TunTop.exe or checksums.txt")
-    if not str(exe_url).startswith(_ASSET_BASE):
+    if not zip_url or not sum_url:
+        raise UpdateError(
+            f"release is missing {zip_name} or {_CHECKSUM_NAME}")
+    if not str(zip_url).startswith(_ASSET_BASE):
         raise UpdateError("asset URL is not on the release download host")
     if not str(sum_url).startswith(_ASSET_BASE):
         raise UpdateError("checksum URL is not on the release download host")
@@ -226,7 +252,8 @@ def check_latest(current_version: str,
         "version": version,
         "current": current,
         "update_available": _version_gt(version, current),
-        "exe_url": exe_url,
+        "zip_name": zip_name,
+        "zip_url": zip_url,
         "checksum_url": sum_url,
     }
 
@@ -262,61 +289,113 @@ def _verify_pe_header(blob: bytes) -> None:
         raise UpdateError("downloaded exe is not x64")
 
 
+def _safe_extract(zf: zipfile.ZipFile, dest: str) -> None:
+    """Extract `zf` into `dest`, refusing any member that would land outside.
+
+    Zip-slip is the whole risk of extracting an archive here: a member named
+    `../../Windows/System32/...` or an ABSOLUTE path escapes `dest` on the
+    next `extract`, and this is a network download that has only been checked
+    by HASH - which proves the bytes are the ones the release published, not
+    that the archive is well-formed. So every member is resolved against dest
+    and rejected if it is not a descendant, BEFORE anything is written.
+
+    Symlinks are refused outright: a member marked as one could otherwise point
+    anywhere, and PyInstaller's payload has no reason to contain one."""
+    root = os.path.realpath(dest)
+    for info_ in zf.infolist():
+        name = info_.filename
+        if name.startswith("/") or name.startswith("\\") or \
+                (len(name) > 1 and name[1] == ":"):
+            raise UpdateError(f"archive member has an absolute path: {name}")
+        target = os.path.realpath(os.path.join(root, name))
+        if target != root and not target.startswith(root + os.sep):
+            raise UpdateError(f"archive member escapes the target: {name}")
+        # 0xA000 is the symlink bit in the external_attr high half.
+        if (info_.external_attr >> 16) & 0xA000 == 0xA000:
+            raise UpdateError(f"archive member is a symlink: {name}")
+
+
 def download_release(info: dict, directory: str,
                      timeout: Optional[int] = None) -> StagedUpdate:
-    """Download TunTop.exe + checksums.txt, verify the SHA-256 and the PE
-    header, then stage the exe as TunTop-<version>.exe inside `directory`
-    (atomically, never overwriting a different file)."""
+    """Download the standalone ZIP + checksums.txt, verify the ZIP's SHA-256
+    against the published line, then extract it into `directory` as
+    TunTop-<version>/ and stage the exe inside it.
+
+    WHY A DIRECTORY AND NOT A SWAPPED EXE
+    ------------------------------------
+    This used to download `TunTop.exe`, verify it, and stage it next to the
+    running executable for the user to run instead. That only ever worked for a
+    self-contained build. Since 1.0.51 the shipped layout is onedir, where the
+    exe is a launcher whose interpreter and DLLs live in a sibling
+    `_internal/` - so the "verified" download was a file that could not start on
+    its own, and the published asset was the same broken thing offered to
+    users. The zip is the whole directory and is the only artifact that runs
+    standalone, so it is what gets verified and what gets unpacked.
+
+    The result is a NEW FOLDER rather than a replaced file: that is inherent to
+    a multi-file install, and it is why the caller has to say so plainly
+    instead of "run that exe to apply it".
+
+    Extraction is into a sibling temp directory and moved into place, so a
+    failure part-way through cannot leave a half-written TunTop-<version>/ that
+    the next run would treat as already staged."""
     version = info["version"]
-    target = os.path.join(directory, f"TunTop-{version}.exe")
-    fd, tmp = tempfile_name(directory)
-    try:
-        blob = _fetch(info["exe_url"], _MAX_EXE_BYTES, timeout=timeout)
-        _verify_pe_header(blob)
-        sums = _parse_checksums(_fetch(info["checksum_url"], _MAX_CHECKSUM_BYTES,
-                                       timeout=timeout))
-        expected = sums.get(_EXE_NAME)
-        if not expected:
-            raise UpdateError("checksums.txt has no entry for TunTop.exe")
-        actual = hashlib.sha256(blob).hexdigest()
-        if actual != expected:
-            raise UpdateError(
-                f"checksum mismatch (got {actual[:12]}..., want {expected[:12]}...)")
-        if os.path.exists(target):
-            with open(target, "rb") as f:
-                same = hashlib.sha256(f.read()).hexdigest() == actual
-            # The temp file may still hold our open fd here (the reuse
-            # path never enters the fdopen block) - close it BEFORE the
-            # unlink or Windows refuses (WinError 32).
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except Exception:
-                    pass
-                fd = None
-            if same:
-                os.unlink(tmp)
-                return StagedUpdate(version, target, actual)
-            raise UpdateError(
-                f"{os.path.basename(target)} already exists with different content")
-        with os.fdopen(fd, "wb") as f:
-            fd = None
-            f.write(blob)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, target)
-        return StagedUpdate(version, target, actual)
-    except Exception:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
+    zip_name = info.get("zip_name") or _standalone_zip_name(version)
+    target_dir = os.path.join(directory, f"TunTop-{version}")
+    staged_exe = os.path.join(target_dir, "TunTop", "TunTop.exe")
+
+    blob = _fetch(info["zip_url"], _MAX_ZIP_BYTES, timeout=timeout)
+    sums = _parse_checksums(_fetch(info["checksum_url"], _MAX_CHECKSUM_BYTES,
+                                   timeout=timeout))
+    expected = sums.get(zip_name)
+    if not expected:
+        raise UpdateError(f"checksums.txt has no entry for {zip_name}")
+    actual = hashlib.sha256(blob).hexdigest()
+    if actual != expected:
+        raise UpdateError(
+            f"checksum mismatch (got {actual[:12]}..., want {expected[:12]}...)")
+
+    # Already staged from a previous attempt? Reuse it only if the exe inside
+    # is still a real x64 PE. A folder that fails that is not "already applied" -
+    # it is a truncated or corrupted extraction, so it is discarded and the
+    # archive is unpacked again rather than reported as done.
+    if os.path.isfile(staged_exe):
         try:
-            os.unlink(tmp)
-        except Exception:
-            pass
+            with open(staged_exe, "rb") as f:
+                _verify_pe_header(f.read(0x200))
+            return StagedUpdate(version, staged_exe, actual)
+        except UpdateError:
+            _rmtree(target_dir)
+
+    staging = os.path.join(directory, f".tuntop-{version}.staging")
+    _rmtree(staging)
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            _safe_extract(zf, staging)
+            zf.extractall(staging)
+        found = None
+        for base, _dirs, files in os.walk(staging):
+            if "TunTop.exe" in files:
+                found = os.path.join(base, "TunTop.exe")
+                break
+        if not found:
+            raise UpdateError("the archive contains no TunTop.exe")
+        with open(found, "rb") as f:
+            _verify_pe_header(f.read(0x200))
+        _rmtree(target_dir)
+        os.replace(staging, target_dir)
+    except Exception:
+        _rmtree(staging)
         raise
+    return StagedUpdate(version, staged_exe, actual)
+
+
+def _rmtree(path: str) -> None:
+    """Best-effort recursive delete. Used only on paths this module created."""
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def tempfile_name(directory: str):

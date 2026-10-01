@@ -142,10 +142,29 @@ jobs:
           # inside the standalone zip is the same application with no
           # temp-dir self-extraction, and needs no AV exclusion to install.
           # The glob covers the version in the archive name.
+          # WHAT IS PUBLISHED
+          # The two zips and checksums.txt - and deliberately NOT the bare
+          # dist/TunTop/TunTop.exe.
+          #
+          # It used to be uploaded, and it cannot run. Since 1.0.51 the shipped
+          # layout is onedir: TunTop.exe is a 2.8 MB launcher whose interpreter,
+          # DLLs and the vendored binaries live in the sibling `_internal/`
+          # (34 MB across 63 files). Verified on the published v1.0.51 asset:
+          # downloaded alone it dies instantly with "Failed to load Python DLL
+          # '.../_internal/python312.dll'". So the page offered a download that
+          # could not start, and `config.updates` fetched that same file by name
+          # - which is the only reason a broken artifact stayed in the set.
+          #
+          # The self-extracting onefile exe is NOT restored here to get a
+          # single-file download back: TunTop.spec documents it as the most
+          # AV-false-positive-prone PyInstaller layout (a local 1.0.50 build was
+          # quarantined as Trojan:Win32/Bearfoos.A!ml with four child processes
+          # flagged), and its temp-dir self-extraction is the behaviour ML
+          # detectors key on. The standalone zip is the same application with no
+          # self-extraction, needs no AV exclusion, and does run on its own.
           files: |
             dist/TunTop-x64.zip
             dist/TunTop-*-x64-standalone.zip
-            dist/TunTop/TunTop.exe
             dist/checksums.txt
           generate_release_notes: true
           draft: false
