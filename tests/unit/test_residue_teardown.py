@@ -609,15 +609,26 @@ class TestGeoCodesUnion(unittest.TestCase):
             seen.append(code)
             return {"5.0.0.0/8"} if code == "ir" else {"20.0.0.0/8"}
 
-        with mock.patch.object(W, "_live_rows",
-                               return_value=[{"DestinationPrefix":
-                                              "5.0.0.0/8",
-                                              "InterfaceAlias": "Wi-Fi",
-                                              "NextHop": "192.168.1.1"}]), \
-             mock.patch("tuntop.geoip.parse_geoip", side_effect=_parse), \
-             mock.patch.object(W, "_run_netsh_batch",
-                               return_value=(1, "")) as batch:
-            W.sweep_geo_routes("geoip.dat", "ru", geoip_codes=["ir"])
+        # A REAL file: `sweep_geo_routes` refuses to parse a path that is not
+        # there - it returns 0, "geo bypass was never active" - and the repo
+        # root `geoip.dat` is an UNTRACKED local artifact, so a fresh checkout
+        # has none. A bare "geoip.dat" here only ever passed on the author's
+        # machine, which is why this failed on every CI runner. The parse is
+        # mocked, so the file's contents never matter.
+        fd, gpath = tempfile.mkstemp(suffix=".dat")
+        os.close(fd)
+        try:
+            with mock.patch.object(W, "_live_rows",
+                                   return_value=[{"DestinationPrefix":
+                                                  "5.0.0.0/8",
+                                                  "InterfaceAlias": "Wi-Fi",
+                                                  "NextHop": "192.168.1.1"}]), \
+                 mock.patch("tuntop.geoip.parse_geoip", side_effect=_parse), \
+                 mock.patch.object(W, "_run_netsh_batch",
+                                   return_value=(1, "")) as batch:
+                W.sweep_geo_routes(gpath, "ru", geoip_codes=["ir"])
+        finally:
+            os.unlink(gpath)
         self.assertEqual(sorted(seen), ["ir", "ru"])
         sent = "\n".join(batch.call_args[0][0])
         self.assertIn("5.0.0.0/8", sent,
@@ -633,7 +644,12 @@ class TestGeoCodesUnion(unittest.TestCase):
         from tuntop.core import cleanup_watchdog as W
         with mock.patch("tuntop.geoip.parse_geoip",
                         side_effect=AssertionError("must not be called")):
-            self.assertEqual(W.sweep_geo_routes("geoip.dat", ""), 0)
+            # "missing.dat", never a bare "geoip.dat": the repo-root
+            # geoip.dat is GITIGNORED, so a fresh checkout has none and any
+            # assertion whose result depends on it passing passes only on the
+            # author's machine. This one must hold with the file absent - which
+            # is why the path is a name that cannot exist anywhere.
+            self.assertEqual(W.sweep_geo_routes("missing.dat", ""), 0)
 
 
 # ── The watchdog's residue sweep ─────────────────────────────────────
